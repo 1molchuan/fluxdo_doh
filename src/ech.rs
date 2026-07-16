@@ -8,7 +8,11 @@ use crate::error::{DohProxyError, Result};
 use crate::upstream::connect_tunnel;
 use crate::{BoxStream, UpstreamProxyConfig};
 use rustls::{pki_types::ServerName, ClientConfig, RootCertStore};
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::net::TcpStream;
 use tokio_rustls::{client::TlsStream, TlsConnector};
 use tracing::{debug, info, warn};
@@ -81,23 +85,74 @@ impl DohTlsConnector {
     }
 
     /// Establish raw TCP tunnel to target host
+    ///
+    /// 无上游代理时优先用 DoH 解析目标 IP（不经系统 DNS），逐个尝试连接；
+    /// 无 DoH resolver（enable_doh=false）或解析失败时回退系统 DNS。
+    /// CF 验证域名（challenges.cloudflare.com）以隧道方式直连时走此路径：
+    /// 既保证与真 CF 端到端 TLS，又不把域名泄漏给系统 DNS。
     pub async fn connect_tcp(&self, host: &str, port: u16) -> Result<BoxStream> {
-        let stream = if let Some(proxy) = self
+        // 有上游代理：交给上游隧道，由上游负责解析
+        if let Some(proxy) = self
             .upstream_proxy
             .as_ref()
             .filter(|proxy| proxy.is_valid())
         {
-            tokio::time::timeout(self.timeout, connect_tunnel(proxy, host, port))
+            let stream = tokio::time::timeout(self.timeout, connect_tunnel(proxy, host, port))
                 .await
-                .map_err(|_| DohProxyError::Timeout)??
-        } else {
-            let stream = tokio::time::timeout(self.timeout, TcpStream::connect((host, port)))
-                .await
-                .map_err(|_| DohProxyError::Timeout)?
-                .map_err(DohProxyError::Io)?;
-            Box::new(stream)
-        };
-        Ok(stream)
+                .map_err(|_| DohProxyError::Timeout)??;
+            return Ok(stream);
+        }
+
+        // host 本身是 IP 字面量：直接连
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            let stream = self.tcp_connect_addr(SocketAddr::new(ip, port)).await?;
+            return Ok(Box::new(stream));
+        }
+
+        // 优先 DoH 解析（不走系统 DNS），按 RTT 排序后逐个尝试
+        if let Some(resolver) = self.dns_resolver.as_ref() {
+            match resolver.lookup_ip(host).await {
+                Ok(addrs) if !addrs.is_empty() => {
+                    let ordered = resolver.order_addrs_by_rtt(addrs);
+                    let mut last_err: Option<DohProxyError> = None;
+                    for ip in ordered {
+                        match self.tcp_connect_addr(SocketAddr::new(ip, port)).await {
+                            Ok(stream) => return Ok(Box::new(stream)),
+                            Err(e) => {
+                                warn!("Tunnel TCP connect to {} failed: {}", ip, e);
+                                last_err = Some(e);
+                            }
+                        }
+                    }
+                    return Err(last_err.unwrap_or_else(|| {
+                        DohProxyError::Dns(format!("No reachable IP for {}", host))
+                    }));
+                }
+                Ok(_) => warn!(
+                    "DoH returned no IP for {}, falling back to system DNS",
+                    host
+                ),
+                Err(e) => warn!(
+                    "DoH lookup failed for {} ({}), falling back to system DNS",
+                    host, e
+                ),
+            }
+        }
+
+        // 回退系统 DNS（enable_doh=false 或 DoH 不可用）
+        let stream = tokio::time::timeout(self.timeout, TcpStream::connect((host, port)))
+            .await
+            .map_err(|_| DohProxyError::Timeout)?
+            .map_err(DohProxyError::Io)?;
+        Ok(Box::new(stream))
+    }
+
+    /// 连接单个已解析的地址（带超时）
+    async fn tcp_connect_addr(&self, addr: SocketAddr) -> Result<TcpStream> {
+        tokio::time::timeout(self.timeout, TcpStream::connect(addr))
+            .await
+            .map_err(|_| DohProxyError::Timeout)?
+            .map_err(DohProxyError::Io)
     }
 
     /// Connect to a server using ECH if available

@@ -215,7 +215,11 @@ async fn handle_connection(
     let target = parts[1].to_string();
 
     if method == "CONNECT" {
-        if enable_doh {
+        // CF 验证域名（challenges.cloudflare.com）不做 MITM：改走隧道让 WebView
+        // 与真 CF 端到端 TLS，否则 Turnstile 会识破中间人而拒绝人机验证。
+        let (connect_host, _) = parse_host_port(&target).unwrap_or_default();
+        let use_mitm = enable_doh && !is_cf_challenge_host(&connect_host);
+        if use_mitm {
             let cert_manager = cert_manager.ok_or_else(|| {
                 DohProxyError::Proxy("MITM mode requires certificate manager".to_string())
             })?;
@@ -432,7 +436,13 @@ async fn handle_gateway_connection(
         let pool = pool.clone();
         async move {
             if req.method() == hyper::Method::CONNECT {
-                if mitm_connect {
+                // CF 验证域名强制走隧道（端到端真 TLS），其余按 mitm_connect 配置。
+                let is_cf = req
+                    .uri()
+                    .authority()
+                    .map(|a| is_cf_challenge_host(a.host()))
+                    .unwrap_or(false);
+                if mitm_connect && !is_cf {
                     gateway_handle_connect(req, connector, cert_manager, h2_mitm).await
                 } else {
                     gateway_handle_connect_tunnel(req, connector).await
@@ -810,6 +820,16 @@ fn gateway_parse_host(host_header: &str) -> Option<(String, u16)> {
     } else {
         Some((host_header.to_string(), 443))
     }
+}
+
+/// 判断是否为 Cloudflare 验证（Turnstile）基础设施域名。
+///
+/// challenges.cloudflare.com 是 CF Turnstile 全球统一的固定域名（api.js 与
+/// challenge-platform 都在此域），属协议级常量而非可变业务白名单。对它做 MITM
+/// 会被 CF 挑战平台识破（TLS 指纹/证书不符）而拒绝人机验证，故这类连接必须以
+/// 隧道方式端到端直连真 CF。
+fn is_cf_challenge_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("challenges.cloudflare.com")
 }
 
 /// Parse host:port from CONNECT target
