@@ -71,6 +71,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|i| args.get(i + 1))
         .cloned();
 
+    // Parse --doh-bootstrap-ips / --doh-ech-bootstrap-ips <ip,ip,...> arguments
+    let parse_ip_list = |flag: &str| -> Vec<String> {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|ip| !ip.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let doh_bootstrap_ips = parse_ip_list("--doh-bootstrap-ips");
+    let doh_ech_bootstrap_ips = parse_ip_list("--doh-ech-bootstrap-ips");
+
     // Parse --server-ip <ip> argument
     let server_ip = args
         .iter()
@@ -99,6 +116,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         prefer_ipv6,
         doh_server,
         doh_server_ech,
+        doh_bootstrap_ips,
+        doh_ech_bootstrap_ips,
         upstream_proxy,
         server_ip,
         h2_mitm,

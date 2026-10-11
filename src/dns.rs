@@ -38,20 +38,158 @@ const CLEANUP_INTERVAL: u64 = 100;
 const STICKY_IP_TTL_SECS: u64 = 600;
 /// ECH 负结果（确定无 ECH）缓存时长，取短值以便域名启用 ECH 后尽快生效
 const ECH_NEGATIVE_TTL_SECS: u64 = 60;
+/// 有备用节点时，主客户端（系统 DNS）的连接超时（含 DNS 解析和 TLS 握手），超时即改走备用节点
+const DOH_PRIMARY_CONNECT_TIMEOUT_SECS: u64 = 3;
+/// 备用节点客户端的连接超时，按节点数平分到每个 IP
+const DOH_BOOTSTRAP_CONNECT_TIMEOUT_SECS: u64 = 4;
+/// 主客户端失败、备用节点成功后，优先走备用节点的时长；到期后重新先试系统 DNS
+const DOH_BOOTSTRAP_PREFER_SECS: u64 = 600;
+/// DoH 服务器连续这么多次连不上（期间没有任何响应）就暂停使用，查询直接失败、由调用方回退系统 DNS
+const DOH_FAILURES_BEFORE_COOLDOWN: u32 = 4;
+/// DoH 服务器暂停使用的时长，到期后再试
+const DOH_COOLDOWN_SECS: u64 = 30;
+/// 同域名并发查询时，跟随者等待领头查询的上限，避免错过通知后一直挂起
+const INFLIGHT_WAIT_TIMEOUT_SECS: u64 = 15;
 
 static SHARED_RESOLVERS: OnceLock<Arc<AsyncRwLock<HashMap<String, Arc<DnsResolver>>>>> =
     OnceLock::new();
+
+/// DoH 服务器域名 -> 备用节点 IP，由启动配置登记
+static DOH_BOOTSTRAP_IPS: OnceLock<RwLock<HashMap<String, Vec<IpAddr>>>> = OnceLock::new();
+
+/// DoH 上游。主客户端用系统 DNS 解析 DoH 域名；登记了备用节点 IP 时另建一个直连节点的客户端
+/// （只替换连接地址，SNI 和 Host 不变），主客户端连不上时改用它重试。
+#[derive(Clone)]
+struct DohUpstream {
+    uri: Uri,
+    client: Client,
+    bootstrap_client: Option<Client>,
+    health: Arc<parking_lot::Mutex<DohUpstreamHealth>>,
+}
+
+#[derive(Default)]
+struct DohUpstreamHealth {
+    /// 在此时间之前先走备用节点，避免每次查询都先等系统 DNS 失败
+    prefer_bootstrap_until: Option<std::time::Instant>,
+    /// 连续连不上的次数，收到任何 HTTP 响应即清零
+    consecutive_failures: u32,
+    /// 在此时间之前不再请求 DoH 服务器
+    cooldown_until: Option<std::time::Instant>,
+}
+
+impl DohUpstream {
+    fn new(uri: Uri, client: Client, bootstrap_client: Option<Client>) -> Self {
+        Self {
+            uri,
+            client,
+            bootstrap_client,
+            health: Arc::new(parking_lot::Mutex::new(DohUpstreamHealth::default())),
+        }
+    }
+
+    async fn get(&self, url: &str) -> Result<reqwest::Response> {
+        let (bootstrap_first, cooling_down) = {
+            let health = self.health.lock();
+            let now = std::time::Instant::now();
+            (
+                health
+                    .prefer_bootstrap_until
+                    .is_some_and(|until| until > now),
+                health.cooldown_until.is_some_and(|until| until > now),
+            )
+        };
+        if cooling_down {
+            return Err(DohProxyError::Dns(format!(
+                "DoH server {} is cooling down after repeated failures",
+                self.uri.host().unwrap_or_default()
+            )));
+        }
+
+        let result = self.send_with_fallback(url, bootstrap_first).await;
+
+        let mut health = self.health.lock();
+        let now = std::time::Instant::now();
+        match result {
+            Ok((response, used_bootstrap)) => {
+                health.consecutive_failures = 0;
+                health.cooldown_until = None;
+                if used_bootstrap != bootstrap_first {
+                    health.prefer_bootstrap_until = used_bootstrap
+                        .then(|| now + Duration::from_secs(DOH_BOOTSTRAP_PREFER_SECS));
+                }
+                Ok(response)
+            }
+            Err(error) => {
+                health.consecutive_failures += 1;
+                if health.consecutive_failures >= DOH_FAILURES_BEFORE_COOLDOWN {
+                    warn!(
+                        "DoH server {} failed {} times in a row, pausing for {}s",
+                        self.uri.host().unwrap_or_default(),
+                        health.consecutive_failures,
+                        DOH_COOLDOWN_SECS
+                    );
+                    health.cooldown_until = Some(now + Duration::from_secs(DOH_COOLDOWN_SECS));
+                }
+                Err(DohProxyError::Dns(format!("DoH GET failed: {}", error)))
+            }
+        }
+    }
+
+    /// 返回响应以及是否经由备用节点
+    async fn send_with_fallback(
+        &self,
+        url: &str,
+        bootstrap_first: bool,
+    ) -> std::result::Result<(reqwest::Response, bool), reqwest::Error> {
+        let send = |client: &Client| {
+            client
+                .get(url)
+                .header("accept", "application/dns-message")
+                .send()
+        };
+        let Some(bootstrap_client) = self.bootstrap_client.as_ref() else {
+            return send(&self.client).await.map(|response| (response, false));
+        };
+
+        let (first, second) = if bootstrap_first {
+            (bootstrap_client, &self.client)
+        } else {
+            (&self.client, bootstrap_client)
+        };
+        match send(first).await {
+            Ok(response) => Ok((response, bootstrap_first)),
+            // 只有连接层失败才换路；HTTP 错误码说明服务器已连通，换节点也一样
+            Err(error) => {
+                warn!(
+                    "DoH GET via {} failed, retrying via {}: {}",
+                    if bootstrap_first {
+                        "bootstrap IPs"
+                    } else {
+                        "system DNS"
+                    },
+                    if bootstrap_first {
+                        "system DNS"
+                    } else {
+                        "bootstrap IPs"
+                    },
+                    error
+                );
+                send(second)
+                    .await
+                    .map(|response| (response, !bootstrap_first))
+            }
+        }
+    }
+}
 
 /// DNS resolver with ECH config caching
 pub struct DnsResolver {
     resolver: TokioAsyncResolver,
     // IP 解析用（A/AAAA 查询）
-    doh_uri_ip: Option<Uri>,
-    doh_client_ip: Option<Client>,
+    doh_ip: Option<DohUpstream>,
     force_doh_get_ip: bool,
     // ECH 配置用（HTTPS 记录查询）
-    doh_uri_ech: Option<Uri>,
-    doh_client_ech: Option<Client>,
+    doh_ech: Option<DohUpstream>,
     force_doh_get_ech: bool,
     /// Cache for ECH configs (domain -> ECHConfigList)
     ech_cache: Arc<RwLock<HashMap<String, CachedEchConfig>>>,
@@ -142,13 +280,66 @@ impl DnsResolver {
         let upstream_key = upstream_proxy
             .map(UpstreamProxyConfig::cache_key)
             .unwrap_or_default();
+        let bootstrap_key = |url: Option<&str>| {
+            url.map(Self::bootstrap_ips_for_url)
+                .unwrap_or_default()
+                .iter()
+                .map(IpAddr::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        // 备用节点变化后要换新的 resolver，所以也纳入 key
         format!(
-            "{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}",
             doh_url,
             doh_url_ech.unwrap_or(""),
             if prefer_ipv6 { "v6" } else { "v4" },
             upstream_key,
+            bootstrap_key(Some(doh_url)),
+            bootstrap_key(doh_url_ech),
         )
+    }
+
+    fn bootstrap_registry() -> &'static RwLock<HashMap<String, Vec<IpAddr>>> {
+        DOH_BOOTSTRAP_IPS.get_or_init(|| RwLock::new(HashMap::new()))
+    }
+
+    fn doh_url_host(doh_url: &str) -> Option<String> {
+        let uri: Uri = doh_url.trim().parse().ok()?;
+        uri.host()
+            .map(|host| host.trim_matches(['[', ']']).to_ascii_lowercase())
+    }
+
+    /// 登记 DoH 服务器的备用节点 IP（按 DoH 域名）；ips 为空时取消登记。
+    /// 系统 DNS 解析不出或连不上 DoH 域名时，直连这些 IP（SNI 不变）。
+    pub fn set_bootstrap_ips(doh_url: &str, ips: &[String]) {
+        let Some(host) = Self::doh_url_host(doh_url) else {
+            return;
+        };
+        let parsed: Vec<IpAddr> = ips
+            .iter()
+            .filter_map(|ip| match ip.trim().parse::<IpAddr>() {
+                Ok(ip) => Some(ip),
+                Err(_) => {
+                    warn!("Ignoring invalid DoH bootstrap IP for {}: {}", host, ip);
+                    None
+                }
+            })
+            .collect();
+
+        let mut registry = Self::bootstrap_registry().write();
+        if parsed.is_empty() {
+            registry.remove(&host);
+        } else {
+            info!("DoH bootstrap IPs for {}: {:?}", host, parsed);
+            registry.insert(host, parsed);
+        }
+    }
+
+    fn bootstrap_ips_for_url(doh_url: &str) -> Vec<IpAddr> {
+        Self::doh_url_host(doh_url)
+            .and_then(|host| Self::bootstrap_registry().read().get(&host).cloned())
+            .unwrap_or_default()
     }
 
     fn shared_resolver_holder() -> &'static Arc<AsyncRwLock<HashMap<String, Arc<DnsResolver>>>> {
@@ -248,31 +439,48 @@ impl DnsResolver {
         prefer_ipv6: bool,
         upstream_proxy: Option<UpstreamProxyConfig>,
     ) -> Result<Self> {
-        let (config, doh_uri_ip) = Self::parse_doh_url(doh_url, prefer_ipv6).await?;
+        let bootstrap_ips = Self::bootstrap_ips_for_url(doh_url);
+        let (config, doh_uri_ip) =
+            Self::parse_doh_url(doh_url, prefer_ipv6, &bootstrap_ips).await?;
         let mut resolver = Self::with_resolver_config(config, prefer_ipv6).await?;
         if let Some(uri) = doh_uri_ip {
-            let client = Self::build_doh_client(resolver.resolve_timeout, upstream_proxy.as_ref())?;
-            resolver.doh_uri_ip = Some(uri.clone());
-            resolver.doh_client_ip = Some(client);
+            let upstream = Self::build_doh_upstream(
+                uri,
+                &bootstrap_ips,
+                resolver.resolve_timeout,
+                upstream_proxy.as_ref(),
+            )?;
+            resolver.doh_ip = Some(upstream.clone());
             resolver.force_doh_get_ip = true;
 
             // ECH 客户端：如果指定了独立 URL 则解析，否则复用 IP 客户端配置
             if let Some(ech_url) = doh_url_ech {
-                let (_, doh_uri_ech) = Self::parse_doh_url(ech_url, prefer_ipv6).await?;
-                if let Some(ech_uri) = doh_uri_ech {
-                    let ech_client =
-                        Self::build_doh_client(resolver.resolve_timeout, upstream_proxy.as_ref())?;
-                    resolver.doh_uri_ech = Some(ech_uri);
-                    resolver.doh_client_ech = Some(ech_client);
-                } else {
-                    // ECH URL 解析未产生 URI（不应发生），回退复用
-                    resolver.doh_uri_ech = Some(uri.clone());
-                    resolver.doh_client_ech = resolver.doh_client_ip.clone();
+                let ech_bootstrap_ips = Self::bootstrap_ips_for_url(ech_url);
+                match Self::parse_doh_url(ech_url, prefer_ipv6, &ech_bootstrap_ips).await {
+                    Ok((_, Some(ech_uri))) => {
+                        resolver.doh_ech = Some(Self::build_doh_upstream(
+                            ech_uri,
+                            &ech_bootstrap_ips,
+                            resolver.resolve_timeout,
+                            upstream_proxy.as_ref(),
+                        )?);
+                    }
+                    Ok((_, None)) => {
+                        // ECH URL 解析未产生 URI（不应发生），回退复用
+                        resolver.doh_ech = Some(upstream);
+                    }
+                    Err(e) => {
+                        // ECH 服务器不可用不影响 IP 解析，回退复用
+                        warn!(
+                            "ECH DoH server {} unavailable, reusing DNS server: {}",
+                            ech_url, e
+                        );
+                        resolver.doh_ech = Some(upstream);
+                    }
                 }
             } else {
                 // 未指定独立 ECH 服务器，复用 IP 客户端
-                resolver.doh_uri_ech = Some(uri);
-                resolver.doh_client_ech = resolver.doh_client_ip.clone();
+                resolver.doh_ech = Some(upstream);
             }
             resolver.force_doh_get_ech = true;
         }
@@ -283,6 +491,7 @@ impl DnsResolver {
     async fn parse_doh_url(
         doh_url: &str,
         prefer_ipv6: bool,
+        bootstrap_ips: &[IpAddr],
     ) -> Result<(ResolverConfig, Option<Uri>)> {
         use hickory_resolver::config::{NameServerConfig, NameServerConfigGroup, Protocol};
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -418,6 +627,9 @@ impl DnsResolver {
         let mut ips = Vec::new();
         if let Ok(ip) = host.parse::<IpAddr>() {
             ips.push(ip);
+        } else if !bootstrap_ips.is_empty() {
+            // 有备用节点时不在构造期查系统 DNS，系统 DNS 解析不出 DoH 域名也能正常启动
+            ips.extend_from_slice(bootstrap_ips);
         } else {
             let addrs = lookup_host((host, port)).await.map_err(|e| {
                 DohProxyError::Dns(format!("Failed to resolve DOH host {}: {}", host, e))
@@ -454,11 +666,9 @@ impl DnsResolver {
 
         Ok(Self {
             resolver,
-            doh_uri_ip: None,
-            doh_client_ip: None,
+            doh_ip: None,
             force_doh_get_ip: false,
-            doh_uri_ech: None,
-            doh_client_ech: None,
+            doh_ech: None,
             force_doh_get_ech: false,
             ech_cache: Arc::new(RwLock::new(HashMap::new())),
             ech_negative_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -512,7 +722,12 @@ impl DnsResolver {
         };
 
         if !is_leader {
-            notify.notified().await;
+            // 领头查询可能在这里注册等待前就已通知，设上限避免一直挂起
+            let _ = tokio::time::timeout(
+                Duration::from_secs(INFLIGHT_WAIT_TIMEOUT_SECS),
+                notify.notified(),
+            )
+            .await;
             let cache = self.ech_cache.read();
             if let Some(cached) = cache.get(domain) {
                 if cached.expires_at > std::time::Instant::now() {
@@ -695,7 +910,12 @@ impl DnsResolver {
         };
 
         if !is_leader {
-            notify.notified().await;
+            // 领头查询可能在这里注册等待前就已通知，设上限避免一直挂起
+            let _ = tokio::time::timeout(
+                Duration::from_secs(INFLIGHT_WAIT_TIMEOUT_SECS),
+                notify.notified(),
+            )
+            .await;
             let cache = self.ip_cache.read();
             if let Some(cached) = cache.get(domain) {
                 if cached.expires_at > std::time::Instant::now() {
@@ -1218,11 +1438,50 @@ impl DnsResolver {
         Duration::from_secs(clamped)
     }
 
+    fn build_doh_upstream(
+        uri: Uri,
+        bootstrap_ips: &[IpAddr],
+        timeout: Duration,
+        upstream_proxy: Option<&UpstreamProxyConfig>,
+    ) -> Result<DohUpstream> {
+        // 走上游代理时由代理解析 DoH 域名，备用节点没有意义
+        let bootstrap_host = uri
+            .host()
+            .filter(|host| host.parse::<IpAddr>().is_err())
+            .filter(|_| !bootstrap_ips.is_empty() && upstream_proxy.is_none());
+
+        let Some(host) = bootstrap_host else {
+            let client = Self::build_doh_client(Client::builder(), timeout, upstream_proxy)?;
+            return Ok(DohUpstream::new(uri, client, None));
+        };
+
+        let port = uri.port_u16().unwrap_or(443);
+        let addrs: Vec<std::net::SocketAddr> = bootstrap_ips
+            .iter()
+            .map(|ip| std::net::SocketAddr::new(*ip, port))
+            .collect();
+        let client = Self::build_doh_client(
+            Client::builder()
+                .connect_timeout(Duration::from_secs(DOH_PRIMARY_CONNECT_TIMEOUT_SECS)),
+            timeout,
+            None,
+        )?;
+        let bootstrap_client = Self::build_doh_client(
+            Client::builder()
+                .connect_timeout(Duration::from_secs(DOH_BOOTSTRAP_CONNECT_TIMEOUT_SECS))
+                .resolve_to_addrs(host, &addrs),
+            timeout,
+            None,
+        )?;
+        Ok(DohUpstream::new(uri, client, Some(bootstrap_client)))
+    }
+
     fn build_doh_client(
+        builder: reqwest::ClientBuilder,
         timeout: Duration,
         upstream_proxy: Option<&UpstreamProxyConfig>,
     ) -> Result<Client> {
-        let mut builder = Client::builder().timeout(timeout);
+        let mut builder = builder.timeout(timeout);
         if let Some(proxy) = upstream_proxy
             .filter(|proxy| proxy.is_valid() && (proxy.is_http() || proxy.is_socks5()))
         {
@@ -1264,8 +1523,7 @@ impl DnsResolver {
         let start = std::time::Instant::now();
         let Some(message) = self
             .doh_get_message_with(
-                self.doh_client_ech.as_ref(),
-                self.doh_uri_ech.as_ref(),
+                self.doh_ech.as_ref(),
                 domain,
                 hickory_resolver::proto::rr::RecordType::HTTPS,
             )
@@ -1302,14 +1560,12 @@ impl DnsResolver {
 
         let (a_result, aaaa_result) = tokio::join!(
             self.doh_get_message_with(
-                self.doh_client_ip.as_ref(),
-                self.doh_uri_ip.as_ref(),
+                self.doh_ip.as_ref(),
                 domain,
                 hickory_resolver::proto::rr::RecordType::A,
             ),
             self.doh_get_message_with(
-                self.doh_client_ip.as_ref(),
-                self.doh_uri_ip.as_ref(),
+                self.doh_ip.as_ref(),
                 domain,
                 hickory_resolver::proto::rr::RecordType::AAAA,
             ),
@@ -1357,17 +1613,14 @@ impl DnsResolver {
 
     async fn doh_get_message_with(
         &self,
-        client: Option<&Client>,
-        uri: Option<&Uri>,
+        upstream: Option<&DohUpstream>,
         domain: &str,
         record_type: hickory_resolver::proto::rr::RecordType,
     ) -> Result<Option<hickory_resolver::proto::op::Message>> {
-        let Some(client) = client else {
+        let Some(upstream) = upstream else {
             return Ok(None);
         };
-        let Some(uri) = uri else {
-            return Ok(None);
-        };
+        let uri = &upstream.uri;
         let start = std::time::Instant::now();
 
         use hickory_resolver::proto::op::{Edns, Message, Query};
@@ -1402,12 +1655,7 @@ impl DnsResolver {
         let path = uri.path();
         let url = format!("{}://{}{}?dns={}", scheme, authority, path, encoded);
 
-        let response = client
-            .get(url)
-            .header("accept", "application/dns-message")
-            .send()
-            .await
-            .map_err(|e| DohProxyError::Dns(format!("DoH GET failed: {}", e)))?;
+        let response = upstream.get(&url).await?;
 
         if !response.status().is_success() {
             return Err(DohProxyError::Dns(format!(
@@ -1442,5 +1690,207 @@ impl DnsResolver {
             start.elapsed().as_millis()
         );
         Ok(Some(message))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hickory_resolver::config::ResolverConfig;
+    use hickory_resolver::proto::op::{Message, MessageType};
+    use hickory_resolver::proto::rr::{rdata::A, RData, Record, RecordType};
+    use std::net::Ipv4Addr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    const FAKE_ANSWER: Ipv4Addr = Ipv4Addr::new(1, 2, 3, 4);
+
+    /// 本地假 DoH 服务器（明文 HTTP）：A 查询回 1.2.3.4，其他类型回空应答
+    async fn spawn_fake_doh() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let encoded = request
+                        .split("dns=")
+                        .nth(1)
+                        .and_then(|rest| rest.split(' ').next())
+                        .unwrap_or_default();
+                    let query =
+                        Message::from_vec(&URL_SAFE_NO_PAD.decode(encoded).unwrap()).unwrap();
+                    let question = query.queries()[0].clone();
+                    let mut response = Message::new();
+                    response
+                        .set_id(query.id())
+                        .set_message_type(MessageType::Response)
+                        .add_query(question.clone());
+                    if question.query_type() == RecordType::A {
+                        response.add_answer(Record::from_rdata(
+                            question.name().clone(),
+                            120,
+                            RData::A(A(FAKE_ANSWER)),
+                        ));
+                    }
+                    let body = response.to_vec().unwrap();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/dns-message\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+        port
+    }
+
+    async fn closed_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    /// 主地址是系统 DNS 解析不出的 .invalid 域名，备用节点指向本机 port
+    fn unresolvable_upstream(port: u16) -> DohUpstream {
+        let uri: Uri = format!("http://doh-bootstrap-test.invalid:{}/v1/lookup", port)
+            .parse()
+            .unwrap();
+        DnsResolver::build_doh_upstream(
+            uri,
+            &[IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            Duration::from_secs(5),
+            None,
+        )
+        .unwrap()
+    }
+
+    async fn resolver_with(upstream: DohUpstream) -> DnsResolver {
+        let mut resolver = DnsResolver::with_resolver_config(ResolverConfig::new(), false)
+            .await
+            .unwrap();
+        resolver.doh_ip = Some(upstream.clone());
+        resolver.doh_ech = Some(upstream);
+        resolver.force_doh_get_ip = true;
+        resolver.force_doh_get_ech = true;
+        resolver
+    }
+
+    #[test]
+    fn bootstrap_registry_is_keyed_by_doh_host() {
+        let url = "https://Registry-Test.Example/v1/lookup";
+        let key_before = DnsResolver::shared_cache_key(url, None, false, None);
+
+        DnsResolver::set_bootstrap_ips(url, &["203.0.113.1".into(), "not-an-ip".into()]);
+        assert_eq!(
+            DnsResolver::bootstrap_ips_for_url("https://registry-test.example/dns-query"),
+            vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))]
+        );
+        assert_ne!(
+            DnsResolver::shared_cache_key(url, None, false, None),
+            key_before
+        );
+
+        DnsResolver::set_bootstrap_ips(url, &[]);
+        assert!(DnsResolver::bootstrap_ips_for_url(url).is_empty());
+        assert_eq!(
+            DnsResolver::shared_cache_key(url, None, false, None),
+            key_before
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_server_with_bootstrap_starts_without_system_dns() {
+        let url = "https://startup-test.invalid/v1/lookup";
+        DnsResolver::set_bootstrap_ips(url, &["203.0.113.2".into()]);
+        let resolver = DnsResolver::new(url, None, false, None).await;
+        DnsResolver::set_bootstrap_ips(url, &[]);
+        let resolver = resolver.expect("bootstrap IPs should avoid system DNS at startup");
+        assert!(resolver.doh_ip.as_ref().unwrap().bootstrap_client.is_some());
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_bootstrap_ips_and_prefers_them() {
+        let port = spawn_fake_doh().await;
+        let upstream = unresolvable_upstream(port);
+        let resolver = resolver_with(upstream.clone()).await;
+
+        let addrs = resolver.lookup_ip("example.com").await.unwrap();
+        assert_eq!(addrs, vec![IpAddr::V4(FAKE_ANSWER)]);
+
+        let health = upstream.health.lock();
+        assert!(health.prefer_bootstrap_until.is_some());
+        assert_eq!(health.consecutive_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn cools_down_after_repeated_failures() {
+        let upstream = unresolvable_upstream(closed_port().await);
+        let url = format!("{}?dns=AAAA", upstream.uri);
+        for _ in 0..DOH_FAILURES_BEFORE_COOLDOWN {
+            assert!(upstream.get(&url).await.is_err());
+        }
+
+        let start = std::time::Instant::now();
+        let error = upstream.get(&url).await.unwrap_err();
+        assert!(error.to_string().contains("cooling down"), "{}", error);
+        assert!(start.elapsed() < Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn lookup_failure_does_not_hang() {
+        let resolver = resolver_with(unresolvable_upstream(closed_port().await)).await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            resolver.lookup_ech_and_ip("example.com"),
+        )
+        .await
+        .expect("lookup should finish");
+        assert!(result.1.is_err());
+    }
+
+    /// 连真实的 cfluxdo 加速节点：主地址故意指向黑洞，验证走备用节点能查到 linux.do。
+    /// 需要外网，手动运行：cargo test -- --ignored edge_doh
+    #[tokio::test]
+    #[ignore]
+    async fn edge_doh_via_bootstrap_nodes() {
+        let host = "cfluxdotest01.wq.1molchuan.top";
+        let uri: Uri = format!("https://{}/v1/lookup", host).parse().unwrap();
+        let nodes: Vec<std::net::SocketAddr> = [
+            "156.239.232.8",
+            "156.239.232.72",
+            "203.168.131.145",
+            "103.199.103.204",
+        ]
+        .iter()
+        .map(|ip| std::net::SocketAddr::new(ip.parse().unwrap(), 443))
+        .collect();
+        let blackhole = [std::net::SocketAddr::new("192.0.2.1".parse().unwrap(), 443)];
+        let timeout = Duration::from_secs(5);
+        let client = DnsResolver::build_doh_client(
+            Client::builder()
+                .connect_timeout(Duration::from_secs(DOH_PRIMARY_CONNECT_TIMEOUT_SECS))
+                .resolve_to_addrs(host, &blackhole),
+            timeout,
+            None,
+        )
+        .unwrap();
+        let bootstrap = DnsResolver::build_doh_client(
+            Client::builder()
+                .connect_timeout(Duration::from_secs(DOH_BOOTSTRAP_CONNECT_TIMEOUT_SECS))
+                .resolve_to_addrs(host, &nodes),
+            timeout,
+            None,
+        )
+        .unwrap();
+        let upstream = DohUpstream::new(uri, client, Some(bootstrap));
+        let resolver = resolver_with(upstream.clone()).await;
+
+        let addrs = resolver.lookup_ip("linux.do").await.unwrap();
+        println!("linux.do -> {:?}", addrs);
+        assert!(!addrs.is_empty());
+        assert!(upstream.health.lock().prefer_bootstrap_until.is_some());
     }
 }

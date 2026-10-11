@@ -58,6 +58,14 @@ impl DohProxyServer {
         }
 
         let dns_resolver = if config.enable_doh {
+            DnsResolver::set_bootstrap_ips(&config.doh_server, &config.doh_bootstrap_ips);
+            if let Some(ech_server) = config
+                .doh_server_ech
+                .as_deref()
+                .filter(|ech_server| *ech_server != config.doh_server)
+            {
+                DnsResolver::set_bootstrap_ips(ech_server, &config.doh_ech_bootstrap_ips);
+            }
             Some(
                 DnsResolver::shared(
                     &config.doh_server,
@@ -551,11 +559,21 @@ async fn gateway_forward_request(
 
         if is_h2 {
             debug!("Gateway: HTTP/2 connection to {}", host_key);
-            let (s, conn) =
-                hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io)
-                    .await
-                    .map_err(|e| warn!("Gateway H2 handshake failed: {}", e))
-                    .unwrap_or_else(|_| unreachable!());
+            let (s, conn) = match hyper::client::conn::http2::handshake(
+                hyper_util::rt::TokioExecutor::new(),
+                io,
+            )
+            .await
+            {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn!("Gateway H2 handshake failed for {}: {}", host_key, e);
+                    return Ok(gateway_error_response(
+                        502,
+                        &format!("H2 handshake failed: {}", e),
+                    ));
+                }
+            };
             tokio::spawn(async move {
                 if let Err(e) = conn.await {
                     debug!("Gateway H2 conn closed: {}", e);
@@ -566,10 +584,16 @@ async fn gateway_forward_request(
             pool.lock().await.insert(host_key.clone(), s_clone);
         } else {
             debug!("Gateway: HTTP/1.1 connection to {}", host_key);
-            let (s, conn) = hyper::client::conn::http1::handshake(io)
-                .await
-                .map_err(|e| warn!("Gateway H1 handshake failed: {}", e))
-                .unwrap_or_else(|_| unreachable!());
+            let (s, conn) = match hyper::client::conn::http1::handshake(io).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn!("Gateway H1 handshake failed for {}: {}", host_key, e);
+                    return Ok(gateway_error_response(
+                        502,
+                        &format!("H1 handshake failed: {}", e),
+                    ));
+                }
+            };
             tokio::spawn(async move {
                 if let Err(e) = conn.await {
                     debug!("Gateway H1 conn closed: {}", e);

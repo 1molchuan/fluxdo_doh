@@ -130,6 +130,12 @@ pub struct ProxyConfig {
     /// When None, uses the same server as doh_server
     #[serde(default)]
     pub doh_server_ech: Option<String>,
+    /// doh_server 的备用节点 IP：系统 DNS 解析不出或连不上 DoH 域名时直连这些 IP（SNI 不变）
+    #[serde(default)]
+    pub doh_bootstrap_ips: Vec<String>,
+    /// doh_server_ech 的备用节点 IP
+    #[serde(default)]
+    pub doh_ech_bootstrap_ips: Vec<String>,
     /// Whether to prefer IPv6
     pub prefer_ipv6: bool,
     /// Connection timeout in seconds
@@ -169,6 +175,8 @@ impl Default for ProxyConfig {
             enable_doh: true,
             doh_server: "https://cloudflare-dns.com/dns-query".to_string(),
             doh_server_ech: None,
+            doh_bootstrap_ips: Vec::new(),
+            doh_ech_bootstrap_ips: Vec::new(),
             prefer_ipv6: false,
             timeout_secs: 30,
             upstream_proxy: None,

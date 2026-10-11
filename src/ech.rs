@@ -147,6 +147,26 @@ impl DohTlsConnector {
         Ok(Box::new(stream))
     }
 
+    /// 系统 DNS 解析（DoH 不可用时的回退）
+    async fn system_lookup_ip(&self, host: &str, port: u16) -> Result<Vec<IpAddr>> {
+        let addrs = tokio::time::timeout(self.timeout, tokio::net::lookup_host((host, port)))
+            .await
+            .map_err(|_| DohProxyError::Timeout)?
+            .map_err(|e| {
+                DohProxyError::Dns(format!("System DNS lookup failed for {}: {}", host, e))
+            })?;
+        let mut ips: Vec<IpAddr> = Vec::new();
+        for addr in addrs {
+            if !ips.contains(&addr.ip()) {
+                ips.push(addr.ip());
+            }
+        }
+        if ips.is_empty() {
+            return Err(DohProxyError::Dns(format!("No IP found for {}", host)));
+        }
+        Ok(ips)
+    }
+
     /// 连接单个已解析的地址（带超时）
     async fn tcp_connect_addr(&self, addr: SocketAddr) -> Result<TcpStream> {
         tokio::time::timeout(self.timeout, TcpStream::connect(addr))
@@ -315,11 +335,24 @@ impl DohTlsConnector {
             }
         }
 
-        // 3. 使用 IP 列表连接
-        let addrs = ip_result?;
-        if addrs.is_empty() {
-            return Err(DohProxyError::Dns(format!("No IP found for {}", host)));
-        }
+        // 3. 使用 IP 列表连接；DoH 查不到时回退系统 DNS，不让请求直接失败
+        let addrs = match ip_result {
+            Ok(addrs) if !addrs.is_empty() => addrs,
+            Ok(_) => {
+                warn!(
+                    "DoH returned no IP for {}, falling back to system DNS",
+                    host
+                );
+                self.system_lookup_ip(host, port).await?
+            }
+            Err(e) => {
+                warn!(
+                    "DoH lookup failed for {} ({}), falling back to system DNS",
+                    host, e
+                );
+                self.system_lookup_ip(host, port).await?
+            }
+        };
         let addrs = dns_resolver.order_addrs_by_rtt(addrs);
 
         let (v6_addrs, v4_addrs): (Vec<_>, Vec<_>) =
