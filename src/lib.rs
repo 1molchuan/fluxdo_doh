@@ -171,6 +171,16 @@ pub struct ProxyConfig {
     /// Optional runtime CA private key PEM (per-device CA for iOS)
     #[serde(default)]
     pub ca_key_pem: Option<String>,
+    /// 路由表接口地址（加速服务端 `GET /v1/routes`）。有值时进入查表模式：
+    /// 表内域名直接用表里的 IP，不发 DoH；None 则和以前一样全部走 DoH
+    #[serde(default)]
+    pub doh_routes_url: Option<String>,
+    /// App 持久化的上一份路由表原文（JSON），启动时先用它，后台再刷新
+    #[serde(default)]
+    pub doh_route_table_json: Option<String>,
+    /// App 持久化的签名节点列表信封（JSON `{kid,payload,sig}`），启动时重新验签后生效
+    #[serde(default)]
+    pub doh_node_list_json: Option<String>,
 }
 
 impl Default for ProxyConfig {
@@ -194,6 +204,9 @@ impl Default for ProxyConfig {
             h2_mitm: false,
             ca_cert_pem: None,
             ca_key_pem: None,
+            doh_routes_url: None,
+            doh_route_table_json: None,
+            doh_node_list_json: None,
         }
     }
 }

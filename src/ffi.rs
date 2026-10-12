@@ -499,6 +499,76 @@ pub extern "C" fn doh_proxy_take_auth_rejected() -> c_int {
     }
 }
 
+/// 取出并清空待 App 持久化的加速更新（新路由表原文 / 新节点列表）。
+/// 返回 `{"ok":true,"route_table":<string|null>,"nodes":<string|null>,"nodes_envelope":{kid,payload,sig}|null}`；
+/// 没有更新时三项都是 null。返回的字符串需要调用 doh_proxy_free_string 释放
+#[no_mangle]
+pub extern "C" fn doh_proxy_take_accel_update() -> *mut c_char {
+    let update = crate::dns::DnsResolver::take_accel_update().unwrap_or_default();
+    json_to_c_string(serde_json::json!({
+        "ok": true,
+        "route_table": update.route_table,
+        "nodes": update.nodes,
+        "nodes_envelope": update.nodes_envelope,
+    }))
+}
+
+/// 经 DoH 同一套 HTTP 客户端发加速接口请求（令牌申请/续期等），让 Dart 侧不再有第二套 TLS 栈。
+/// `headers_json` 为 `{"name":"value",...}` 或 null；`body` 为 UTF-8 字符串或 null。
+/// 返回 `{"ok":true,"status":<u16>,"body":"<string>"}`，或 `{"ok":false,"error":"..."}`。
+/// 返回的字符串需要调用 doh_proxy_free_string 释放
+#[no_mangle]
+pub extern "C" fn doh_proxy_accel_request(
+    method: *const c_char,
+    url: *const c_char,
+    headers_json: *const c_char,
+    body: *const c_char,
+) -> *mut c_char {
+    doh_proxy_init_logging();
+
+    let method = match parse_required_string(method, "method") {
+        Ok(value) => value,
+        Err(message) => return error_json(&message),
+    };
+    let url = match parse_required_string(url, "url") {
+        Ok(value) => value,
+        Err(message) => return error_json(&message),
+    };
+    let headers: Vec<(String, String)> = match parse_optional_string(headers_json) {
+        Some(raw) => match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&raw)
+        {
+            Ok(map) => map
+                .into_iter()
+                .filter_map(|(name, value)| match value {
+                    serde_json::Value::String(value) => Some((name, value)),
+                    serde_json::Value::Null => None,
+                    other => Some((name, other.to_string())),
+                })
+                .collect(),
+            Err(e) => return error_json(&format!("Invalid headers JSON: {}", e)),
+        },
+        None => Vec::new(),
+    };
+    let body = parse_optional_string(body);
+
+    let rt = get_runtime();
+    let result = rt.block_on(crate::dns::DnsResolver::accel_request(
+        &method,
+        &url,
+        &headers,
+        body.as_deref().map(str::as_bytes),
+    ));
+
+    match result {
+        Ok(response) => json_to_c_string(serde_json::json!({
+            "ok": true,
+            "status": response.status,
+            "body": response.body,
+        })),
+        Err(e) => error_json(&format!("{}", e)),
+    }
+}
+
 /// Return shared DNS resolver cache statistics.
 /// The caller must free the returned string with doh_proxy_free_string.
 #[no_mangle]
@@ -627,8 +697,11 @@ pub extern "C" fn doh_proxy_free_string(ptr: *mut c_char) {
 }
 
 fn error_json(msg: &str) -> *mut c_char {
-    let json = format!(r#"{{"ok":false,"error":"{}"}}"#, msg.replace('"', r#"\""#));
-    match std::ffi::CString::new(json) {
+    json_to_c_string(serde_json::json!({ "ok": false, "error": msg }))
+}
+
+fn json_to_c_string(value: serde_json::Value) -> *mut c_char {
+    match std::ffi::CString::new(value.to_string()) {
         Ok(c) => c.into_raw(),
         Err(_) => std::ptr::null_mut(),
     }

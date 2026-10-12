@@ -68,6 +68,30 @@ impl DohProxyServer {
                 DnsResolver::set_bootstrap_ips(ech_server, &config.doh_ech_bootstrap_ips);
                 DnsResolver::set_auth_token(ech_server, config.doh_ech_auth_token.as_deref());
             }
+            // 节点列表先于 resolver 建立，首启解析 DoH 域名就能用下发的节点
+            if let Some(raw) = config.doh_node_list_json.as_deref() {
+                match DnsResolver::load_node_list_json(raw) {
+                    Ok(true) => info!("Persisted node list loaded"),
+                    Ok(false) => info!("Persisted node list is not newer than current"),
+                    Err(error) => warn!("Persisted node list rejected: {}", error),
+                }
+            }
+            // 查表模式：登记路由表接口；None 时取消登记（切回普通 DoH 服务器）
+            if let Err(error) = DnsResolver::set_routes_url(
+                &config.doh_server,
+                config.doh_routes_url.as_deref(),
+                config.upstream_proxy.as_ref(),
+            ) {
+                warn!("Route table URL rejected, staying in DoH-only mode: {}", error);
+            } else if let Some(raw) = config
+                .doh_route_table_json
+                .as_deref()
+                .filter(|_| config.doh_routes_url.is_some())
+            {
+                if let Err(error) = DnsResolver::load_route_table_json(&config.doh_server, raw) {
+                    warn!("Persisted route table ignored: {}", error);
+                }
+            }
             Some(
                 DnsResolver::shared(
                     &config.doh_server,

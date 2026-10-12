@@ -13,12 +13,13 @@ use http::Uri;
 use parking_lot::RwLock;
 use reqwest::Client;
 use rustls::pki_types::EchConfigListBytes;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{
     collections::{HashMap, HashSet},
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, OnceLock},
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::net::lookup_host;
 use tokio::sync::{Mutex, Notify, RwLock as AsyncRwLock};
@@ -55,6 +56,28 @@ const DOH_AUTH_REJECTED_COOLDOWN_SECS: u64 = 60;
 /// DoH 请求固定带的 User-Agent：安卓上最常见的 HTTP 库，混在普通 App 流量里不显眼。
 /// 只用于 DoH 查询，不影响经代理转发的站点请求。
 const DOH_USER_AGENT: &str = "okhttp/4.12.0";
+/// DNS 查询报文用 EDNS(0) Padding 填充到这个长度的整倍数（RFC 8467 推荐值），去掉报文长度特征
+const DNS_QUERY_PAD_BLOCK: usize = 128;
+/// 没有可用路由表时，查询最多等首次拉取这么久（秒），超时就走 DoH
+const ROUTES_INITIAL_WAIT_SECS: u64 = 4;
+/// 路由表拉取失败后的退避时长（秒），期间查询直接走 DoH，不再每次等待
+const ROUTES_RETRY_BACKOFF_SECS: u64 = 30;
+/// 路由表拉取请求的总超时（秒）
+const ROUTES_FETCH_TIMEOUT_SECS: u64 = 10;
+/// App 经 Rust 发出的加速接口请求（令牌申请/续期等）的总超时（秒）
+const ACCEL_REQUEST_TIMEOUT_SECS: u64 = 10;
+/// 签名节点列表的内嵌公钥：kid -> Ed25519 公钥（32 字节）。换钥时追加新 kid，老钥保留到老客户端退场
+const NODE_LIST_PUBKEYS: &[(&str, [u8; 32])] = &[
+    // 2026-10-12 服务端生成，base64 为 0nnkUa5f1lPKHnSKFMc5N/vZlBIp+jRQJnP+OFelaCI=
+    (
+        "2026-10",
+        [
+            0xd2, 0x79, 0xe4, 0x51, 0xae, 0x5f, 0xd6, 0x53, 0xca, 0x1e, 0x74, 0x8a, 0x14, 0xc7,
+            0x39, 0x37, 0xfb, 0xd9, 0x94, 0x12, 0x29, 0xfa, 0x34, 0x50, 0x26, 0x73, 0xfe, 0x38,
+            0x57, 0xa5, 0x68, 0x22,
+        ],
+    ),
+];
 
 static SHARED_RESOLVERS: OnceLock<Arc<AsyncRwLock<HashMap<String, Arc<DnsResolver>>>>> =
     OnceLock::new();
@@ -68,13 +91,120 @@ static DOH_AUTH_TOKENS: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::ne
 /// 有 DoH 服务器拒绝了令牌，等 App 取走后重新申请
 static DOH_AUTH_REJECTED: AtomicBool = AtomicBool::new(false);
 
-/// DoH 上游。主客户端用系统 DNS 解析 DoH 域名；登记了备用节点 IP 时另建一个直连节点的客户端
-/// （只替换连接地址，SNI 和 Host 不变），主客户端连不上时改用它重试。
+/// DoH 服务器域名 -> 路由表（查表模式），由启动配置登记；没登记的服务器行为不变
+static DOH_ROUTE_TABLES: OnceLock<RwLock<HashMap<String, Arc<RouteTableStore>>>> =
+    OnceLock::new();
+
+/// 已验签接受的节点列表：加速域名 -> 当前节点 IP，优先级高于启动登记的种子 IP
+static NODE_LIST: OnceLock<RwLock<Option<Arc<NodeList>>>> = OnceLock::new();
+
+/// 等 App 取走并持久化的更新：路由表原文、节点列表
+static ACCEL_UPDATE: OnceLock<parking_lot::Mutex<AccelUpdate>> = OnceLock::new();
+
+/// `accel_request` 用的客户端缓存：scheme://authority -> 上游（复用连接，与 DoH 同一套 TLS 栈）
+static ACCEL_UPSTREAMS: OnceLock<RwLock<HashMap<String, DohUpstream>>> = OnceLock::new();
+
+/// 测试用的额外公钥（kid -> 公钥），与 `NODE_LIST_PUBKEYS` 一起查
+#[cfg(test)]
+static TEST_NODE_LIST_PUBKEYS: OnceLock<RwLock<Vec<(String, [u8; 32])>>> = OnceLock::new();
+
+/// 当前 unix 时间（秒）
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 解 base64：先按标准（带填充），再兼容 url-safe / 无填充
+fn decode_base64_lenient(value: &str) -> Option<Vec<u8>> {
+    use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE};
+    let value = value.trim();
+    STANDARD
+        .decode(value)
+        .or_else(|_| STANDARD_NO_PAD.decode(value))
+        .or_else(|_| URL_SAFE.decode(value))
+        .or_else(|_| URL_SAFE_NO_PAD.decode(value))
+        .ok()
+}
+
+/// reqwest 的 DNS 解析器：建连时才取 DoH 域名当前的备用节点 IP
+/// （已下发的节点列表 > 启动登记的种子 > 构造期传入的 `initial`），节点列表更新后不用重建客户端。
+/// 返回的端口为 0，由 hyper 换成 URL 里的端口。
+struct BootstrapResolver {
+    host: String,
+    initial: Vec<IpAddr>,
+}
+
+impl BootstrapResolver {
+    fn current(&self) -> Vec<IpAddr> {
+        let ips = DnsResolver::bootstrap_ips_for_host(&self.host);
+        if ips.is_empty() {
+            self.initial.clone()
+        } else {
+            ips
+        }
+    }
+}
+
+impl reqwest::dns::Resolve for BootstrapResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let requested = name.as_str().trim_end_matches('.').to_ascii_lowercase();
+        let addrs: Vec<SocketAddr> = if requested == self.host {
+            self.current()
+                .into_iter()
+                .map(|ip| SocketAddr::new(ip, 0))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Box::pin(async move {
+            if addrs.is_empty() {
+                let error: Box<dyn std::error::Error + Send + Sync> = Box::new(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("no bootstrap IPs for {}", requested),
+                ));
+                Err(error)
+            } else {
+                Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+            }
+        })
+    }
+}
+
+/// 经 DoH 上游客户端发出的请求：DNS 查询报文，或 App 的加速接口 HTTP 请求（同一套 TLS 栈和备用节点）
+enum DohRequest<'a> {
+    Dns {
+        message: &'a [u8],
+        endpoint: &'a str,
+    },
+    Http {
+        method: reqwest::Method,
+        url: &'a str,
+        headers: &'a [(String, String)],
+        body: Option<&'a [u8]>,
+        /// 调用方没给 Authorization 时，是否带上登记的令牌
+        registry_auth: bool,
+        /// 带登记令牌被 401/403 时是否打「令牌被拒」标记
+        flag_auth_rejected: bool,
+    },
+}
+
+impl DohRequest<'_> {
+    fn is_dns(&self) -> bool {
+        matches!(self, DohRequest::Dns { .. })
+    }
+}
+
+/// DoH 上游。主客户端用系统 DNS 解析 DoH 域名；域名型地址另建一个直连备用节点的客户端
+/// （只替换连接地址，SNI 和 Host 不变），主客户端连不上且当前有备用节点时改用它重试。
 #[derive(Clone)]
 struct DohUpstream {
     uri: Uri,
     client: Client,
     bootstrap_client: Option<Client>,
+    /// 备用节点来源；None 表示 `bootstrap_client` 自带固定地址（测试用）
+    bootstrap: Option<Arc<BootstrapResolver>>,
     health: Arc<parking_lot::Mutex<DohUpstreamHealth>>,
 }
 
@@ -98,8 +228,26 @@ impl DohUpstream {
             uri,
             client,
             bootstrap_client,
+            bootstrap: None,
             health: Arc::new(parking_lot::Mutex::new(DohUpstreamHealth::default())),
         }
+    }
+
+    fn with_bootstrap(mut self, bootstrap: Arc<BootstrapResolver>) -> Self {
+        self.bootstrap = Some(bootstrap);
+        self
+    }
+
+    /// 当前是否有可用的备用节点地址
+    fn bootstrap_available(&self) -> bool {
+        match &self.bootstrap {
+            Some(bootstrap) => !bootstrap.current().is_empty(),
+            None => true,
+        }
+    }
+
+    fn host(&self) -> &str {
+        self.uri.host().unwrap_or_default()
     }
 
     /// 不带查询参数的请求地址：scheme://authority/path
@@ -115,21 +263,56 @@ impl DohUpstream {
     /// 发送 DNS 查询报文。默认 POST（报文放请求体，二进制 body 比 `?dns=` 更像普通 API 调用）；
     /// 服务器回 405/415 说明只支持 GET，改为 GET `?dns=` 重发一次，之后该服务器一直用 GET。
     async fn query(&self, message: &[u8]) -> Result<reqwest::Response> {
+        let endpoint = self.endpoint()?;
+        let request = DohRequest::Dns {
+            message,
+            endpoint: &endpoint,
+        };
         loop {
-            let (response, retry_with_get) = self.query_once(message).await?;
+            let (response, retry_with_get) = self.send_once(&request).await?;
             if !retry_with_get {
                 return Ok(response);
             }
         }
     }
 
-    /// 返回响应，以及是否刚切到 GET、需要重发
-    async fn query_once(&self, message: &[u8]) -> Result<(reqwest::Response, bool)> {
-        let auth_token = DnsResolver::auth_token_for_uri(&self.uri);
+    /// 发送普通 HTTP 请求（路由表拉取、App 的加速接口调用），复用 DoH 的客户端、备用节点和健康状态。
+    /// 不检查 DoH 的暂停状态：调用方各有自己的退避。
+    async fn send_http(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        headers: &[(String, String)],
+        body: Option<&[u8]>,
+        registry_auth: bool,
+        flag_auth_rejected: bool,
+    ) -> Result<reqwest::Response> {
+        let request = DohRequest::Http {
+            method,
+            url,
+            headers,
+            body,
+            registry_auth,
+            flag_auth_rejected,
+        };
+        let (response, _) = self.send_once(&request).await?;
+        Ok(response)
+    }
+
+    /// 返回响应，以及是否刚切到 GET、需要重发（只对 DNS 查询）
+    async fn send_once(&self, request: &DohRequest<'_>) -> Result<(reqwest::Response, bool)> {
+        let is_dns = request.is_dns();
+        let wants_registry_token = match request {
+            DohRequest::Dns { .. } => true,
+            DohRequest::Http { registry_auth, .. } => *registry_auth,
+        };
+        let auth_token = wants_registry_token
+            .then(|| DnsResolver::auth_token_for_uri(&self.uri))
+            .flatten();
         let (bootstrap_first, cooling_down, use_get) = {
             let mut health = self.health.lock();
-            let now = std::time::Instant::now();
-            if health.rejected_token.is_some() && health.rejected_token != auth_token {
+            let now = Instant::now();
+            if is_dns && health.rejected_token.is_some() && health.rejected_token != auth_token {
                 health.rejected_token = None;
                 health.cooldown_until = None;
             }
@@ -141,76 +324,150 @@ impl DohUpstream {
                 health.get_only,
             )
         };
-        if cooling_down {
+        if is_dns && cooling_down {
             return Err(DohProxyError::Dns(format!(
                 "DoH server {} is cooling down",
-                self.uri.host().unwrap_or_default()
+                self.host()
             )));
         }
 
-        let endpoint = self.endpoint()?;
         let result = self
-            .send_with_fallback(
-                &endpoint,
-                message,
-                use_get,
-                bootstrap_first,
-                auth_token.as_deref(),
-            )
+            .send_with_fallback(request, use_get, bootstrap_first, auth_token.as_deref())
             .await;
 
         let mut health = self.health.lock();
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         match result {
             Ok((response, used_bootstrap)) => {
                 health.consecutive_failures = 0;
-                health.cooldown_until = None;
+                if is_dns {
+                    health.cooldown_until = None;
+                }
                 if used_bootstrap != bootstrap_first {
                     health.prefer_bootstrap_until = used_bootstrap
                         .then(|| now + Duration::from_secs(DOH_BOOTSTRAP_PREFER_SECS));
                 }
                 let status = response.status();
-                if !use_get
-                    && (status == reqwest::StatusCode::METHOD_NOT_ALLOWED
-                        || status == reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE)
-                {
-                    warn!(
-                        "DoH server {} does not accept POST ({}), switching to GET",
-                        self.uri.host().unwrap_or_default(),
-                        status
-                    );
-                    health.get_only = true;
-                    return Ok((response, true));
-                }
-                if auth_token.is_some()
+                let auth_rejected = auth_token.is_some()
                     && (status == reqwest::StatusCode::UNAUTHORIZED
-                        || status == reqwest::StatusCode::FORBIDDEN)
-                {
-                    warn!(
-                        "DoH server {} rejected the auth token ({}), pausing for {}s",
-                        self.uri.host().unwrap_or_default(),
-                        status,
-                        DOH_AUTH_REJECTED_COOLDOWN_SECS
-                    );
-                    health.rejected_token = auth_token;
-                    health.cooldown_until =
-                        Some(now + Duration::from_secs(DOH_AUTH_REJECTED_COOLDOWN_SECS));
-                    DOH_AUTH_REJECTED.store(true, Ordering::Relaxed);
+                        || status == reqwest::StatusCode::FORBIDDEN);
+                match request {
+                    DohRequest::Dns { .. } => {
+                        if !use_get
+                            && (status == reqwest::StatusCode::METHOD_NOT_ALLOWED
+                                || status == reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE)
+                        {
+                            warn!(
+                                "DoH server {} does not accept POST ({}), switching to GET",
+                                self.host(),
+                                status
+                            );
+                            health.get_only = true;
+                            return Ok((response, true));
+                        }
+                        if auth_rejected {
+                            warn!(
+                                "DoH server {} rejected the auth token ({}), pausing for {}s",
+                                self.host(),
+                                status,
+                                DOH_AUTH_REJECTED_COOLDOWN_SECS
+                            );
+                            health.rejected_token = auth_token;
+                            health.cooldown_until =
+                                Some(now + Duration::from_secs(DOH_AUTH_REJECTED_COOLDOWN_SECS));
+                            DOH_AUTH_REJECTED.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    DohRequest::Http {
+                        flag_auth_rejected,
+                        ..
+                    } => {
+                        if auth_rejected && *flag_auth_rejected {
+                            warn!(
+                                "Accel server {} rejected the auth token ({})",
+                                self.host(),
+                                status
+                            );
+                            DOH_AUTH_REJECTED.store(true, Ordering::Relaxed);
+                        }
+                    }
                 }
                 Ok((response, false))
             }
             Err(error) => {
                 health.consecutive_failures += 1;
-                if health.consecutive_failures >= DOH_FAILURES_BEFORE_COOLDOWN {
+                if is_dns && health.consecutive_failures >= DOH_FAILURES_BEFORE_COOLDOWN {
                     warn!(
                         "DoH server {} failed {} times in a row, pausing for {}s",
-                        self.uri.host().unwrap_or_default(),
+                        self.host(),
                         health.consecutive_failures,
                         DOH_COOLDOWN_SECS
                     );
                     health.cooldown_until = Some(now + Duration::from_secs(DOH_COOLDOWN_SECS));
                 }
-                Err(DohProxyError::Dns(format!("DoH request failed: {}", error)))
+                Err(DohProxyError::Dns(format!(
+                    "{} request failed: {}",
+                    if is_dns { "DoH" } else { "Accel" },
+                    error
+                )))
+            }
+        }
+    }
+
+    /// 按请求类型构造 reqwest 请求。不打印 headers/body。
+    fn build_request(
+        client: &Client,
+        request: &DohRequest<'_>,
+        use_get: bool,
+        auth_token: Option<&str>,
+    ) -> reqwest::RequestBuilder {
+        match request {
+            DohRequest::Dns { message, endpoint } => {
+                let builder = if use_get {
+                    client.get(format!(
+                        "{}?dns={}",
+                        endpoint,
+                        URL_SAFE_NO_PAD.encode(message)
+                    ))
+                } else {
+                    client
+                        .post(*endpoint)
+                        .header("content-type", "application/dns-message")
+                        .body(message.to_vec())
+                }
+                .header("accept", "application/dns-message");
+                match auth_token {
+                    Some(token) => builder.bearer_auth(token),
+                    None => builder,
+                }
+            }
+            DohRequest::Http {
+                method,
+                url,
+                headers,
+                body,
+                ..
+            } => {
+                let mut builder = client.request(method.clone(), *url);
+                let mut has_accept = false;
+                let mut has_auth = false;
+                for (name, value) in headers.iter() {
+                    has_accept |= name.eq_ignore_ascii_case("accept");
+                    has_auth |= name.eq_ignore_ascii_case("authorization");
+                    builder = builder.header(name.as_str(), value.as_str());
+                }
+                if !has_accept {
+                    builder = builder.header("accept", "application/json");
+                }
+                if !has_auth {
+                    if let Some(token) = auth_token {
+                        builder = builder.bearer_auth(token);
+                    }
+                }
+                if let Some(body) = body {
+                    builder = builder.body(body.to_vec());
+                }
+                builder
             }
         }
     }
@@ -218,33 +475,17 @@ impl DohUpstream {
     /// 返回响应以及是否经由备用节点
     async fn send_with_fallback(
         &self,
-        endpoint: &str,
-        message: &[u8],
+        request: &DohRequest<'_>,
         use_get: bool,
         bootstrap_first: bool,
         auth_token: Option<&str>,
     ) -> std::result::Result<(reqwest::Response, bool), reqwest::Error> {
-        let send = |client: &Client| {
-            let request = if use_get {
-                client.get(format!(
-                    "{}?dns={}",
-                    endpoint,
-                    URL_SAFE_NO_PAD.encode(message)
-                ))
-            } else {
-                client
-                    .post(endpoint)
-                    .header("content-type", "application/dns-message")
-                    .body(message.to_vec())
-            }
-            .header("accept", "application/dns-message");
-            match auth_token {
-                Some(token) => request.bearer_auth(token),
-                None => request,
-            }
-            .send()
-        };
-        let Some(bootstrap_client) = self.bootstrap_client.as_ref() else {
+        let send = |client: &Client| Self::build_request(client, request, use_get, auth_token).send();
+        let bootstrap_client = self
+            .bootstrap_client
+            .as_ref()
+            .filter(|_| self.bootstrap_available());
+        let Some(bootstrap_client) = bootstrap_client else {
             return send(&self.client).await.map(|response| (response, false));
         };
 
@@ -367,6 +608,434 @@ pub struct HttpsHints {
     pub ipv6_hints: Vec<IpAddr>,
 }
 
+/// 签名节点列表信封：服务端随路由表下发，App 持久化后启动时原样回传重新验签
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodesEnvelope {
+    pub kid: String,
+    /// base64(JSON)
+    pub payload: String,
+    /// base64(Ed25519 对 payload 解码后原始字节的签名)
+    pub sig: String,
+}
+
+/// 节点列表 payload 的 JSON 形态
+#[derive(Deserialize)]
+struct NodeListJson {
+    serial: u64,
+    not_after: u64,
+    #[serde(default)]
+    hosts: HashMap<String, NodeHostJson>,
+}
+
+#[derive(Deserialize, Default)]
+struct NodeHostJson {
+    #[serde(default)]
+    v4: Vec<String>,
+    #[serde(default)]
+    v6: Vec<String>,
+}
+
+/// 已验签的节点列表
+pub struct NodeList {
+    serial: u64,
+    not_after: u64,
+    /// (域名, 节点 IP)，按域名长度降序，匹配时最长后缀优先
+    hosts: Vec<(String, Vec<IpAddr>)>,
+    /// payload 解码后的 JSON 原文，交给 App 持久化/展示
+    payload_json: String,
+}
+
+impl NodeList {
+    /// 域名相等或以 `.<key>` 结尾即命中
+    fn ips_for(&self, host: &str) -> Option<&[IpAddr]> {
+        self.hosts
+            .iter()
+            .find(|(key, _)| {
+                host == key
+                    || host
+                        .strip_suffix(key.as_str())
+                        .is_some_and(|prefix| prefix.ends_with('.'))
+            })
+            .map(|(_, ips)| ips.as_slice())
+    }
+
+    fn is_expired(&self, now_unix: u64) -> bool {
+        self.not_after <= now_unix
+    }
+}
+
+/// 等 App 取走并持久化的更新
+#[derive(Default, Debug)]
+pub struct AccelUpdate {
+    /// 新拉到的路由表原文（JSON）
+    pub route_table: Option<String>,
+    /// 新接受的节点列表 payload（JSON，已验签）
+    pub nodes: Option<String>,
+    /// 新接受的节点列表信封，App 持久化后启动时回传
+    pub nodes_envelope: Option<NodesEnvelope>,
+}
+
+impl AccelUpdate {
+    fn is_empty(&self) -> bool {
+        self.route_table.is_none() && self.nodes.is_none() && self.nodes_envelope.is_none()
+    }
+}
+
+/// 加速接口请求的响应
+pub struct AccelResponse {
+    pub status: u16,
+    pub body: String,
+}
+
+/// 路由表 JSON 形态（加速服务端 `GET /v1/routes` 的响应）
+#[derive(Deserialize)]
+struct RouteTableJson {
+    /// 表生成时刻（unix 秒），持久化后用来算年龄
+    #[serde(default)]
+    generated: Option<u64>,
+    #[serde(default)]
+    serial: Option<u64>,
+    /// 新鲜期（秒）
+    ttl: u64,
+    /// 过期后仍可继续用旧表的时长（秒），期间后台刷新
+    #[serde(default)]
+    max_stale: u64,
+    /// 表外域名的解析顺序：`system_first`（缺省）/ `doh_first`
+    #[serde(default)]
+    miss: Option<String>,
+    #[serde(default)]
+    routes: Vec<RouteEntryJson>,
+    #[serde(default)]
+    nodes: Option<NodesEnvelope>,
+}
+
+#[derive(Deserialize)]
+struct RouteEntryJson {
+    name: String,
+    /// true 表示 name 本身和所有 *.name 都命中
+    #[serde(default)]
+    wildcard: bool,
+    #[serde(default)]
+    v4: Vec<String>,
+    #[serde(default)]
+    v6: Vec<String>,
+    /// base64 的 ECHConfigList，可省
+    #[serde(default)]
+    ech: Option<String>,
+}
+
+/// 表外域名的解析顺序
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MissPolicy {
+    /// 先系统 DNS，失败再 DoH
+    SystemFirst,
+    /// 先 DoH（原有行为）
+    DohFirst,
+}
+
+struct RouteEntry {
+    addrs: Vec<IpAddr>,
+    ech: Option<EchConfigListBytes<'static>>,
+}
+
+/// 域名 -> IP 的路由表：命中的域名不再查 DoH
+struct RouteTable {
+    exact: HashMap<String, RouteEntry>,
+    wildcard: HashMap<String, RouteEntry>,
+    /// 新鲜期截止；之后仍可用，但要后台刷新
+    expires_at: Instant,
+    /// 可用期截止（ttl + max_stale）；之后当没有表
+    stale_until: Instant,
+    miss_policy: MissPolicy,
+}
+
+impl RouteTable {
+    /// `age` 是表生成到现在的时长：持久化的表按 `generated` 算，刚拉到的按 0。
+    /// 不用 `Instant - age`：安卓开机不久的单调钟减大数会下溢
+    fn from_json(json: &RouteTableJson, age: Duration) -> Self {
+        let now = Instant::now();
+        let fresh = Duration::from_secs(json.ttl);
+        let usable = Duration::from_secs(json.ttl.saturating_add(json.max_stale));
+        let mut exact = HashMap::new();
+        let mut wildcard = HashMap::new();
+        for route in &json.routes {
+            let name = route.name.trim().trim_end_matches('.').to_ascii_lowercase();
+            if name.is_empty() {
+                continue;
+            }
+            let addrs: Vec<IpAddr> = route
+                .v4
+                .iter()
+                .chain(route.v6.iter())
+                .filter_map(|ip| ip.trim().parse::<IpAddr>().ok())
+                .collect();
+            let ech = route
+                .ech
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .and_then(decode_base64_lenient)
+                .map(|bytes| {
+                    EchConfigListBytes::from(DnsResolver::ensure_ech_config_list_len_prefix(bytes))
+                });
+            if route.wildcard {
+                wildcard.insert(
+                    name.clone(),
+                    RouteEntry {
+                        addrs: addrs.clone(),
+                        ech: ech.clone(),
+                    },
+                );
+            }
+            exact.insert(name, RouteEntry { addrs, ech });
+        }
+        let miss_policy = match json.miss.as_deref().map(str::trim) {
+            Some("doh_first") => MissPolicy::DohFirst,
+            _ => MissPolicy::SystemFirst,
+        };
+        Self {
+            exact,
+            wildcard,
+            expires_at: now + fresh.saturating_sub(age),
+            stale_until: now + usable.saturating_sub(age),
+            miss_policy,
+        }
+    }
+
+    /// 精确匹配，再逐级去掉最左一段查通配
+    fn lookup(&self, host: &str) -> Option<&RouteEntry> {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        if let Some(entry) = self.exact.get(&host) {
+            return Some(entry);
+        }
+        let mut rest = host.as_str();
+        while let Some((_, parent)) = rest.split_once('.') {
+            if let Some(entry) = self.wildcard.get(parent) {
+                return Some(entry);
+            }
+            rest = parent;
+        }
+        None
+    }
+
+    fn is_fresh(&self, now: Instant) -> bool {
+        self.expires_at > now
+    }
+
+    fn is_usable(&self, now: Instant) -> bool {
+        self.stale_until > now
+    }
+
+    /// 给 App 的缓存时长：到新鲜期截止的剩余时间，下限 MIN_TTL_SECS
+    fn ttl_hint(&self, now: Instant) -> Duration {
+        self.expires_at
+            .saturating_duration_since(now)
+            .max(Duration::from_secs(MIN_TTL_SECS))
+    }
+
+    fn len(&self) -> usize {
+        self.exact.len()
+    }
+}
+
+/// 某个 DoH 服务器的路由表：拉取、缓存、后台刷新
+struct RouteTableStore {
+    routes_url: String,
+    proxy_key: String,
+    upstream: DohUpstream,
+    table: RwLock<Option<Arc<RouteTable>>>,
+    /// 是否有拉取在进行（single-flight）
+    refreshing: AtomicBool,
+    /// 拉取结束（无论成败）时唤醒等待的查询
+    refreshed: Notify,
+    last_failure: parking_lot::Mutex<Option<Instant>>,
+}
+
+/// 拉取结束时复位 single-flight 标记并唤醒等待者，任务被取消也会执行
+struct RefreshGuard(Arc<RouteTableStore>);
+
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        self.0.refreshing.store(false, Ordering::Release);
+        self.0.refreshed.notify_waiters();
+    }
+}
+
+impl RouteTableStore {
+    fn new(routes_url: &str, upstream_proxy: Option<&UpstreamProxyConfig>) -> Result<Self> {
+        let uri: Uri = routes_url.parse().map_err(|e| {
+            DohProxyError::InvalidUrl(format!("Invalid routes URL '{}': {}", routes_url, e))
+        })?;
+        if uri.host().is_none() || !matches!(uri.scheme_str(), Some("http") | Some("https")) {
+            return Err(DohProxyError::InvalidUrl(format!(
+                "Routes URL must be http(s) with a host: {}",
+                routes_url
+            )));
+        }
+        let bootstrap_ips = DnsResolver::bootstrap_ips_for_url(routes_url);
+        let upstream = DnsResolver::build_doh_upstream(
+            uri,
+            &bootstrap_ips,
+            Duration::from_secs(ROUTES_FETCH_TIMEOUT_SECS),
+            upstream_proxy,
+        )?;
+        Ok(Self {
+            routes_url: routes_url.to_string(),
+            proxy_key: upstream_proxy
+                .map(UpstreamProxyConfig::cache_key)
+                .unwrap_or_default(),
+            upstream,
+            table: RwLock::new(None),
+            refreshing: AtomicBool::new(false),
+            refreshed: Notify::new(),
+            last_failure: parking_lot::Mutex::new(None),
+        })
+    }
+
+    fn host(&self) -> &str {
+        self.upstream.host()
+    }
+
+    /// 解析并存入一份表。`persisted`：App 回传的旧表，按 `generated` 算年龄且不再通知 App；
+    /// 否则是刚拉到的，年龄按 0 并记入待取更新。返回条目数
+    fn apply_raw(&self, raw: &str, persisted: bool) -> Result<usize> {
+        let json: RouteTableJson = serde_json::from_str(raw)
+            .map_err(|e| DohProxyError::Parse(format!("Invalid route table: {}", e)))?;
+        let age = if persisted {
+            let now = now_unix();
+            Duration::from_secs(now.saturating_sub(json.generated.or(json.serial).unwrap_or(now)))
+        } else {
+            Duration::ZERO
+        };
+        let table = RouteTable::from_json(&json, age);
+        let now = Instant::now();
+        if !table.is_usable(now) {
+            return Err(DohProxyError::Parse(
+                "Route table is older than ttl + max_stale".to_string(),
+            ));
+        }
+        let count = table.len();
+        let fresh_for = table.expires_at.saturating_duration_since(now);
+        let miss_policy = table.miss_policy;
+        *self.table.write() = Some(Arc::new(table));
+
+        if let Some(envelope) = &json.nodes {
+            match DnsResolver::accept_node_list_inner(envelope, !persisted) {
+                Ok(true) => {}
+                Ok(false) => debug!(
+                    "Node list in route table from {} is not newer, ignored",
+                    self.host()
+                ),
+                Err(error) => warn!(
+                    "Node list in route table from {} rejected: {}",
+                    self.host(),
+                    error
+                ),
+            }
+        }
+        if !persisted {
+            DnsResolver::accel_update().lock().route_table = Some(raw.to_string());
+        }
+        info!(
+            "Route table for {} loaded: {} entries, fresh for {}s, miss policy {:?}",
+            self.host(),
+            count,
+            fresh_for.as_secs(),
+            miss_policy
+        );
+        Ok(count)
+    }
+
+    fn in_backoff(&self, now: Instant) -> bool {
+        self.last_failure.lock().is_some_and(|at| {
+            now.saturating_duration_since(at) < Duration::from_secs(ROUTES_RETRY_BACKOFF_SECS)
+        })
+    }
+
+    /// 当前可用的表：新鲜直接用；过期但未超 max_stale 先用旧表、后台刷新；
+    /// 没有表或已超 max_stale 时等一次拉取（上限 ROUTES_INITIAL_WAIT_SECS），退避期内直接放弃
+    async fn current(self: &Arc<Self>) -> Option<Arc<RouteTable>> {
+        let now = Instant::now();
+        let table = self.table.read().clone();
+        if let Some(table) = table {
+            if table.is_fresh(now) {
+                return Some(table);
+            }
+            if table.is_usable(now) {
+                self.spawn_refresh();
+                return Some(table);
+            }
+        }
+        if self.in_backoff(now) {
+            return None;
+        }
+        // 先登记等待再触发拉取，避免错过通知
+        let notified = self.refreshed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        self.spawn_refresh();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(ROUTES_INITIAL_WAIT_SECS),
+            notified,
+        )
+        .await;
+        let now = Instant::now();
+        self.table
+            .read()
+            .clone()
+            .filter(|table| table.is_usable(now))
+    }
+
+    fn spawn_refresh(self: &Arc<Self>) {
+        if self.in_backoff(Instant::now()) {
+            return;
+        }
+        if self
+            .refreshing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let store = self.clone();
+        tokio::spawn(async move {
+            let _guard = RefreshGuard(store.clone());
+            match store.fetch_once().await {
+                Ok(_) => {
+                    *store.last_failure.lock() = None;
+                }
+                Err(error) => {
+                    warn!(
+                        "Route table fetch from {} failed, retrying after {}s: {}",
+                        store.host(),
+                        ROUTES_RETRY_BACKOFF_SECS,
+                        error
+                    );
+                    *store.last_failure.lock() = Some(Instant::now());
+                }
+            }
+        });
+    }
+
+    async fn fetch_once(&self) -> Result<usize> {
+        let response = self
+            .upstream
+            .send_http(reqwest::Method::GET, &self.routes_url, &[], None, true, true)
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(DohProxyError::Dns(format!(
+                "Route table http error: {}",
+                status
+            )));
+        }
+        let raw = response
+            .text()
+            .await
+            .map_err(|e| DohProxyError::Dns(format!("Route table read failed: {}", e)))?;
+        self.apply_raw(&raw, false)
+    }
+}
+
 impl DnsResolver {
     fn shared_cache_key(
         doh_url: &str,
@@ -377,23 +1046,13 @@ impl DnsResolver {
         let upstream_key = upstream_proxy
             .map(UpstreamProxyConfig::cache_key)
             .unwrap_or_default();
-        let bootstrap_key = |url: Option<&str>| {
-            url.map(Self::bootstrap_ips_for_url)
-                .unwrap_or_default()
-                .iter()
-                .map(IpAddr::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-        // 备用节点变化后要换新的 resolver，所以也纳入 key
+        // 备用节点在建连时动态读取，不纳入 key；节点变化不用换 resolver
         format!(
-            "{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}",
             doh_url,
             doh_url_ech.unwrap_or(""),
             if prefer_ipv6 { "v6" } else { "v4" },
             upstream_key,
-            bootstrap_key(Some(doh_url)),
-            bootstrap_key(doh_url_ech),
         )
     }
 
@@ -435,8 +1094,289 @@ impl DnsResolver {
 
     fn bootstrap_ips_for_url(doh_url: &str) -> Vec<IpAddr> {
         Self::doh_url_host(doh_url)
-            .and_then(|host| Self::bootstrap_registry().read().get(&host).cloned())
+            .map(|host| Self::bootstrap_ips_for_host(&host))
             .unwrap_or_default()
+    }
+
+    /// 某域名当前的备用 IP：已验签且未过期的节点列表优先，再补启动时登记的种子（去重）。
+    /// 每次建连都重新读取，节点列表更新后无需重建 client
+    fn bootstrap_ips_for_host(host: &str) -> Vec<IpAddr> {
+        let host = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
+        let mut ips: Vec<IpAddr> = Self::node_list_holder()
+            .read()
+            .as_ref()
+            .filter(|list| !list.is_expired(now_unix()))
+            .and_then(|list| list.ips_for(&host).map(<[IpAddr]>::to_vec))
+            .unwrap_or_default();
+        if let Some(seeds) = Self::bootstrap_registry().read().get(&host) {
+            for ip in seeds {
+                if !ips.contains(ip) {
+                    ips.push(*ip);
+                }
+            }
+        }
+        ips
+    }
+
+    fn node_list_holder() -> &'static RwLock<Option<Arc<NodeList>>> {
+        NODE_LIST.get_or_init(|| RwLock::new(None))
+    }
+
+    fn accel_update() -> &'static parking_lot::Mutex<AccelUpdate> {
+        ACCEL_UPDATE.get_or_init(|| parking_lot::Mutex::new(AccelUpdate::default()))
+    }
+
+    fn node_list_pubkey(kid: &str) -> Option<[u8; 32]> {
+        #[cfg(test)]
+        {
+            if let Some((_, key)) = TEST_NODE_LIST_PUBKEYS
+                .get_or_init(|| RwLock::new(Vec::new()))
+                .read()
+                .iter()
+                .find(|(k, _)| k == kid)
+            {
+                return Some(*key);
+            }
+        }
+        NODE_LIST_PUBKEYS
+            .iter()
+            .find(|(k, _)| *k == kid)
+            .map(|(_, key)| *key)
+    }
+
+    /// 验签并解析节点列表（纯函数，不碰全局状态）：
+    /// kid 必须在内嵌公钥表里，Ed25519 签名必须对上 payload 原始字节，且未过期
+    fn verify_node_list(envelope: &NodesEnvelope, now_unix: u64) -> Result<NodeList> {
+        let kid = envelope.kid.trim();
+        let pubkey = Self::node_list_pubkey(kid).ok_or_else(|| {
+            DohProxyError::Parse(format!("Unknown node list key id '{}'", kid))
+        })?;
+        let payload = decode_base64_lenient(envelope.payload.trim())
+            .ok_or_else(|| DohProxyError::Parse("Node list payload is not base64".to_string()))?;
+        let sig = decode_base64_lenient(envelope.sig.trim())
+            .ok_or_else(|| DohProxyError::Parse("Node list signature is not base64".to_string()))?;
+        ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &pubkey)
+            .verify(&payload, &sig)
+            .map_err(|_| DohProxyError::Parse("Node list signature mismatch".to_string()))?;
+
+        let json: NodeListJson = serde_json::from_slice(&payload)
+            .map_err(|e| DohProxyError::Parse(format!("Invalid node list payload: {}", e)))?;
+        if json.not_after <= now_unix {
+            return Err(DohProxyError::Parse(format!(
+                "Node list serial {} expired at {}",
+                json.serial, json.not_after
+            )));
+        }
+        let mut hosts: Vec<(String, Vec<IpAddr>)> = json
+            .hosts
+            .iter()
+            .filter_map(|(name, entry)| {
+                let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
+                if name.is_empty() {
+                    return None;
+                }
+                let ips: Vec<IpAddr> = entry
+                    .v4
+                    .iter()
+                    .chain(entry.v6.iter())
+                    .filter_map(|ip| ip.trim().parse::<IpAddr>().ok())
+                    .collect();
+                Some((name, ips))
+            })
+            .collect();
+        // 最长后缀优先
+        hosts.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+        let payload_json = String::from_utf8(payload)
+            .map_err(|_| DohProxyError::Parse("Node list payload is not UTF-8".to_string()))?;
+        Ok(NodeList {
+            serial: json.serial,
+            not_after: json.not_after,
+            hosts,
+            payload_json,
+        })
+    }
+
+    /// 验签通过且 serial 比已存的大才接受；`notify_app` 为 true 时记入待取更新让 App 持久化。
+    /// 返回 Ok(false) 表示不比现有的新
+    fn accept_node_list_inner(envelope: &NodesEnvelope, notify_app: bool) -> Result<bool> {
+        let list = Self::verify_node_list(envelope, now_unix())?;
+        {
+            let mut holder = Self::node_list_holder().write();
+            if holder.as_ref().is_some_and(|current| current.serial >= list.serial) {
+                return Ok(false);
+            }
+            info!(
+                "Accepted node list serial {} ({} hosts, valid until {})",
+                list.serial,
+                list.hosts.len(),
+                list.not_after
+            );
+            let payload_json = list.payload_json.clone();
+            *holder = Some(Arc::new(list));
+            if notify_app {
+                let mut update = Self::accel_update().lock();
+                update.nodes = Some(payload_json);
+                update.nodes_envelope = Some(envelope.clone());
+            }
+        }
+        Ok(true)
+    }
+
+    /// 接受服务端刚下发的签名节点列表（会通知 App 持久化）
+    pub fn accept_node_list(envelope: &NodesEnvelope) -> Result<bool> {
+        Self::accept_node_list_inner(envelope, true)
+    }
+
+    /// 启动时回灌 App 持久化的签名信封（JSON `{kid,payload,sig}`），重新验签，不通知 App
+    pub fn load_node_list_json(raw: &str) -> Result<bool> {
+        let envelope: NodesEnvelope = serde_json::from_str(raw)
+            .map_err(|e| DohProxyError::Parse(format!("Invalid node list envelope: {}", e)))?;
+        Self::accept_node_list_inner(&envelope, false)
+    }
+
+    /// 取出并清空待 App 持久化的更新（路由表原文 / 节点列表）
+    pub fn take_accel_update() -> Option<AccelUpdate> {
+        let mut update = Self::accel_update().lock();
+        if update.is_empty() {
+            return None;
+        }
+        Some(std::mem::take(&mut *update))
+    }
+
+    fn route_table_registry() -> &'static RwLock<HashMap<String, Arc<RouteTableStore>>> {
+        DOH_ROUTE_TABLES.get_or_init(|| RwLock::new(HashMap::new()))
+    }
+
+    /// 登记某 DoH 服务器的路由表接口。`routes_url` 为 None 时取消登记（关掉查表模式）；
+    /// 同 URL、同代理则复用已拉到的表
+    pub fn set_routes_url(
+        doh_url: &str,
+        routes_url: Option<&str>,
+        upstream_proxy: Option<&UpstreamProxyConfig>,
+    ) -> Result<()> {
+        let Some(host) = Self::doh_url_host(doh_url) else {
+            return Ok(());
+        };
+        let routes_url = routes_url.map(str::trim).filter(|url| !url.is_empty());
+        let Some(routes_url) = routes_url else {
+            if Self::route_table_registry().write().remove(&host).is_some() {
+                info!("Route table disabled for {}", host);
+            }
+            return Ok(());
+        };
+        let proxy_key = upstream_proxy
+            .map(UpstreamProxyConfig::cache_key)
+            .unwrap_or_default();
+        {
+            let registry = Self::route_table_registry().read();
+            if registry
+                .get(&host)
+                .is_some_and(|store| store.routes_url == routes_url && store.proxy_key == proxy_key)
+            {
+                return Ok(());
+            }
+        }
+        let store = Arc::new(RouteTableStore::new(routes_url, upstream_proxy)?);
+        info!("Route table for {} will be fetched from {}", host, store.host());
+        Self::route_table_registry().write().insert(host, store);
+        Ok(())
+    }
+
+    /// 启动时回灌 App 持久化的路由表原文；必须先 `set_routes_url`
+    pub fn load_route_table_json(doh_url: &str, raw: &str) -> Result<()> {
+        let Some(host) = Self::doh_url_host(doh_url) else {
+            return Err(DohProxyError::InvalidUrl(format!(
+                "Invalid DoH URL: {}",
+                doh_url
+            )));
+        };
+        let store = Self::route_table_registry().read().get(&host).cloned();
+        let Some(store) = store else {
+            return Err(DohProxyError::Dns(format!(
+                "No route table registered for {}",
+                host
+            )));
+        };
+        store.apply_raw(raw, true).map(|_| ())
+    }
+
+    /// 当前 resolver 可用的路由表；没登记、拉不到或已超 max_stale 时为 None
+    async fn active_route_table(&self) -> Option<Arc<RouteTable>> {
+        let host = self.doh_ip.as_ref()?.host().to_string();
+        let store = Self::route_table_registry().read().get(&host).cloned()?;
+        store.current().await
+    }
+
+    fn accel_upstreams() -> &'static RwLock<HashMap<String, DohUpstream>> {
+        ACCEL_UPSTREAMS.get_or_init(|| RwLock::new(HashMap::new()))
+    }
+
+    /// 加速接口（令牌申请/续期等）用的 HTTP 客户端：和 DoH 同一套 reqwest/rustls 栈，
+    /// 按 scheme://authority 缓存，不挂上游代理
+    fn accel_upstream_for(uri: &Uri) -> Result<DohUpstream> {
+        let host = uri.host().ok_or_else(|| {
+            DohProxyError::InvalidUrl(format!("Accel URL has no host: {}", uri))
+        })?;
+        let key = format!(
+            "{}://{}",
+            uri.scheme_str().unwrap_or("https"),
+            uri.authority().map(|a| a.as_str()).unwrap_or(host)
+        );
+        if let Some(upstream) = Self::accel_upstreams().read().get(&key) {
+            return Ok(upstream.clone());
+        }
+        let bootstrap_ips = Self::bootstrap_ips_for_host(host);
+        let upstream = Self::build_doh_upstream(
+            uri.clone(),
+            &bootstrap_ips,
+            Duration::from_secs(ACCEL_REQUEST_TIMEOUT_SECS),
+            None,
+        )?;
+        let upstream = Self::accel_upstreams()
+            .write()
+            .entry(key)
+            .or_insert(upstream)
+            .clone();
+        Ok(upstream)
+    }
+
+    /// 经 DoH 同一套客户端发加速接口请求。只记录方法、主机、路径和状态码，不记录头和 body
+    pub async fn accel_request(
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: Option<&[u8]>,
+    ) -> Result<AccelResponse> {
+        let uri: Uri = url
+            .parse()
+            .map_err(|e| DohProxyError::InvalidUrl(format!("Invalid accel URL '{}': {}", url, e)))?;
+        if !matches!(uri.scheme_str(), Some("http") | Some("https")) {
+            return Err(DohProxyError::InvalidUrl(format!(
+                "Accel URL must be http(s): {}",
+                url
+            )));
+        }
+        let method = reqwest::Method::from_bytes(method.trim().to_ascii_uppercase().as_bytes())
+            .map_err(|_| DohProxyError::InvalidUrl(format!("Invalid HTTP method: {}", method)))?;
+        let upstream = Self::accel_upstream_for(&uri)?;
+        let start = Instant::now();
+        let response = upstream
+            .send_http(method.clone(), url, headers, body, false, false)
+            .await?;
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| DohProxyError::Dns(format!("Accel response read failed: {}", e)))?;
+        debug!(
+            "Accel {} {}{} -> {} in {} ms",
+            method,
+            uri.host().unwrap_or(""),
+            uri.path(),
+            status,
+            start.elapsed().as_millis()
+        );
+        Ok(AccelResponse { status, body })
     }
 
     fn auth_token_registry() -> &'static RwLock<HashMap<String, String>> {
@@ -821,8 +1761,18 @@ impl DnsResolver {
         &self,
         domain: &str,
     ) -> Result<Option<EchConfigListBytes<'static>>> {
+        // IP 字面量没有 HTTPS 记录
+        if domain.trim_matches(['[', ']']).parse::<IpAddr>().is_ok() {
+            return Ok(None);
+        }
+
         // 定期清理过期缓存
         self.maybe_cleanup_caches();
+
+        // 查表模式：表里有就用表里的 ECH，没有按无 ECH 处理，都不再查 DoH
+        if let Some(table) = self.active_route_table().await {
+            return Ok(table.lookup(domain).and_then(|entry| entry.ech.clone()));
+        }
 
         // Check cache first
         {
@@ -1015,8 +1965,27 @@ impl DnsResolver {
 
     /// Lookup IP addresses for a domain
     pub async fn lookup_ip(&self, domain: &str) -> Result<Vec<IpAddr>> {
+        // IP 字面量不用解析
+        if let Ok(ip) = domain.trim_matches(['[', ']']).parse::<IpAddr>() {
+            return Ok(vec![ip]);
+        }
+
         // 定期清理过期缓存
         self.maybe_cleanup_caches();
+
+        // 查表模式：命中直接用表里的地址，不发 DoH；表外域名按表的 miss 策略
+        let table = self.active_route_table().await;
+        if let Some(entry) = table.as_ref().and_then(|table| table.lookup(domain)) {
+            if !entry.addrs.is_empty() {
+                let mut addrs = entry.addrs.clone();
+                self.sort_addrs_by_preference(&mut addrs);
+                debug!("Route table hit for {}", domain);
+                return Ok(addrs);
+            }
+        }
+        let system_first = table
+            .as_ref()
+            .is_some_and(|table| table.miss_policy == MissPolicy::SystemFirst);
 
         // Check cache first
         {
@@ -1057,6 +2026,25 @@ impl DnsResolver {
                 }
             }
             return Err(DohProxyError::Dns(format!("No IP found for {}", domain)));
+        }
+
+        // 表外域名先走系统 DNS，解析不出再落到 DoH
+        if system_first {
+            match self.system_lookup_ip(domain).await {
+                Ok(addrs) => {
+                    self.put_ip_cache(domain, addrs.clone(), Duration::from_secs(MIN_TTL_SECS));
+                    let mut inflight = self.ip_inflight.lock().await;
+                    inflight.remove(domain);
+                    notify.notify_waiters();
+                    return Ok(addrs);
+                }
+                Err(error) => {
+                    debug!(
+                        "System DNS lookup failed for {}, falling back to DoH: {}",
+                        domain, error
+                    );
+                }
+            }
         }
 
         if self.force_doh_get_ip {
@@ -1108,11 +2096,7 @@ impl DnsResolver {
         let ttl_secs = ttl_duration.as_secs().clamp(MIN_TTL_SECS, MAX_TTL_SECS);
 
         // Sort by preference
-        if self.prefer_ipv6 {
-            addrs.sort_by_key(|a| if a.is_ipv6() { 0 } else { 1 });
-        } else {
-            addrs.sort_by_key(|a| if a.is_ipv4() { 0 } else { 1 });
-        }
+        self.sort_addrs_by_preference(&mut addrs);
 
         // Cache the result with DNS TTL
         self.put_ip_cache(domain, addrs.clone(), Duration::from_secs(ttl_secs));
@@ -1126,6 +2110,38 @@ impl DnsResolver {
         let mut inflight = self.ip_inflight.lock().await;
         inflight.remove(domain);
         notify.notify_waiters();
+        Ok(addrs)
+    }
+
+    fn sort_addrs_by_preference(&self, addrs: &mut [IpAddr]) {
+        if self.prefer_ipv6 {
+            addrs.sort_by_key(|a| if a.is_ipv6() { 0 } else { 1 });
+        } else {
+            addrs.sort_by_key(|a| if a.is_ipv4() { 0 } else { 1 });
+        }
+    }
+
+    /// 用系统 DNS 解析（查表模式下表外域名的首选路径）
+    async fn system_lookup_ip(&self, domain: &str) -> Result<Vec<IpAddr>> {
+        let host = domain.trim_end_matches('.').to_string();
+        let resolved = tokio::time::timeout(self.resolve_timeout, lookup_host((host, 0)))
+            .await
+            .map_err(|_| DohProxyError::Timeout)?
+            .map_err(|e| DohProxyError::Dns(format!("System DNS failed for {}: {}", domain, e)))?;
+        let mut addrs: Vec<IpAddr> = Vec::new();
+        for addr in resolved {
+            let ip = addr.ip();
+            if !addrs.contains(&ip) {
+                addrs.push(ip);
+            }
+        }
+        if addrs.is_empty() {
+            return Err(DohProxyError::Dns(format!(
+                "System DNS returned no address for {}",
+                domain
+            )));
+        }
+        self.sort_addrs_by_preference(&mut addrs);
         Ok(addrs)
     }
 
@@ -1179,8 +2195,15 @@ impl DnsResolver {
         // 否则 query 模式会把一个未验证的单 IP 提前钉死给 rhttp，
         // 一旦这个边缘节点不稳定，就会持续触发连接重置/超时。
         let preferred_ip = self.preferred_host_ip_for_addrs(domain, &addrs);
-        let ttl = self
-            .remaining_ttl_for_host(domain)
+        // 表命中的域名不进 ip_cache，缓存时长按表的新鲜期给
+        let table_ttl = match self.active_route_table().await {
+            Some(table) if table.lookup(domain).is_some_and(|e| !e.addrs.is_empty()) => {
+                Some(table.ttl_hint(Instant::now()))
+            }
+            _ => None,
+        };
+        let ttl = table_ttl
+            .or_else(|| self.remaining_ttl_for_host(domain))
             .unwrap_or_else(|| Duration::from_secs(DEFAULT_TTL_SECS));
 
         Ok(LookupHostResult {
@@ -1577,36 +2600,40 @@ impl DnsResolver {
         timeout: Duration,
         upstream_proxy: Option<&UpstreamProxyConfig>,
     ) -> Result<DohUpstream> {
-        // 走上游代理时由代理解析 DoH 域名，备用节点没有意义
+        // 走上游代理时由代理解析 DoH 域名，备用节点没有意义；IP 字面量也不需要
         let bootstrap_host = uri
             .host()
-            .filter(|host| host.parse::<IpAddr>().is_err())
-            .filter(|_| !bootstrap_ips.is_empty() && upstream_proxy.is_none());
+            .filter(|host| host.trim_matches(['[', ']']).parse::<IpAddr>().is_err())
+            .filter(|_| upstream_proxy.is_none())
+            .map(|host| host.to_ascii_lowercase());
 
         let Some(host) = bootstrap_host else {
             let client = Self::build_doh_client(Client::builder(), timeout, upstream_proxy)?;
             return Ok(DohUpstream::new(uri, client, None));
         };
 
-        let port = uri.port_u16().unwrap_or(443);
-        let addrs: Vec<std::net::SocketAddr> = bootstrap_ips
-            .iter()
-            .map(|ip| std::net::SocketAddr::new(*ip, port))
-            .collect();
-        let client = Self::build_doh_client(
+        // 备用客户端总是建好：建连时才读当前节点（已下发列表 > 登记种子 > 这里的 initial），
+        // 首装没有任何备用 IP 时节点列表一到就能用，不用重建。
+        // 主客户端只在一开始就有备用节点时缩短连接超时，第三方 DoH 行为不变
+        let primary_builder = if bootstrap_ips.is_empty() {
             Client::builder()
-                .connect_timeout(Duration::from_secs(DOH_PRIMARY_CONNECT_TIMEOUT_SECS)),
-            timeout,
-            None,
-        )?;
+        } else {
+            Client::builder()
+                .connect_timeout(Duration::from_secs(DOH_PRIMARY_CONNECT_TIMEOUT_SECS))
+        };
+        let client = Self::build_doh_client(primary_builder, timeout, None)?;
+        let resolver = Arc::new(BootstrapResolver {
+            host,
+            initial: bootstrap_ips.to_vec(),
+        });
         let bootstrap_client = Self::build_doh_client(
             Client::builder()
                 .connect_timeout(Duration::from_secs(DOH_BOOTSTRAP_CONNECT_TIMEOUT_SECS))
-                .resolve_to_addrs(host, &addrs),
+                .dns_resolver(resolver.clone()),
             timeout,
             None,
         )?;
-        Ok(DohUpstream::new(uri, client, Some(bootstrap_client)))
+        Ok(DohUpstream::new(uri, client, Some(bootstrap_client)).with_bootstrap(resolver))
     }
 
     fn build_doh_client(
@@ -1755,29 +2782,7 @@ impl DnsResolver {
         };
         let start = std::time::Instant::now();
 
-        use hickory_resolver::proto::op::{Edns, Message, Query};
-        use hickory_resolver::proto::rr::Name;
-        use std::str::FromStr;
-
-        let fqdn = if domain.ends_with('.') {
-            domain.to_string()
-        } else {
-            format!("{}.", domain)
-        };
-        let name = Name::from_str(&fqdn)
-            .map_err(|e| DohProxyError::Dns(format!("Invalid domain {}: {}", domain, e)))?;
-
-        let mut request = Message::new();
-        request.add_query(Query::query(name, record_type));
-        request.set_recursion_desired(true);
-        let mut edns = Edns::new();
-        edns.set_version(0);
-        edns.set_max_payload(1232);
-        *request.extensions_mut() = Some(edns);
-
-        let bytes = request
-            .to_vec()
-            .map_err(|e| DohProxyError::Dns(format!("Failed to encode DNS query: {}", e)))?;
+        let bytes = Self::encode_query(domain, record_type)?;
 
         let response = upstream.query(&bytes).await?;
 
@@ -1814,6 +2819,50 @@ impl DnsResolver {
             start.elapsed().as_millis()
         );
         Ok(Some(message))
+    }
+
+    /// 编码一条 DNS 查询报文：RD=1、EDNS(0) 1232 字节，并按 RFC 8467 用 Padding 选项
+    /// 把整个报文填到 `DNS_QUERY_PAD_BLOCK` 的整倍数，去掉报文长度特征
+    fn encode_query(
+        domain: &str,
+        record_type: hickory_resolver::proto::rr::RecordType,
+    ) -> Result<Vec<u8>> {
+        use hickory_resolver::proto::op::{Edns, Message, Query};
+        use hickory_resolver::proto::rr::rdata::opt::EdnsOption;
+        use hickory_resolver::proto::rr::Name;
+        use std::str::FromStr;
+
+        let fqdn = if domain.ends_with('.') {
+            domain.to_string()
+        } else {
+            format!("{}.", domain)
+        };
+        let name = Name::from_str(&fqdn)
+            .map_err(|e| DohProxyError::Dns(format!("Invalid domain {}: {}", domain, e)))?;
+
+        let mut request = Message::new();
+        request.add_query(Query::query(name, record_type));
+        request.set_recursion_desired(true);
+        let mut edns = Edns::new();
+        edns.set_version(0);
+        edns.set_max_payload(1232);
+        *request.extensions_mut() = Some(edns);
+
+        let unpadded_len = request
+            .to_vec()
+            .map_err(|e| DohProxyError::Dns(format!("Failed to encode DNS query: {}", e)))?
+            .len();
+        // Padding 选项自身占 4 字节（code + length）
+        let pad = (DNS_QUERY_PAD_BLOCK - (unpadded_len + 4) % DNS_QUERY_PAD_BLOCK)
+            % DNS_QUERY_PAD_BLOCK;
+        if let Some(edns) = request.extensions_mut().as_mut() {
+            edns.options_mut()
+                .insert(EdnsOption::Unknown(12, vec![0; pad]));
+        }
+
+        request
+            .to_vec()
+            .map_err(|e| DohProxyError::Dns(format!("Failed to encode DNS query: {}", e)))
     }
 }
 
@@ -2007,7 +3056,13 @@ mod tests {
 
     /// 主地址是系统 DNS 解析不出的 .invalid 域名，备用节点指向本机 port
     fn unresolvable_upstream(port: u16) -> DohUpstream {
-        let uri: Uri = format!("http://doh-bootstrap-test.invalid:{}/v1/lookup", port)
+        unresolvable_upstream_named("doh-bootstrap-test.invalid", port)
+    }
+
+    /// 同上，但 DoH 域名由调用方指定：路由表、令牌登记都按域名全局登记，
+    /// 各测试并行跑，每个用自己的域名互不干扰
+    fn unresolvable_upstream_named(host: &str, port: u16) -> DohUpstream {
+        let uri: Uri = format!("http://{}:{}/v1/lookup", host, port)
             .parse()
             .unwrap();
         DnsResolver::build_doh_upstream(
@@ -2017,6 +3072,146 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    /// 本地假 JSON 接口（明文 HTTP）：只响应 `path` 上的请求，按顺序回 `responses`（用完重复最后一个）；
+    /// 返回端口和收到的每个请求头部
+    async fn spawn_fake_json(
+        path: &'static str,
+        responses: Vec<(u16, String)>,
+    ) -> (u16, Arc<parking_lot::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen_by_server = seen.clone();
+        let responses = Arc::new(responses);
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let seen = seen_by_server.clone();
+                let responses = responses.clone();
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let (head, _body) = read_request(&mut stream).await;
+                    let request_path = head.split(' ').nth(1).unwrap_or("");
+                    if request_path != path {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                            .await;
+                        return;
+                    }
+                    seen.lock().push(head.clone());
+                    let index = counter
+                        .fetch_add(1, Ordering::SeqCst)
+                        .min(responses.len().saturating_sub(1));
+                    let (status, body) = &responses[index];
+                    let reason = match status {
+                        200 => "OK",
+                        401 => "Unauthorized",
+                        404 => "Not Found",
+                        500 => "Internal Server Error",
+                        _ => "Status",
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        status,
+                        reason,
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    const TABLE_V4: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 10);
+    const TABLE_V6: std::net::Ipv6Addr = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10);
+
+    /// 只含 `linux.do`（wildcard）一条的路由表 JSON
+    fn route_table_json(
+        generated: u64,
+        ttl: u64,
+        max_stale: u64,
+        miss: Option<&str>,
+        nodes: Option<serde_json::Value>,
+    ) -> String {
+        let mut json = serde_json::json!({
+            "generated": generated,
+            "serial": generated,
+            "ttl": ttl,
+            "max_stale": max_stale,
+            "routes": [
+                {
+                    "name": "linux.do",
+                    "wildcard": true,
+                    "v4": [TABLE_V4.to_string()],
+                    "v6": [TABLE_V6.to_string()],
+                    "ttl": 300
+                }
+            ]
+        });
+        if let Some(miss) = miss {
+            json["miss"] = miss.into();
+        }
+        if let Some(nodes) = nodes {
+            json["nodes"] = nodes;
+        }
+        json.to_string()
+    }
+
+    /// 查表模式的 resolver：DoH 和路由表接口都挂在 `name` 这个解析不出的域名上，备用节点指向本机
+    async fn table_mode_resolver(
+        name: &str,
+        doh_port: u16,
+        routes_port: u16,
+    ) -> (DnsResolver, String) {
+        let doh_url = format!("http://{}:{}/v1/lookup", name, doh_port);
+        let routes_url = format!("http://{}:{}/v1/routes", name, routes_port);
+        DnsResolver::set_bootstrap_ips(&doh_url, &["127.0.0.1".into()]);
+        DnsResolver::set_routes_url(&doh_url, Some(&routes_url), None).unwrap();
+        let resolver = resolver_with(unresolvable_upstream_named(name, doh_port)).await;
+        (resolver, doh_url)
+    }
+
+    /// 生成一对测试用 Ed25519 密钥，并把公钥按 kid 登记到测试公钥表
+    fn test_keypair(kid: &str) -> ring::signature::Ed25519KeyPair {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let keypair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(keypair.public_key().as_ref());
+        TEST_NODE_LIST_PUBKEYS
+            .get_or_init(|| RwLock::new(Vec::new()))
+            .write()
+            .push((kid.to_string(), pubkey));
+        keypair
+    }
+
+    fn signed_envelope(
+        keypair: &ring::signature::Ed25519KeyPair,
+        kid: &str,
+        payload_json: &str,
+    ) -> NodesEnvelope {
+        NodesEnvelope {
+            kid: kid.to_string(),
+            payload: STANDARD.encode(payload_json.as_bytes()),
+            sig: STANDARD.encode(keypair.sign(payload_json.as_bytes()).as_ref()),
+        }
+    }
+
+    /// 等到条件成立或超时
+    async fn wait_until(mut condition: impl FnMut() -> bool, limit: Duration) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < limit {
+            if condition() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        condition()
     }
 
     async fn resolver_with(upstream: DohUpstream) -> DnsResolver {
@@ -2040,7 +3235,8 @@ mod tests {
             DnsResolver::bootstrap_ips_for_url("https://registry-test.example/dns-query"),
             vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))]
         );
-        assert_ne!(
+        // 备用节点在建连时动态读取，登记与否都不换 resolver
+        assert_eq!(
             DnsResolver::shared_cache_key(url, None, false, None),
             key_before
         );
@@ -2053,8 +3249,12 @@ mod tests {
         );
     }
 
+    /// `DOH_AUTH_REJECTED` 是进程全局标记，会碰它的测试串行跑
+    static AUTH_FLAG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn sends_auth_token_and_recovers_after_token_change() {
+        let _serial = AUTH_FLAG_LOCK.lock().await;
         let (port, seen) = spawn_auth_doh().await;
         let url = format!("http://auth-test.invalid:{}/v1/lookup", port);
         let upstream = DnsResolver::build_doh_upstream(
@@ -2207,6 +3407,377 @@ mod tests {
         .await
         .expect("lookup should finish");
         assert!(result.1.is_err());
+    }
+
+    /// 查询报文带 EDNS Padding，整体填到 128 字节整倍数，问题段和类型不受影响
+    #[test]
+    fn pads_query_to_128_byte_multiple() {
+        use hickory_resolver::proto::rr::rdata::opt::EdnsCode;
+        let domains = [
+            "a.io",
+            "linux.do",
+            "some-rather-long-subdomain-name.cdn.example-domain-with-many-labels.co.uk",
+        ];
+        for domain in domains {
+            for record_type in [RecordType::A, RecordType::AAAA, RecordType::HTTPS] {
+                let bytes = DnsResolver::encode_query(domain, record_type).unwrap();
+                assert_eq!(
+                    bytes.len() % DNS_QUERY_PAD_BLOCK,
+                    0,
+                    "{} {} -> {} bytes",
+                    domain,
+                    record_type,
+                    bytes.len()
+                );
+                let message = Message::from_vec(&bytes).unwrap();
+                let question = &message.queries()[0];
+                assert_eq!(question.name().to_utf8(), format!("{}.", domain));
+                assert_eq!(question.query_type(), record_type);
+                assert!(message.recursion_desired());
+                let edns = message.extensions().as_ref().expect("EDNS present");
+                assert_eq!(edns.max_payload(), 1232);
+                assert!(edns.option(EdnsCode::Padding).is_some());
+            }
+        }
+    }
+
+    /// 表命中：直接用表里的地址，DoH 服务器收不到任何查询；表请求带 JSON accept 和固定 UA
+    #[tokio::test]
+    async fn route_table_hit_skips_doh() {
+        let (doh_port, doh_seen) = spawn_fake_doh().await;
+        let table = route_table_json(now_unix(), 600, 86400, None, None);
+        let (routes_port, routes_seen) = spawn_fake_json("/v1/routes", vec![(200, table)]).await;
+        let (resolver, _) = table_mode_resolver("table-hit.invalid", doh_port, routes_port).await;
+
+        let result = resolver.lookup_host("linux.do", false).await.unwrap();
+        assert_eq!(
+            result.addrs,
+            vec![IpAddr::V4(TABLE_V4), IpAddr::V6(TABLE_V6)]
+        );
+        assert!(result.ech_config.is_none());
+        assert!(result.ttl >= Duration::from_secs(MIN_TTL_SECS));
+        assert!(result.ttl <= Duration::from_secs(600));
+
+        // 通配：子域名也命中
+        let addrs = resolver.lookup_ip("cdn.linux.do").await.unwrap();
+        assert_eq!(addrs[0], IpAddr::V4(TABLE_V4));
+        let (ech, ip) = resolver.lookup_ech_and_ip("connect.linux.do").await;
+        assert!(ech.is_none());
+        assert_eq!(ip.unwrap()[0], IpAddr::V4(TABLE_V4));
+
+        assert!(doh_seen.lock().is_empty(), "{:?}", doh_seen.lock());
+        let heads = routes_seen.lock();
+        assert_eq!(heads.len(), 1);
+        assert!(heads[0].starts_with("GET /v1/routes HTTP/1.1"), "{}", heads[0]);
+        assert_eq!(
+            header_value(&heads[0], "accept").as_deref(),
+            Some("application/json")
+        );
+        assert_eq!(
+            header_value(&heads[0], "user-agent").as_deref(),
+            Some(DOH_USER_AGENT)
+        );
+        assert!(header_value(&heads[0], "authorization").is_none());
+    }
+
+    /// 通配只向下匹配，精确条目不向下匹配；ech 字段解成带长度前缀的 ECHConfigList
+    #[test]
+    fn route_table_wildcard_matches_subdomains() {
+        let json: RouteTableJson = serde_json::from_str(
+            &serde_json::json!({
+                "generated": now_unix(),
+                "ttl": 600,
+                "max_stale": 86400,
+                "routes": [
+                    {"name": "Linux.do", "wildcard": true, "v4": ["203.0.113.10"]},
+                    {"name": "cdn.linux.do", "wildcard": false, "v4": ["203.0.113.11"], "ech": STANDARD.encode([0xfe, 0x0d, 0x00, 0x00])},
+                    {"name": "exact.example", "v4": ["203.0.113.12"], "ech": ""}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let table = RouteTable::from_json(&json, Duration::ZERO);
+        assert_eq!(table.len(), 3);
+        assert_eq!(table.miss_policy, MissPolicy::SystemFirst);
+
+        let hit = |host: &str| table.lookup(host).map(|entry| entry.addrs[0]);
+        assert_eq!(hit("linux.do"), Some("203.0.113.10".parse().unwrap()));
+        assert_eq!(hit("LINUX.DO."), Some("203.0.113.10".parse().unwrap()));
+        assert_eq!(hit("a.b.linux.do"), Some("203.0.113.10".parse().unwrap()));
+        // 更具体的精确条目优先
+        assert_eq!(hit("cdn.linux.do"), Some("203.0.113.11".parse().unwrap()));
+        // 精确条目的子域名回落到通配
+        assert_eq!(hit("x.cdn.linux.do"), Some("203.0.113.10".parse().unwrap()));
+        assert_eq!(hit("exact.example"), Some("203.0.113.12".parse().unwrap()));
+        assert_eq!(hit("sub.exact.example"), None);
+        assert_eq!(hit("notlinux.do"), None);
+
+        let ech = table.lookup("cdn.linux.do").unwrap().ech.as_ref().unwrap();
+        assert_eq!(ech.as_ref(), &[0x00, 0x04, 0xfe, 0x0d, 0x00, 0x00]);
+        assert!(table.lookup("exact.example").unwrap().ech.is_none());
+        assert!(table.lookup("linux.do").unwrap().ech.is_none());
+    }
+
+    /// 表外域名缺省先走系统 DNS（localhost 不碰 DoH），系统 DNS 解析不出才落到 DoH
+    #[tokio::test]
+    async fn route_table_miss_uses_system_dns_first() {
+        let (doh_port, doh_seen) = spawn_fake_doh().await;
+        let table = route_table_json(now_unix(), 600, 86400, None, None);
+        let (routes_port, _) = spawn_fake_json("/v1/routes", vec![(200, table)]).await;
+        let (resolver, _) = table_mode_resolver("table-miss.invalid", doh_port, routes_port).await;
+
+        let addrs = resolver.lookup_ip("localhost").await.unwrap();
+        assert!(!addrs.is_empty());
+        assert!(addrs.iter().all(IpAddr::is_loopback), "{:?}", addrs);
+        assert!(doh_seen.lock().is_empty());
+
+        let addrs = resolver.lookup_ip("nx-table-miss.invalid").await.unwrap();
+        assert_eq!(addrs, vec![IpAddr::V4(FAKE_ANSWER)]);
+        assert!(!doh_seen.lock().is_empty());
+    }
+
+    /// `miss: doh_first` 时表外域名和以前一样直接走 DoH
+    #[tokio::test]
+    async fn route_table_doh_first_policy_skips_system_dns() {
+        let (doh_port, doh_seen) = spawn_fake_doh().await;
+        let table = route_table_json(now_unix(), 600, 86400, Some("doh_first"), None);
+        let (routes_port, _) = spawn_fake_json("/v1/routes", vec![(200, table)]).await;
+        let (resolver, _) =
+            table_mode_resolver("table-dohfirst.invalid", doh_port, routes_port).await;
+
+        let addrs = resolver.lookup_ip("localhost").await.unwrap();
+        assert_eq!(addrs, vec![IpAddr::V4(FAKE_ANSWER)]);
+        assert!(!doh_seen.lock().is_empty());
+    }
+
+    /// 过了 ttl 但没超 max_stale：旧表照用，同时后台重新拉一次
+    #[tokio::test]
+    async fn stale_route_table_is_still_used_and_refreshed() {
+        let (doh_port, doh_seen) = spawn_fake_doh().await;
+        let table = route_table_json(now_unix(), 1, 600, None, None);
+        let (routes_port, routes_seen) = spawn_fake_json("/v1/routes", vec![(200, table)]).await;
+        let (resolver, _) =
+            table_mode_resolver("table-stale.invalid", doh_port, routes_port).await;
+
+        let addrs = resolver.lookup_ip("linux.do").await.unwrap();
+        assert_eq!(addrs[0], IpAddr::V4(TABLE_V4));
+        assert_eq!(routes_seen.lock().len(), 1);
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let start = std::time::Instant::now();
+        let addrs = resolver.lookup_ip("linux.do").await.unwrap();
+        assert_eq!(addrs[0], IpAddr::V4(TABLE_V4));
+        assert!(start.elapsed() < Duration::from_secs(1));
+
+        assert!(wait_until(|| routes_seen.lock().len() >= 2, Duration::from_secs(5)).await);
+        assert!(doh_seen.lock().is_empty());
+    }
+
+    /// 没有可用的表（持久化的已超 max_stale、接口又连不上）：退回 DoH，而且退避期内不再等待
+    #[tokio::test]
+    async fn route_table_beyond_max_stale_falls_back_to_doh() {
+        let (doh_port, doh_seen) = spawn_fake_doh().await;
+        let routes_port = closed_port().await;
+        let (resolver, doh_url) =
+            table_mode_resolver("table-expired.invalid", doh_port, routes_port).await;
+
+        let old = route_table_json(now_unix() - 100_000, 600, 3600, None, None);
+        assert!(DnsResolver::load_route_table_json(&doh_url, &old).is_err());
+
+        let start = std::time::Instant::now();
+        let addrs = resolver.lookup_ip("linux.do").await.unwrap();
+        assert_eq!(addrs, vec![IpAddr::V4(FAKE_ANSWER)]);
+        assert!(start.elapsed() < Duration::from_secs(ROUTES_INITIAL_WAIT_SECS + 6));
+        assert!(!doh_seen.lock().is_empty());
+
+        let start = std::time::Instant::now();
+        let addrs = resolver.lookup_ip("cdn.linux.do").await.unwrap();
+        assert_eq!(addrs, vec![IpAddr::V4(FAKE_ANSWER)]);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    /// 表接口回 401：打上「令牌被拒」标记，查询退回 DoH
+    #[tokio::test]
+    async fn routes_401_sets_auth_rejected() {
+        let _serial = AUTH_FLAG_LOCK.lock().await;
+        let (doh_port, _) = spawn_fake_doh().await;
+        let body = r#"{"error":{"code":"unauthorized","message":"invalid or missing API key"}}"#;
+        let (routes_port, routes_seen) =
+            spawn_fake_json("/v1/routes", vec![(401, body.to_string())]).await;
+        let (resolver, doh_url) =
+            table_mode_resolver("table-401.invalid", doh_port, routes_port).await;
+        DnsResolver::set_auth_token(&doh_url, Some("stale-token"));
+        DnsResolver::take_auth_rejected();
+
+        let addrs = resolver.lookup_ip("linux.do").await.unwrap();
+        assert_eq!(addrs, vec![IpAddr::V4(FAKE_ANSWER)]);
+        assert!(DnsResolver::take_auth_rejected());
+        let heads = routes_seen.lock();
+        assert_eq!(
+            header_value(&heads[0], "authorization").as_deref(),
+            Some("Bearer stale-token")
+        );
+    }
+
+    /// App 回灌的表没过期就直接用，不先拉接口；缓存时长按表剩余新鲜期
+    #[tokio::test]
+    async fn persisted_route_table_is_used_immediately() {
+        let (doh_port, doh_seen) = spawn_fake_doh().await;
+        let (routes_port, routes_seen) =
+            spawn_fake_json("/v1/routes", vec![(500, "{}".to_string())]).await;
+        let (resolver, doh_url) =
+            table_mode_resolver("table-persist.invalid", doh_port, routes_port).await;
+        let persisted = route_table_json(now_unix() - 30, 600, 86400, None, None);
+        DnsResolver::load_route_table_json(&doh_url, &persisted).unwrap();
+
+        let result = resolver.lookup_host("linux.do", false).await.unwrap();
+        assert_eq!(result.addrs[0], IpAddr::V4(TABLE_V4));
+        assert!(result.ttl > Duration::from_secs(500), "{:?}", result.ttl);
+        assert!(result.ttl <= Duration::from_secs(570), "{:?}", result.ttl);
+        assert!(routes_seen.lock().is_empty());
+        assert!(doh_seen.lock().is_empty());
+
+        // 取消登记后回到普通 DoH
+        DnsResolver::set_routes_url(&doh_url, None, None).unwrap();
+        let addrs = resolver.lookup_ip("linux.do").await.unwrap();
+        assert_eq!(addrs, vec![IpAddr::V4(FAKE_ANSWER)]);
+    }
+
+    /// 节点列表：坏签名 / 未知 kid / 过期一律拒绝；serial 不比已存的大不接受；
+    /// 接受后建连用的备用 IP 立即变化，并与登记的种子合并去重
+    #[tokio::test]
+    async fn node_list_signature_serial_and_expiry() {
+        let kid = "test-2026";
+        let keypair = test_keypair(kid);
+        let other = test_keypair("other-2026");
+        let now = now_unix();
+        let payload = |serial: u64, not_after: u64, ips: &[&str]| {
+            serde_json::json!({
+                "serial": serial,
+                "not_after": not_after,
+                "hosts": {"node-test.invalid": {"v4": ips, "v6": ["2001:db8::9"]}}
+            })
+            .to_string()
+        };
+        let resolver = BootstrapResolver {
+            host: "abc.node-test.invalid".to_string(),
+            initial: Vec::new(),
+        };
+        assert!(resolver.current().is_empty());
+
+        let bad_sig = signed_envelope(&other, kid, &payload(10, now + 3600, &["203.0.113.9"]));
+        assert!(DnsResolver::verify_node_list(&bad_sig, now).is_err());
+        let unknown_kid =
+            signed_envelope(&keypair, "nope", &payload(10, now + 3600, &["203.0.113.9"]));
+        assert!(DnsResolver::verify_node_list(&unknown_kid, now).is_err());
+        let expired = signed_envelope(&keypair, kid, &payload(10, now - 1, &["203.0.113.9"]));
+        assert!(DnsResolver::verify_node_list(&expired, now).is_err());
+        let mut tampered = signed_envelope(&keypair, kid, &payload(10, now + 3600, &["203.0.113.9"]));
+        tampered.payload = STANDARD.encode(payload(99, now + 3600, &["203.0.113.9"]));
+        assert!(DnsResolver::verify_node_list(&tampered, now).is_err());
+
+        let good = signed_envelope(&keypair, kid, &payload(10, now + 3600, &["203.0.113.9"]));
+        assert!(DnsResolver::accept_node_list(&good).unwrap());
+        let expected: Vec<IpAddr> = vec![
+            "203.0.113.9".parse().unwrap(),
+            "2001:db8::9".parse().unwrap(),
+        ];
+        assert_eq!(resolver.current(), expected);
+        assert_eq!(DnsResolver::bootstrap_ips_for_host("node-test.invalid"), expected);
+        assert_eq!(DnsResolver::bootstrap_ips_for_host("NODE-TEST.invalid"), expected);
+        assert!(DnsResolver::bootstrap_ips_for_host("xnode-test.invalid").is_empty());
+        assert!(DnsResolver::bootstrap_ips_for_host("other-node.invalid").is_empty());
+
+        assert!(!DnsResolver::accept_node_list(&good).unwrap());
+        let older = signed_envelope(&keypair, kid, &payload(9, now + 3600, &["203.0.113.8"]));
+        assert!(!DnsResolver::accept_node_list(&older).unwrap());
+        assert_eq!(resolver.current(), expected);
+
+        // 更新的 serial 生效；登记的种子排在后面并去重
+        DnsResolver::set_bootstrap_ips(
+            "https://abc.node-test.invalid/v1/lookup",
+            &["203.0.113.19".into(), "203.0.113.20".into()],
+        );
+        let newer = signed_envelope(&keypair, kid, &payload(11, now + 3600, &["203.0.113.19"]));
+        assert!(DnsResolver::accept_node_list(&newer).unwrap());
+        assert_eq!(
+            resolver.current(),
+            vec![
+                "203.0.113.19".parse::<IpAddr>().unwrap(),
+                "2001:db8::9".parse().unwrap(),
+                "203.0.113.20".parse().unwrap(),
+            ]
+        );
+        // url-safe 无填充的 base64 也认
+        let mut url_safe = newer.clone();
+        url_safe.payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(STANDARD.decode(&newer.payload).unwrap());
+        url_safe.sig = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(STANDARD.decode(&newer.sig).unwrap());
+        assert_eq!(
+            DnsResolver::verify_node_list(&url_safe, now).unwrap().serial,
+            11
+        );
+        // 持久化回灌：验签要过，但同 serial 不算更新
+        assert!(!DnsResolver::load_node_list_json(&serde_json::to_string(&newer).unwrap()).unwrap());
+        assert!(DnsResolver::load_node_list_json("{\"kid\":\"x\"}").is_err());
+
+        let update = DnsResolver::take_accel_update().expect("node list update pending");
+        assert_eq!(update.nodes_envelope.as_ref(), Some(&newer));
+        assert!(update.nodes.unwrap().contains("203.0.113.19"));
+    }
+
+    /// 加速接口请求走 DoH 同一套客户端：固定 UA、调用方的头原样带上、缺省 accept JSON、经备用节点可达
+    #[tokio::test]
+    async fn accel_request_sends_json_with_doh_client_path() {
+        let (port, seen) = spawn_fake_json("/v1/token", vec![(200, r#"{"ok":true}"#.to_string())]).await;
+        DnsResolver::set_bootstrap_ips(
+            &format!("http://accel-test.invalid:{}/v1/lookup", port),
+            &["127.0.0.1".into()],
+        );
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            ("authorization".to_string(), "Bearer abc".to_string()),
+        ];
+        let response = DnsResolver::accel_request(
+            "post",
+            &format!("http://accel-test.invalid:{}/v1/token", port),
+            &headers,
+            Some(br#"{"a":1}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, r#"{"ok":true}"#);
+
+        let heads = seen.lock();
+        assert_eq!(heads.len(), 1);
+        assert!(heads[0].starts_with("POST /v1/token HTTP/1.1"), "{}", heads[0]);
+        assert_eq!(
+            header_value(&heads[0], "content-type").as_deref(),
+            Some("application/json")
+        );
+        assert_eq!(
+            header_value(&heads[0], "authorization").as_deref(),
+            Some("Bearer abc")
+        );
+        assert_eq!(
+            header_value(&heads[0], "accept").as_deref(),
+            Some("application/json")
+        );
+        assert_eq!(
+            header_value(&heads[0], "user-agent").as_deref(),
+            Some(DOH_USER_AGENT)
+        );
+        assert_eq!(header_value(&heads[0], "content-length").as_deref(), Some("7"));
+
+        assert!(DnsResolver::accel_request("GET", "ftp://x", &[], None)
+            .await
+            .is_err());
+        assert!(DnsResolver::accel_request("GET", "https://", &[], None)
+            .await
+            .is_err());
     }
 
     /// 连真实的 cfluxdo 加速节点：主地址故意指向黑洞，验证走备用节点能查到 linux.do。

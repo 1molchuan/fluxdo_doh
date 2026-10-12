@@ -105,6 +105,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|i| args.get(i + 1))
         .cloned();
 
+    // Parse --doh-routes-url <url>：加速服务端的路由表接口，有值即查表模式
+    let doh_routes_url = args
+        .iter()
+        .position(|a| a == "--doh-routes-url")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+
     let upstream_proxy = match (upstream_host, upstream_port) {
         (Some(host), Some(port)) if !host.trim().is_empty() && port > 0 => {
             Some(UpstreamProxyConfig {
@@ -133,6 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         upstream_proxy,
         server_ip,
         h2_mitm,
+        doh_routes_url,
         ..Default::default()
     };
 
@@ -163,13 +171,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Server starting...");
 
-    // 进程模式没有 FFI，令牌被拒时在 stdout 打一行标记，由 App 读取后重新申请令牌
+    // 进程模式没有 FFI，令牌被拒时在 stdout 打一行标记，由 App 读取后重新申请令牌；
+    // 新拉到的路由表 / 节点列表也打一行单行 JSON，由 App 持久化
     tokio::spawn(async {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             interval.tick().await;
             if doh_proxy::dns::DnsResolver::take_auth_rejected() {
                 println!("DOH_AUTH_REJECTED");
+            }
+            if let Some(update) = doh_proxy::dns::DnsResolver::take_accel_update() {
+                let json = serde_json::json!({
+                    "route_table": update.route_table,
+                    "nodes": update.nodes,
+                    "nodes_envelope": update.nodes_envelope,
+                });
+                println!("DOH_ACCEL_UPDATE {}", json);
             }
         }
     });
