@@ -52,6 +52,9 @@ const DOH_COOLDOWN_SECS: u64 = 30;
 const INFLIGHT_WAIT_TIMEOUT_SECS: u64 = 15;
 /// DoH 服务器拒绝令牌（401/403）后暂停使用的时长；换了新令牌会立即恢复
 const DOH_AUTH_REJECTED_COOLDOWN_SECS: u64 = 60;
+/// DoH 请求固定带的 User-Agent：安卓上最常见的 HTTP 库，混在普通 App 流量里不显眼。
+/// 只用于 DoH 查询，不影响经代理转发的站点请求。
+const DOH_USER_AGENT: &str = "okhttp/4.12.0";
 
 static SHARED_RESOLVERS: OnceLock<Arc<AsyncRwLock<HashMap<String, Arc<DnsResolver>>>>> =
     OnceLock::new();
@@ -85,6 +88,8 @@ struct DohUpstreamHealth {
     cooldown_until: Option<std::time::Instant>,
     /// 被服务器拒绝的令牌；登记的令牌换掉后解除暂停
     rejected_token: Option<String>,
+    /// 服务器不接受 POST（回 405/415）后改用 GET `?dns=` 查询
+    get_only: bool,
 }
 
 impl DohUpstream {
@@ -97,9 +102,31 @@ impl DohUpstream {
         }
     }
 
-    async fn get(&self, url: &str) -> Result<reqwest::Response> {
+    /// 不带查询参数的请求地址：scheme://authority/path
+    fn endpoint(&self) -> Result<String> {
+        let scheme = self.uri.scheme_str().unwrap_or("https");
+        let authority = self
+            .uri
+            .authority()
+            .ok_or_else(|| DohProxyError::InvalidUrl("Missing DOH authority".to_string()))?;
+        Ok(format!("{}://{}{}", scheme, authority, self.uri.path()))
+    }
+
+    /// 发送 DNS 查询报文。默认 POST（报文放请求体，二进制 body 比 `?dns=` 更像普通 API 调用）；
+    /// 服务器回 405/415 说明只支持 GET，改为 GET `?dns=` 重发一次，之后该服务器一直用 GET。
+    async fn query(&self, message: &[u8]) -> Result<reqwest::Response> {
+        loop {
+            let (response, retry_with_get) = self.query_once(message).await?;
+            if !retry_with_get {
+                return Ok(response);
+            }
+        }
+    }
+
+    /// 返回响应，以及是否刚切到 GET、需要重发
+    async fn query_once(&self, message: &[u8]) -> Result<(reqwest::Response, bool)> {
         let auth_token = DnsResolver::auth_token_for_uri(&self.uri);
-        let (bootstrap_first, cooling_down) = {
+        let (bootstrap_first, cooling_down, use_get) = {
             let mut health = self.health.lock();
             let now = std::time::Instant::now();
             if health.rejected_token.is_some() && health.rejected_token != auth_token {
@@ -111,6 +138,7 @@ impl DohUpstream {
                     .prefer_bootstrap_until
                     .is_some_and(|until| until > now),
                 health.cooldown_until.is_some_and(|until| until > now),
+                health.get_only,
             )
         };
         if cooling_down {
@@ -120,8 +148,15 @@ impl DohUpstream {
             )));
         }
 
+        let endpoint = self.endpoint()?;
         let result = self
-            .send_with_fallback(url, bootstrap_first, auth_token.as_deref())
+            .send_with_fallback(
+                &endpoint,
+                message,
+                use_get,
+                bootstrap_first,
+                auth_token.as_deref(),
+            )
             .await;
 
         let mut health = self.health.lock();
@@ -135,6 +170,18 @@ impl DohUpstream {
                         .then(|| now + Duration::from_secs(DOH_BOOTSTRAP_PREFER_SECS));
                 }
                 let status = response.status();
+                if !use_get
+                    && (status == reqwest::StatusCode::METHOD_NOT_ALLOWED
+                        || status == reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE)
+                {
+                    warn!(
+                        "DoH server {} does not accept POST ({}), switching to GET",
+                        self.uri.host().unwrap_or_default(),
+                        status
+                    );
+                    health.get_only = true;
+                    return Ok((response, true));
+                }
                 if auth_token.is_some()
                     && (status == reqwest::StatusCode::UNAUTHORIZED
                         || status == reqwest::StatusCode::FORBIDDEN)
@@ -150,7 +197,7 @@ impl DohUpstream {
                         Some(now + Duration::from_secs(DOH_AUTH_REJECTED_COOLDOWN_SECS));
                     DOH_AUTH_REJECTED.store(true, Ordering::Relaxed);
                 }
-                Ok(response)
+                Ok((response, false))
             }
             Err(error) => {
                 health.consecutive_failures += 1;
@@ -163,7 +210,7 @@ impl DohUpstream {
                     );
                     health.cooldown_until = Some(now + Duration::from_secs(DOH_COOLDOWN_SECS));
                 }
-                Err(DohProxyError::Dns(format!("DoH GET failed: {}", error)))
+                Err(DohProxyError::Dns(format!("DoH request failed: {}", error)))
             }
         }
     }
@@ -171,12 +218,26 @@ impl DohUpstream {
     /// 返回响应以及是否经由备用节点
     async fn send_with_fallback(
         &self,
-        url: &str,
+        endpoint: &str,
+        message: &[u8],
+        use_get: bool,
         bootstrap_first: bool,
         auth_token: Option<&str>,
     ) -> std::result::Result<(reqwest::Response, bool), reqwest::Error> {
         let send = |client: &Client| {
-            let request = client.get(url).header("accept", "application/dns-message");
+            let request = if use_get {
+                client.get(format!(
+                    "{}?dns={}",
+                    endpoint,
+                    URL_SAFE_NO_PAD.encode(message)
+                ))
+            } else {
+                client
+                    .post(endpoint)
+                    .header("content-type", "application/dns-message")
+                    .body(message.to_vec())
+            }
+            .header("accept", "application/dns-message");
             match auth_token {
                 Some(token) => request.bearer_auth(token),
                 None => request,
@@ -197,7 +258,7 @@ impl DohUpstream {
             // 只有连接层失败才换路；HTTP 错误码说明服务器已连通，换节点也一样
             Err(error) => {
                 warn!(
-                    "DoH GET via {} failed, retrying via {}: {}",
+                    "DoH request via {} failed, retrying via {}: {}",
                     if bootstrap_first {
                         "bootstrap IPs"
                     } else {
@@ -1553,7 +1614,7 @@ impl DnsResolver {
         timeout: Duration,
         upstream_proxy: Option<&UpstreamProxyConfig>,
     ) -> Result<Client> {
-        let mut builder = builder.timeout(timeout);
+        let mut builder = builder.timeout(timeout).user_agent(DOH_USER_AGENT);
         if let Some(proxy) = upstream_proxy
             .filter(|proxy| proxy.is_valid() && (proxy.is_http() || proxy.is_socks5()))
         {
@@ -1692,7 +1753,6 @@ impl DnsResolver {
         let Some(upstream) = upstream else {
             return Ok(None);
         };
-        let uri = &upstream.uri;
         let start = std::time::Instant::now();
 
         use hickory_resolver::proto::op::{Edns, Message, Query};
@@ -1718,20 +1778,12 @@ impl DnsResolver {
         let bytes = request
             .to_vec()
             .map_err(|e| DohProxyError::Dns(format!("Failed to encode DNS query: {}", e)))?;
-        let encoded = URL_SAFE_NO_PAD.encode(bytes);
 
-        let scheme = uri.scheme_str().unwrap_or("https");
-        let authority = uri
-            .authority()
-            .ok_or_else(|| DohProxyError::InvalidUrl("Missing DOH authority".to_string()))?;
-        let path = uri.path();
-        let url = format!("{}://{}{}?dns={}", scheme, authority, path, encoded);
-
-        let response = upstream.get(&url).await?;
+        let response = upstream.query(&bytes).await?;
 
         if !response.status().is_success() {
             return Err(DohProxyError::Dns(format!(
-                "DoH GET http error: {}",
+                "DoH http error: {}",
                 response.status()
             )));
         }
@@ -1751,7 +1803,7 @@ impl DnsResolver {
         let body = response
             .bytes()
             .await
-            .map_err(|e| DohProxyError::Dns(format!("DoH GET read failed: {}", e)))?;
+            .map_err(|e| DohProxyError::Dns(format!("DoH read failed: {}", e)))?;
         let message = hickory_resolver::proto::op::Message::from_vec(&body)
             .map_err(|e| DohProxyError::Dns(format!("Invalid DNS response: {}", e)))?;
 
@@ -1777,47 +1829,143 @@ mod tests {
 
     const FAKE_ANSWER: Ipv4Addr = Ipv4Addr::new(1, 2, 3, 4);
 
-    /// 本地假 DoH 服务器（明文 HTTP）：A 查询回 1.2.3.4，其他类型回空应答
-    async fn spawn_fake_doh() -> u16 {
+    /// 读完整的 HTTP 请求：头部文本，以及按 content-length 读满的请求体
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let header_end = loop {
+            let n = stream.read(&mut chunk).await.unwrap_or(0);
+            if n == 0 {
+                break buf.len();
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+        let content_length = header_value(&head, "content-length")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        while buf.len() < header_end + content_length {
+            let n = stream.read(&mut chunk).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        (head, buf[header_end..].to_vec())
+    }
+
+    /// 本机上有别的程序会探测新开的端口（见过 Go-http-client 的 `GET /`），
+    /// 不是打到查询路径的请求一律回 404 并忽略，避免干扰断言
+    async fn is_doh_request(stream: &mut tokio::net::TcpStream, head: &str) -> bool {
+        if head.contains(" /v1/lookup") {
+            return true;
+        }
+        let _ = stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+            .await;
+        false
+    }
+
+    fn header_value(head: &str, name: &str) -> Option<String> {
+        head.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_string())
+        })
+    }
+
+    /// 从请求里取出 DNS 查询报文：POST 看请求体，GET 看 `?dns=`
+    fn query_message(head: &str, body: &[u8]) -> Message {
+        if head.starts_with("POST ") {
+            return Message::from_vec(body).unwrap();
+        }
+        let encoded = head
+            .split("dns=")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .unwrap_or_default();
+        Message::from_vec(&URL_SAFE_NO_PAD.decode(encoded).unwrap()).unwrap()
+    }
+
+    /// A 查询回 1.2.3.4，其他类型回空应答
+    async fn write_dns_answer(stream: &mut tokio::net::TcpStream, query: &Message) {
+        let question = query.queries()[0].clone();
+        let mut response = Message::new();
+        response
+            .set_id(query.id())
+            .set_message_type(MessageType::Response)
+            .add_query(question.clone());
+        if question.query_type() == RecordType::A {
+            response.add_answer(Record::from_rdata(
+                question.name().clone(),
+                120,
+                RData::A(A(FAKE_ANSWER)),
+            ));
+        }
+        let body = response.to_vec().unwrap();
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/dns-message\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(head.as_bytes()).await;
+        let _ = stream.write_all(&body).await;
+    }
+
+    /// 本地假 DoH 服务器（明文 HTTP），GET/POST 都接受；返回端口和收到的每个请求头部
+    async fn spawn_fake_doh() -> (u16, Arc<parking_lot::Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen_by_server = seen.clone();
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
+                let seen = seen_by_server.clone();
                 tokio::spawn(async move {
-                    let mut buf = vec![0u8; 4096];
-                    let n = stream.read(&mut buf).await.unwrap_or(0);
-                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let encoded = request
-                        .split("dns=")
-                        .nth(1)
-                        .and_then(|rest| rest.split(' ').next())
-                        .unwrap_or_default();
-                    let query =
-                        Message::from_vec(&URL_SAFE_NO_PAD.decode(encoded).unwrap()).unwrap();
-                    let question = query.queries()[0].clone();
-                    let mut response = Message::new();
-                    response
-                        .set_id(query.id())
-                        .set_message_type(MessageType::Response)
-                        .add_query(question.clone());
-                    if question.query_type() == RecordType::A {
-                        response.add_answer(Record::from_rdata(
-                            question.name().clone(),
-                            120,
-                            RData::A(A(FAKE_ANSWER)),
-                        ));
+                    let (head, body) = read_request(&mut stream).await;
+                    if !is_doh_request(&mut stream, &head).await {
+                        return;
                     }
-                    let body = response.to_vec().unwrap();
-                    let head = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/dns-message\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    let _ = stream.write_all(head.as_bytes()).await;
-                    let _ = stream.write_all(&body).await;
+                    seen.lock().push(head.clone());
+                    let query = query_message(&head, &body);
+                    write_dns_answer(&mut stream, &query).await;
                 });
             }
         });
-        port
+        (port, seen)
+    }
+
+    /// 只支持 GET 的假 DoH 服务器：POST 一律回 405；返回端口和收到的每个请求头部
+    async fn spawn_get_only_doh() -> (u16, Arc<parking_lot::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen_by_server = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let seen = seen_by_server.clone();
+                tokio::spawn(async move {
+                    let (head, body) = read_request(&mut stream).await;
+                    if !is_doh_request(&mut stream, &head).await {
+                        return;
+                    }
+                    seen.lock().push(head.clone());
+                    if head.starts_with("POST ") {
+                        let _ = stream
+                            .write_all(
+                                b"HTTP/1.1 405 Method Not Allowed\r\nallow: GET\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                            )
+                            .await;
+                        return;
+                    }
+                    let query = query_message(&head, &body);
+                    write_dns_answer(&mut stream, &query).await;
+                });
+            }
+        });
+        (port, seen)
     }
 
     /// 只认 `Bearer good-token` 的假 DoH 服务器：其他令牌回 401，并记下收到的 Authorization 头
@@ -1830,17 +1978,11 @@ mod tests {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let seen = seen_by_server.clone();
                 tokio::spawn(async move {
-                    let mut buf = vec![0u8; 4096];
-                    let n = stream.read(&mut buf).await.unwrap_or(0);
-                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let auth = request
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("authorization")
-                                .then(|| value.trim().to_string())
-                        })
-                        .unwrap_or_default();
+                    let (head, body) = read_request(&mut stream).await;
+                    if !is_doh_request(&mut stream, &head).await {
+                        return;
+                    }
+                    let auth = header_value(&head, "authorization").unwrap_or_default();
                     seen.lock().push(auth.clone());
                     if auth != "Bearer good-token" {
                         let _ = stream
@@ -1850,33 +1992,8 @@ mod tests {
                             .await;
                         return;
                     }
-                    let encoded = request
-                        .split("dns=")
-                        .nth(1)
-                        .and_then(|rest| rest.split(' ').next())
-                        .unwrap_or_default();
-                    let query =
-                        Message::from_vec(&URL_SAFE_NO_PAD.decode(encoded).unwrap()).unwrap();
-                    let question = query.queries()[0].clone();
-                    let mut response = Message::new();
-                    response
-                        .set_id(query.id())
-                        .set_message_type(MessageType::Response)
-                        .add_query(question.clone());
-                    if question.query_type() == RecordType::A {
-                        response.add_answer(Record::from_rdata(
-                            question.name().clone(),
-                            120,
-                            RData::A(A(FAKE_ANSWER)),
-                        ));
-                    }
-                    let body = response.to_vec().unwrap();
-                    let head = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/dns-message\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    let _ = stream.write_all(head.as_bytes()).await;
-                    let _ = stream.write_all(&body).await;
+                    let query = query_message(&head, &body);
+                    write_dns_answer(&mut stream, &query).await;
                 });
             }
         });
@@ -1997,7 +2114,7 @@ mod tests {
 
     #[tokio::test]
     async fn falls_back_to_bootstrap_ips_and_prefers_them() {
-        let port = spawn_fake_doh().await;
+        let (port, _) = spawn_fake_doh().await;
         let upstream = unresolvable_upstream(port);
         let resolver = resolver_with(upstream.clone()).await;
 
@@ -2009,16 +2126,73 @@ mod tests {
         assert_eq!(health.consecutive_failures, 0);
     }
 
+    /// 查询默认用 POST：报文放请求体，带 content-type/accept 和固定 UA，地址里没有 `dns=`
+    #[tokio::test]
+    async fn posts_dns_message_with_fixed_user_agent() {
+        let (port, seen) = spawn_fake_doh().await;
+        let resolver = resolver_with(unresolvable_upstream(port)).await;
+
+        let addrs = resolver.lookup_ip("example.com").await.unwrap();
+        assert_eq!(addrs, vec![IpAddr::V4(FAKE_ANSWER)]);
+
+        let heads = seen.lock();
+        assert!(!heads.is_empty());
+        for head in heads.iter() {
+            assert!(head.starts_with("POST /v1/lookup HTTP/1.1"), "{}", head);
+            assert!(!head.contains("dns="), "{}", head);
+            assert_eq!(
+                header_value(head, "content-type").as_deref(),
+                Some("application/dns-message")
+            );
+            assert_eq!(
+                header_value(head, "accept").as_deref(),
+                Some("application/dns-message")
+            );
+            assert_eq!(
+                header_value(head, "user-agent").as_deref(),
+                Some(DOH_USER_AGENT)
+            );
+        }
+    }
+
+    /// 服务器回 405 时立刻改用 GET 重发，之后一直用 GET
+    #[tokio::test]
+    async fn falls_back_to_get_when_post_is_rejected() {
+        let (port, seen) = spawn_get_only_doh().await;
+        let upstream = unresolvable_upstream(port);
+        let resolver = resolver_with(upstream.clone()).await;
+
+        let addrs = resolver.lookup_ip("example.com").await.unwrap();
+        assert_eq!(addrs, vec![IpAddr::V4(FAKE_ANSWER)]);
+        assert!(upstream.health.lock().get_only);
+        let first_round = seen.lock().len();
+        {
+            let heads = seen.lock();
+            assert!(heads.iter().any(|head| head.starts_with("POST ")));
+            assert!(heads
+                .iter()
+                .any(|head| head.starts_with("GET /v1/lookup?dns=")));
+        }
+
+        let addrs = resolver.lookup_ip("example.org").await.unwrap();
+        assert_eq!(addrs, vec![IpAddr::V4(FAKE_ANSWER)]);
+        let heads = seen.lock();
+        assert!(heads.len() > first_round);
+        assert!(heads[first_round..]
+            .iter()
+            .all(|head| head.starts_with("GET /v1/lookup?dns=")));
+    }
+
     #[tokio::test]
     async fn cools_down_after_repeated_failures() {
         let upstream = unresolvable_upstream(closed_port().await);
-        let url = format!("{}?dns=AAAA", upstream.uri);
+        let message = b"not-a-real-query";
         for _ in 0..DOH_FAILURES_BEFORE_COOLDOWN {
-            assert!(upstream.get(&url).await.is_err());
+            assert!(upstream.query(message).await.is_err());
         }
 
         let start = std::time::Instant::now();
-        let error = upstream.get(&url).await.unwrap_err();
+        let error = upstream.query(message).await.unwrap_err();
         assert!(error.to_string().contains("cooling down"), "{}", error);
         assert!(start.elapsed() < Duration::from_millis(50));
     }
