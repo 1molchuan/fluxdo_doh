@@ -88,6 +88,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let doh_bootstrap_ips = parse_ip_list("--doh-bootstrap-ips");
     let doh_ech_bootstrap_ips = parse_ip_list("--doh-ech-bootstrap-ips");
 
+    // DoH 访问令牌走环境变量，不放命令行，避免出现在进程列表里
+    let env_token = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let doh_auth_token = env_token("DOH_PROXY_AUTH_TOKEN");
+    let doh_ech_auth_token = env_token("DOH_PROXY_ECH_AUTH_TOKEN");
+
     // Parse --server-ip <ip> argument
     let server_ip = args
         .iter()
@@ -118,6 +128,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         doh_server_ech,
         doh_bootstrap_ips,
         doh_ech_bootstrap_ips,
+        doh_auth_token,
+        doh_ech_auth_token,
         upstream_proxy,
         server_ip,
         h2_mitm,
@@ -150,6 +162,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = DohProxyServer::new(config).await?;
 
     info!("Server starting...");
+
+    // 进程模式没有 FFI，令牌被拒时在 stdout 打一行标记，由 App 读取后重新申请令牌
+    tokio::spawn(async {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            if doh_proxy::dns::DnsResolver::take_auth_rejected() {
+                println!("DOH_AUTH_REJECTED");
+            }
+        }
+    });
 
     // Handle Ctrl+C
     let server_handle = server;

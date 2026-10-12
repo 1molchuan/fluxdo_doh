@@ -136,6 +136,12 @@ pub struct ProxyConfig {
     /// doh_server_ech 的备用节点 IP
     #[serde(default)]
     pub doh_ech_bootstrap_ips: Vec<String>,
+    /// doh_server 的访问令牌，查询时放在 `Authorization: Bearer` 里
+    #[serde(default)]
+    pub doh_auth_token: Option<String>,
+    /// doh_server_ech 的访问令牌
+    #[serde(default)]
+    pub doh_ech_auth_token: Option<String>,
     /// Whether to prefer IPv6
     pub prefer_ipv6: bool,
     /// Connection timeout in seconds
@@ -177,6 +183,8 @@ impl Default for ProxyConfig {
             doh_server_ech: None,
             doh_bootstrap_ips: Vec::new(),
             doh_ech_bootstrap_ips: Vec::new(),
+            doh_auth_token: None,
+            doh_ech_auth_token: None,
             prefer_ipv6: false,
             timeout_secs: 30,
             upstream_proxy: None,

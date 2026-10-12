@@ -488,6 +488,17 @@ pub extern "C" fn doh_proxy_clear_dns_cache() -> c_int {
     1
 }
 
+/// 取出并清除「DoH 服务器拒绝了令牌」标记
+/// Returns 1 if a token was rejected since the last call, 0 otherwise
+#[no_mangle]
+pub extern "C" fn doh_proxy_take_auth_rejected() -> c_int {
+    if crate::dns::DnsResolver::take_auth_rejected() {
+        1
+    } else {
+        0
+    }
+}
+
 /// Return shared DNS resolver cache statistics.
 /// The caller must free the returned string with doh_proxy_free_string.
 #[no_mangle]

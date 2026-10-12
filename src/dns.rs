@@ -13,7 +13,7 @@ use http::Uri;
 use parking_lot::RwLock;
 use reqwest::Client;
 use rustls::pki_types::EchConfigListBytes;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{
     collections::{HashMap, HashSet},
     net::IpAddr,
@@ -50,12 +50,20 @@ const DOH_FAILURES_BEFORE_COOLDOWN: u32 = 4;
 const DOH_COOLDOWN_SECS: u64 = 30;
 /// 同域名并发查询时，跟随者等待领头查询的上限，避免错过通知后一直挂起
 const INFLIGHT_WAIT_TIMEOUT_SECS: u64 = 15;
+/// DoH 服务器拒绝令牌（401/403）后暂停使用的时长；换了新令牌会立即恢复
+const DOH_AUTH_REJECTED_COOLDOWN_SECS: u64 = 60;
 
 static SHARED_RESOLVERS: OnceLock<Arc<AsyncRwLock<HashMap<String, Arc<DnsResolver>>>>> =
     OnceLock::new();
 
 /// DoH 服务器域名 -> 备用节点 IP，由启动配置登记
 static DOH_BOOTSTRAP_IPS: OnceLock<RwLock<HashMap<String, Vec<IpAddr>>>> = OnceLock::new();
+
+/// DoH 服务器域名 -> 访问令牌，由启动配置登记；查询时放在 `Authorization: Bearer` 里
+static DOH_AUTH_TOKENS: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
+
+/// 有 DoH 服务器拒绝了令牌，等 App 取走后重新申请
+static DOH_AUTH_REJECTED: AtomicBool = AtomicBool::new(false);
 
 /// DoH 上游。主客户端用系统 DNS 解析 DoH 域名；登记了备用节点 IP 时另建一个直连节点的客户端
 /// （只替换连接地址，SNI 和 Host 不变），主客户端连不上时改用它重试。
@@ -75,6 +83,8 @@ struct DohUpstreamHealth {
     consecutive_failures: u32,
     /// 在此时间之前不再请求 DoH 服务器
     cooldown_until: Option<std::time::Instant>,
+    /// 被服务器拒绝的令牌；登记的令牌换掉后解除暂停
+    rejected_token: Option<String>,
 }
 
 impl DohUpstream {
@@ -88,9 +98,14 @@ impl DohUpstream {
     }
 
     async fn get(&self, url: &str) -> Result<reqwest::Response> {
+        let auth_token = DnsResolver::auth_token_for_uri(&self.uri);
         let (bootstrap_first, cooling_down) = {
-            let health = self.health.lock();
+            let mut health = self.health.lock();
             let now = std::time::Instant::now();
+            if health.rejected_token.is_some() && health.rejected_token != auth_token {
+                health.rejected_token = None;
+                health.cooldown_until = None;
+            }
             (
                 health
                     .prefer_bootstrap_until
@@ -100,12 +115,14 @@ impl DohUpstream {
         };
         if cooling_down {
             return Err(DohProxyError::Dns(format!(
-                "DoH server {} is cooling down after repeated failures",
+                "DoH server {} is cooling down",
                 self.uri.host().unwrap_or_default()
             )));
         }
 
-        let result = self.send_with_fallback(url, bootstrap_first).await;
+        let result = self
+            .send_with_fallback(url, bootstrap_first, auth_token.as_deref())
+            .await;
 
         let mut health = self.health.lock();
         let now = std::time::Instant::now();
@@ -116,6 +133,22 @@ impl DohUpstream {
                 if used_bootstrap != bootstrap_first {
                     health.prefer_bootstrap_until = used_bootstrap
                         .then(|| now + Duration::from_secs(DOH_BOOTSTRAP_PREFER_SECS));
+                }
+                let status = response.status();
+                if auth_token.is_some()
+                    && (status == reqwest::StatusCode::UNAUTHORIZED
+                        || status == reqwest::StatusCode::FORBIDDEN)
+                {
+                    warn!(
+                        "DoH server {} rejected the auth token ({}), pausing for {}s",
+                        self.uri.host().unwrap_or_default(),
+                        status,
+                        DOH_AUTH_REJECTED_COOLDOWN_SECS
+                    );
+                    health.rejected_token = auth_token;
+                    health.cooldown_until =
+                        Some(now + Duration::from_secs(DOH_AUTH_REJECTED_COOLDOWN_SECS));
+                    DOH_AUTH_REJECTED.store(true, Ordering::Relaxed);
                 }
                 Ok(response)
             }
@@ -140,12 +173,15 @@ impl DohUpstream {
         &self,
         url: &str,
         bootstrap_first: bool,
+        auth_token: Option<&str>,
     ) -> std::result::Result<(reqwest::Response, bool), reqwest::Error> {
         let send = |client: &Client| {
-            client
-                .get(url)
-                .header("accept", "application/dns-message")
-                .send()
+            let request = client.get(url).header("accept", "application/dns-message");
+            match auth_token {
+                Some(token) => request.bearer_auth(token),
+                None => request,
+            }
+            .send()
         };
         let Some(bootstrap_client) = self.bootstrap_client.as_ref() else {
             return send(&self.client).await.map(|response| (response, false));
@@ -340,6 +376,42 @@ impl DnsResolver {
         Self::doh_url_host(doh_url)
             .and_then(|host| Self::bootstrap_registry().read().get(&host).cloned())
             .unwrap_or_default()
+    }
+
+    fn auth_token_registry() -> &'static RwLock<HashMap<String, String>> {
+        DOH_AUTH_TOKENS.get_or_init(|| RwLock::new(HashMap::new()))
+    }
+
+    /// 登记 DoH 服务器的访问令牌（按 DoH 域名）；token 为空时取消登记。
+    /// 每次查询时读取，换令牌不需要重建 resolver，也不清 DNS 缓存。
+    pub fn set_auth_token(doh_url: &str, token: Option<&str>) {
+        let Some(host) = Self::doh_url_host(doh_url) else {
+            return;
+        };
+        let token = token.map(str::trim).filter(|token| !token.is_empty());
+        let mut registry = Self::auth_token_registry().write();
+        match token {
+            Some(token) if http::HeaderValue::from_str(&format!("Bearer {}", token)).is_ok() => {
+                registry.insert(host, token.to_string());
+            }
+            Some(_) => {
+                warn!("Ignoring invalid DoH auth token for {}", host);
+                registry.remove(&host);
+            }
+            None => {
+                registry.remove(&host);
+            }
+        }
+    }
+
+    fn auth_token_for_uri(uri: &Uri) -> Option<String> {
+        let host = uri.host()?.trim_matches(['[', ']']).to_ascii_lowercase();
+        Self::auth_token_registry().read().get(&host).cloned()
+    }
+
+    /// 取出并清除「令牌被拒」标记：返回 true 说明需要重新申请令牌
+    pub fn take_auth_rejected() -> bool {
+        DOH_AUTH_REJECTED.swap(false, Ordering::Relaxed)
     }
 
     fn shared_resolver_holder() -> &'static Arc<AsyncRwLock<HashMap<String, Arc<DnsResolver>>>> {
@@ -1748,6 +1820,69 @@ mod tests {
         port
     }
 
+    /// 只认 `Bearer good-token` 的假 DoH 服务器：其他令牌回 401，并记下收到的 Authorization 头
+    async fn spawn_auth_doh() -> (u16, Arc<parking_lot::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen_by_server = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let seen = seen_by_server.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let auth = request
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("authorization")
+                                .then(|| value.trim().to_string())
+                        })
+                        .unwrap_or_default();
+                    seen.lock().push(auth.clone());
+                    if auth != "Bearer good-token" {
+                        let _ = stream
+                            .write_all(
+                                b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                            )
+                            .await;
+                        return;
+                    }
+                    let encoded = request
+                        .split("dns=")
+                        .nth(1)
+                        .and_then(|rest| rest.split(' ').next())
+                        .unwrap_or_default();
+                    let query =
+                        Message::from_vec(&URL_SAFE_NO_PAD.decode(encoded).unwrap()).unwrap();
+                    let question = query.queries()[0].clone();
+                    let mut response = Message::new();
+                    response
+                        .set_id(query.id())
+                        .set_message_type(MessageType::Response)
+                        .add_query(question.clone());
+                    if question.query_type() == RecordType::A {
+                        response.add_answer(Record::from_rdata(
+                            question.name().clone(),
+                            120,
+                            RData::A(A(FAKE_ANSWER)),
+                        ));
+                    }
+                    let body = response.to_vec().unwrap();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/dns-message\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+        (port, seen)
+    }
+
     async fn closed_port() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         listener.local_addr().unwrap().port()
@@ -1799,6 +1934,55 @@ mod tests {
             DnsResolver::shared_cache_key(url, None, false, None),
             key_before
         );
+    }
+
+    #[tokio::test]
+    async fn sends_auth_token_and_recovers_after_token_change() {
+        let (port, seen) = spawn_auth_doh().await;
+        let url = format!("http://auth-test.invalid:{}/v1/lookup", port);
+        let upstream = DnsResolver::build_doh_upstream(
+            url.parse().unwrap(),
+            &[IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            Duration::from_secs(5),
+            None,
+        )
+        .unwrap();
+        let resolver = resolver_with(upstream.clone()).await;
+
+        // 令牌被拒：查询失败，打上标记并暂停，暂停期间不再发请求
+        DnsResolver::set_auth_token(&url, Some("bad-token"));
+        DnsResolver::take_auth_rejected();
+        assert!(resolver.lookup_ip("example.com").await.is_err());
+        assert!(DnsResolver::take_auth_rejected());
+        assert!(!DnsResolver::take_auth_rejected());
+        let requests_before = seen.lock().len();
+        assert!(resolver.lookup_ip("example.org").await.is_err());
+        assert_eq!(seen.lock().len(), requests_before);
+
+        // 换成有效令牌后立即恢复，不用等暂停结束
+        DnsResolver::set_auth_token(&url, Some("good-token"));
+        let addrs = resolver.lookup_ip("example.net").await.unwrap();
+        assert_eq!(addrs, vec![IpAddr::V4(FAKE_ANSWER)]);
+        assert!(seen.lock().iter().any(|auth| auth == "Bearer good-token"));
+        assert!(!DnsResolver::take_auth_rejected());
+
+        // 取消登记后不再带 Authorization 头
+        DnsResolver::set_auth_token(&url, None);
+        let _ = resolver.lookup_ip("example.edu").await;
+        assert_eq!(seen.lock().last().map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn invalid_auth_token_is_not_registered() {
+        let url = "https://token-test.example/v1/lookup";
+        let uri: Uri = url.parse().unwrap();
+        DnsResolver::set_auth_token(url, Some("ok-token"));
+        assert_eq!(
+            DnsResolver::auth_token_for_uri(&uri).as_deref(),
+            Some("ok-token")
+        );
+        DnsResolver::set_auth_token(url, Some("bad\r\ntoken"));
+        assert!(DnsResolver::auth_token_for_uri(&uri).is_none());
     }
 
     #[tokio::test]

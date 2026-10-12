@@ -59,12 +59,14 @@ impl DohProxyServer {
 
         let dns_resolver = if config.enable_doh {
             DnsResolver::set_bootstrap_ips(&config.doh_server, &config.doh_bootstrap_ips);
+            DnsResolver::set_auth_token(&config.doh_server, config.doh_auth_token.as_deref());
             if let Some(ech_server) = config
                 .doh_server_ech
                 .as_deref()
                 .filter(|ech_server| *ech_server != config.doh_server)
             {
                 DnsResolver::set_bootstrap_ips(ech_server, &config.doh_ech_bootstrap_ips);
+                DnsResolver::set_auth_token(ech_server, config.doh_ech_auth_token.as_deref());
             }
             Some(
                 DnsResolver::shared(
