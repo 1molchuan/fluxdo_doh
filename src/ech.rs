@@ -294,6 +294,7 @@ impl DohTlsConnector {
         }
 
         // 2. Prefer recently successful IP for this host (shared with query mode)
+        //    preferred_host_ip 已按地址族亲和过滤：亲和切换前记下的另一族粘性 IP 不会再用
         if let Some(cached_addr) = dns_resolver.preferred_host_ip(host) {
             let socket_addr = SocketAddr::new(cached_addr, port);
             debug!("Trying sticky IP for {}:{} via {}", host, port, socket_addr);
@@ -304,6 +305,7 @@ impl DohTlsConnector {
                 Ok(stream) => {
                     dns_resolver.record_host_success(host, socket_addr.ip());
                     dns_resolver.record_ip_rtt(socket_addr.ip(), start.elapsed());
+                    dns_resolver.record_family_affinity(socket_addr.ip(), false);
                     #[cfg(feature = "ech")]
                     {
                         let (_, conn) = stream.get_ref();
@@ -357,17 +359,63 @@ impl DohTlsConnector {
 
         let (v6_addrs, v4_addrs): (Vec<_>, Vec<_>) =
             addrs.into_iter().partition(|addr| addr.is_ipv6());
-        let prefer_ipv6 = dns_resolver.prefer_ipv6();
+        // 地址族亲和：首次建连后固定出站地址族，所有域名共用，保证 cf_clearance
+        // 绑定的出口 IP 在 linux.do 与其子域之间一致（见 DnsResolver::family_affinity）
+        let affinity = dns_resolver.family_affinity();
+        let prefer_ipv6 = affinity.unwrap_or(dns_resolver.prefer_ipv6());
         let (primary, secondary) = if prefer_ipv6 {
             (v6_addrs, v4_addrs)
         } else {
             (v4_addrs, v6_addrs)
         };
+        let family_name = |is_ipv6: bool| if is_ipv6 { "IPv6" } else { "IPv4" };
 
-        // Happy Eyeballs: 主协议族先行，50ms 后启动备用协议族
-        let result = if secondary.is_empty() {
+        // 某一族没有地址（如只有 AAAA 的域名）：直接连另一族，不做空赛跑——否则
+        // 空族立刻报 "No addresses" 并盖掉另一族的真实错误。这不算亲和族失败。
+        // 亲和已定：只连亲和族，整族失败才由另一族接管并切换亲和。
+        // 亲和未定（首次建连）：Happy Eyeballs 两族赛跑，赢家确定亲和。
+        // 结果里的 bool 表示「是在亲和族整族失败后由另一族接管」。
+        let result = if primary.is_empty() {
+            self.connect_to_addrs(&connector, server_name.clone(), host, port, secondary)
+                .await
+                .map(|ok| (ok, false))
+        } else if secondary.is_empty() {
             self.connect_to_addrs(&connector, server_name.clone(), host, port, primary)
                 .await
+                .map(|ok| (ok, false))
+        } else if affinity.is_some() {
+            match self
+                .connect_to_addrs(&connector, server_name.clone(), host, port, primary)
+                .await
+            {
+                Ok(ok) => Ok((ok, false)),
+                Err(primary_err) => {
+                    warn!(
+                        "All {} addresses failed for {}:{} ({}), trying {}",
+                        family_name(prefer_ipv6),
+                        host,
+                        port,
+                        primary_err,
+                        family_name(!prefer_ipv6)
+                    );
+                    match self
+                        .connect_to_addrs(&connector, server_name.clone(), host, port, secondary)
+                        .await
+                    {
+                        Ok(ok) => Ok((ok, true)),
+                        Err(secondary_err) => {
+                            warn!(
+                                "{} fallback also failed for {}:{}: {}",
+                                family_name(!prefer_ipv6),
+                                host,
+                                port,
+                                secondary_err
+                            );
+                            Err(primary_err)
+                        }
+                    }
+                }
+            }
         } else {
             let mut primary_fut = Box::pin(self.connect_to_addrs(
                 &connector,
@@ -393,7 +441,7 @@ impl DohTlsConnector {
                     res = &mut primary_fut, if !primary_done => {
                         primary_done = true;
                         match res {
-                            Ok(ok) => break Ok(ok),
+                            Ok(ok) => break Ok((ok, false)),
                             Err(e) => {
                                 primary_err = Some(e);
                                 if secondary_done {
@@ -407,7 +455,7 @@ impl DohTlsConnector {
                     res = &mut secondary_fut, if !secondary_done => {
                         secondary_done = true;
                         match res {
-                            Ok(ok) => break Ok(ok),
+                            Ok(ok) => break Ok((ok, false)),
                             Err(e) => {
                                 secondary_err = Some(e);
                                 if primary_done {
@@ -423,9 +471,10 @@ impl DohTlsConnector {
         };
 
         match result {
-            Ok((stream, socket_addr, rtt)) => {
+            Ok(((stream, socket_addr, rtt), switched_family)) => {
                 dns_resolver.record_host_success(host, socket_addr.ip());
                 dns_resolver.record_ip_rtt(socket_addr.ip(), rtt);
+                dns_resolver.record_family_affinity(socket_addr.ip(), switched_family);
                 #[cfg(feature = "ech")]
                 {
                     let (_, conn) = stream.get_ref();

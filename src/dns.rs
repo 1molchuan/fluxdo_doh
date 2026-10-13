@@ -539,6 +539,14 @@ pub struct DnsResolver {
     ip_inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     ip_rtt_cache: Arc<RwLock<HashMap<IpAddr, CachedIpRtt>>>,
     preferred_host_ip_cache: Arc<RwLock<HashMap<String, CachedPreferredHostIp>>>,
+    /// 出站地址族亲和：首次成功建连后固定下来（`true` = IPv6），之后所有域名都
+    /// 优先用同一个地址族，只有该族整体连不上才切换。
+    ///
+    /// CF 的 cf_clearance 绑定出口 IP，而双栈网络下 v4 与 v6 的出口是两个地址。
+    /// 以前 Happy Eyeballs 让两族赛跑、谁赢谁做该域名的粘性 IP，结果 `linux.do`
+    /// 可能走 v6、`credit.linux.do` 走 v4：WebView 在 linux.do 过盾铸出的 clearance
+    /// 到了 credit.linux.do 的请求上就被 CF 判成另一个 IP，稳定 403。
+    family_affinity: Arc<RwLock<Option<bool>>>,
     prefer_ipv6: bool,
     resolve_timeout: Duration,
     /// 查询计数器，用于定期清理缓存
@@ -1750,6 +1758,7 @@ impl DnsResolver {
             ip_inflight: Arc::new(Mutex::new(HashMap::new())),
             ip_rtt_cache: Arc::new(RwLock::new(HashMap::new())),
             preferred_host_ip_cache: Arc::new(RwLock::new(HashMap::new())),
+            family_affinity: Arc::new(RwLock::new(None)),
             prefer_ipv6,
             resolve_timeout,
             query_count: AtomicU64::new(0),
@@ -2238,6 +2247,43 @@ impl DnsResolver {
         self.ech_negative_cache.write().clear();
         self.ip_rtt_cache.write().clear();
         self.preferred_host_ip_cache.write().clear();
+        // 网络切换后地址族可能变化（如 Wi-Fi 双栈 → 蜂窝 v4-only），亲和一并重置
+        *self.family_affinity.write() = None;
+    }
+
+    /// 当前出站地址族亲和（`Some(true)` = IPv6 优先），未建连过时为 `None`
+    pub fn family_affinity(&self) -> Option<bool> {
+        *self.family_affinity.read()
+    }
+
+    /// 本次建连应优先的地址族：有亲和用亲和，否则按配置的 prefer_ipv6
+    pub fn effective_prefer_ipv6(&self) -> bool {
+        self.family_affinity().unwrap_or(self.prefer_ipv6)
+    }
+
+    /// 记录一次成功建连所用的地址族。`force` 为 false 时只在尚无亲和时写入；
+    /// 为 true 表示原亲和族已整体连不上、由另一族接管，强制切换。
+    pub fn record_family_affinity(&self, addr: IpAddr, force: bool) {
+        let is_ipv6 = addr.is_ipv6();
+        let mut affinity = self.family_affinity.write();
+        match *affinity {
+            Some(current) if current == is_ipv6 => {}
+            Some(_) if !force => {}
+            Some(_) => {
+                info!(
+                    "Address family affinity switched to {}",
+                    if is_ipv6 { "IPv6" } else { "IPv4" }
+                );
+                *affinity = Some(is_ipv6);
+            }
+            None => {
+                info!(
+                    "Address family affinity set to {}",
+                    if is_ipv6 { "IPv6" } else { "IPv4" }
+                );
+                *affinity = Some(is_ipv6);
+            }
+        }
     }
 
     pub fn cache_stats(&self) -> DnsCacheStats {
@@ -2379,11 +2425,24 @@ impl DnsResolver {
 
     pub fn preferred_host_ip(&self, domain: &str) -> Option<IpAddr> {
         let now = std::time::Instant::now();
-        self.preferred_host_ip_cache
+        let addr = self
+            .preferred_host_ip_cache
             .read()
             .get(domain)
             .filter(|entry| entry.expires_at > now)
-            .map(|entry| entry.addr)
+            .map(|entry| entry.addr)?;
+        // 粘性 IP 与当前地址族亲和不一致（亲和切换前记下的）：作废，按亲和重连
+        if let Some(prefer_ipv6) = self.family_affinity() {
+            if addr.is_ipv6() != prefer_ipv6 {
+                debug!(
+                    "Dropping sticky IP {} for {}: address family differs from affinity",
+                    addr, domain
+                );
+                self.clear_preferred_host_ip(domain);
+                return None;
+            }
+        }
+        Some(addr)
     }
 
     pub fn preferred_host_ip_for_addrs(&self, domain: &str, addrs: &[IpAddr]) -> Option<IpAddr> {
@@ -3821,5 +3880,44 @@ mod tests {
         println!("linux.do -> {:?}", addrs);
         assert!(!addrs.is_empty());
         assert!(upstream.health.lock().prefer_bootstrap_until.is_some());
+    }
+
+    /// 地址族亲和：首次成功建连定下地址族，之后另一族的粘性 IP 作废；
+    /// 非强制记录不改亲和，强制记录（亲和族整族失败）才切换；清缓存重置
+    #[tokio::test]
+    async fn family_affinity_pins_address_family_across_hosts() {
+        let resolver = DnsResolver::with_resolver_config(ResolverConfig::new(), false)
+            .await
+            .unwrap();
+        let v4: IpAddr = "198.51.100.10".parse().unwrap();
+        let v6: IpAddr = "2001:db8::10".parse().unwrap();
+
+        assert_eq!(resolver.family_affinity(), None);
+        assert!(!resolver.effective_prefer_ipv6());
+
+        // 首次建连走了 v6（Happy Eyeballs 赛跑赢家）：亲和定为 v6
+        resolver.record_host_success("linux.do", v6);
+        resolver.record_family_affinity(v6, false);
+        assert_eq!(resolver.family_affinity(), Some(true));
+        assert!(resolver.effective_prefer_ipv6());
+        assert_eq!(resolver.preferred_host_ip("linux.do"), Some(v6));
+
+        // 另一域名早先记下的 v4 粘性 IP 与亲和不一致：读取时作废
+        resolver.record_host_success("credit.linux.do", v4);
+        assert_eq!(resolver.preferred_host_ip("credit.linux.do"), None);
+        assert_eq!(resolver.preferred_host_ip("credit.linux.do"), None);
+
+        // 只有 A 记录的域名走 v4 成功，不是亲和族失败：亲和不变
+        resolver.record_family_affinity(v4, false);
+        assert_eq!(resolver.family_affinity(), Some(true));
+
+        // 亲和族整族失败、v4 接管：切换亲和，原 v6 粘性 IP 作废
+        resolver.record_family_affinity(v4, true);
+        assert_eq!(resolver.family_affinity(), Some(false));
+        assert_eq!(resolver.preferred_host_ip("linux.do"), None);
+
+        // 网络切换清缓存：亲和重置
+        resolver.clear_all_caches();
+        assert_eq!(resolver.family_affinity(), None);
     }
 }

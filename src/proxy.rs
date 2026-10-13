@@ -878,8 +878,21 @@ fn gateway_parse_host(host_header: &str) -> Option<(String, u16)> {
 /// challenge-platform 都在此域），属协议级常量而非可变业务白名单。对它做 MITM
 /// 会被 CF 挑战平台识破（TLS 指纹/证书不符）而拒绝人机验证，故这类连接必须以
 /// 隧道方式端到端直连真 CF。
+///
+/// 挑战页还会向它的子域名（如 `brunhild.challenges.cloudflare.com`，只有 AAAA
+/// 记录）发探测请求，这些子域同样属于挑战平台：被 MITM 后指纹不符，且 v4-only
+/// 网络下代理这边直接报 `No addresses` 把连接掐断，WebView 记到
+/// `ERR_CONNECTION_RESET`。所以整个 `*.challenges.cloudflare.com` 都走隧道，
+/// 让浏览器自己和真 CF 握手，成功与否交给挑战平台按正常浏览器的行为判定。
 fn is_cf_challenge_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("challenges.cloudflare.com")
+    const CF_CHALLENGE_DOMAIN: &str = "challenges.cloudflare.com";
+    let host = host.trim_end_matches('.');
+    if host.eq_ignore_ascii_case(CF_CHALLENGE_DOMAIN) {
+        return true;
+    }
+    host.len() > CF_CHALLENGE_DOMAIN.len() + 1
+        && host.as_bytes()[host.len() - CF_CHALLENGE_DOMAIN.len() - 1] == b'.'
+        && host[host.len() - CF_CHALLENGE_DOMAIN.len()..].eq_ignore_ascii_case(CF_CHALLENGE_DOMAIN)
 }
 
 /// Parse host:port from CONNECT target
@@ -956,5 +969,24 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_cf_challenge_host;
+
+    /// 挑战平台的主域和所有子域都必须走隧道，其余域名（含同名前缀的伪装域）不算
+    #[test]
+    fn cf_challenge_host_covers_subdomains_only() {
+        assert!(is_cf_challenge_host("challenges.cloudflare.com"));
+        assert!(is_cf_challenge_host("CHALLENGES.cloudflare.com."));
+        assert!(is_cf_challenge_host("brunhild.challenges.cloudflare.com"));
+        assert!(is_cf_challenge_host("a.b.challenges.cloudflare.com"));
+        assert!(!is_cf_challenge_host("cloudflare.com"));
+        assert!(!is_cf_challenge_host("notchallenges.cloudflare.com"));
+        assert!(!is_cf_challenge_host("challenges.cloudflare.com.evil.test"));
+        assert!(!is_cf_challenge_host("linux.do"));
+        assert!(!is_cf_challenge_host(""));
     }
 }
