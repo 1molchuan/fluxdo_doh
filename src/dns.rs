@@ -1,6 +1,7 @@
 //! DNS resolver with DOH and HTTPS record support for ECH config retrieval
 
 use crate::error::{DohProxyError, Result};
+use crate::select::{Selector, SELECT_LOOKUP_WAIT_SECS};
 use crate::UpstreamProxyConfig;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
@@ -104,6 +105,9 @@ static ACCEL_UPDATE: OnceLock<parking_lot::Mutex<AccelUpdate>> = OnceLock::new()
 /// `accel_request` 用的客户端缓存：scheme://authority -> 上游（复用连接，与 DoH 同一套 TLS 栈）
 static ACCEL_UPSTREAMS: OnceLock<RwLock<HashMap<String, DohUpstream>>> = OnceLock::new();
 
+/// 除 linux.do 外也由本地优选覆盖的主机名（atlas、cfhub6），由启动配置登记
+static EXTRA_COVERED_HOSTS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
+
 /// 测试用的额外公钥（kid -> 公钥），与 `NODE_LIST_PUBKEYS` 一起查
 #[cfg(test)]
 static TEST_NODE_LIST_PUBKEYS: OnceLock<RwLock<Vec<(String, [u8; 32])>>> = OnceLock::new();
@@ -117,7 +121,7 @@ fn now_unix() -> u64 {
 }
 
 /// 解 base64：先按标准（带填充），再兼容 url-safe / 无填充
-fn decode_base64_lenient(value: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_base64_lenient(value: &str) -> Option<Vec<u8>> {
     use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE};
     let value = value.trim();
     STANDARD
@@ -199,7 +203,7 @@ impl DohRequest<'_> {
 /// DoH 上游。主客户端用系统 DNS 解析 DoH 域名；域名型地址另建一个直连备用节点的客户端
 /// （只替换连接地址，SNI 和 Host 不变），主客户端连不上且当前有备用节点时改用它重试。
 #[derive(Clone)]
-struct DohUpstream {
+pub(crate) struct DohUpstream {
     uri: Uri,
     client: Client,
     bootstrap_client: Option<Client>,
@@ -262,7 +266,7 @@ impl DohUpstream {
 
     /// 发送 DNS 查询报文。默认 POST（报文放请求体，二进制 body 比 `?dns=` 更像普通 API 调用）；
     /// 服务器回 405/415 说明只支持 GET，改为 GET `?dns=` 重发一次，之后该服务器一直用 GET。
-    async fn query(&self, message: &[u8]) -> Result<reqwest::Response> {
+    pub(crate) async fn query(&self, message: &[u8]) -> Result<reqwest::Response> {
         let endpoint = self.endpoint()?;
         let request = DohRequest::Dns {
             message,
@@ -535,6 +539,8 @@ pub struct DnsResolver {
     ech_negative_cache: Arc<RwLock<HashMap<String, std::time::Instant>>>,
     /// Cache for IP addresses
     ip_cache: Arc<RwLock<HashMap<String, CachedIpAddrs>>>,
+    /// 服务端 retry_configs 给的新钥匙：domain -> (钥匙, 过期时间)，优先于表和缓存
+    ech_overrides: Arc<RwLock<HashMap<String, (EchConfigListBytes<'static>, std::time::Instant)>>>,
     ech_inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     ip_inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     ip_rtt_cache: Arc<RwLock<HashMap<IpAddr, CachedIpRtt>>>,
@@ -681,11 +687,19 @@ pub struct AccelUpdate {
     pub nodes: Option<String>,
     /// 新接受的节点列表信封，App 持久化后启动时回传
     pub nodes_envelope: Option<NodesEnvelope>,
+    /// 本地优选的最新状态 JSON（赢家、钥匙、atlas 缓存等）
+    pub select_state: Option<String>,
+    /// 上报被 cfhub 拒绝（401/403）：App 要清令牌、关开关
+    pub report_auth_rejected: bool,
 }
 
 impl AccelUpdate {
     fn is_empty(&self) -> bool {
-        self.route_table.is_none() && self.nodes.is_none() && self.nodes_envelope.is_none()
+        self.route_table.is_none()
+            && self.nodes.is_none()
+            && self.nodes_envelope.is_none()
+            && self.select_state.is_none()
+            && !self.report_auth_rejected
     }
 }
 
@@ -741,13 +755,13 @@ enum MissPolicy {
     DohFirst,
 }
 
-struct RouteEntry {
-    addrs: Vec<IpAddr>,
-    ech: Option<EchConfigListBytes<'static>>,
+pub(crate) struct RouteEntry {
+    pub(crate) addrs: Vec<IpAddr>,
+    pub(crate) ech: Option<EchConfigListBytes<'static>>,
 }
 
 /// 域名 -> IP 的路由表：命中的域名不再查 DoH
-struct RouteTable {
+pub(crate) struct RouteTable {
     exact: HashMap<String, RouteEntry>,
     wildcard: HashMap<String, RouteEntry>,
     /// 新鲜期截止；之后仍可用，但要后台刷新
@@ -810,7 +824,7 @@ impl RouteTable {
     }
 
     /// 精确匹配，再逐级去掉最左一段查通配
-    fn lookup(&self, host: &str) -> Option<&RouteEntry> {
+    pub(crate) fn lookup(&self, host: &str) -> Option<&RouteEntry> {
         let host = host.trim_end_matches('.').to_ascii_lowercase();
         if let Some(entry) = self.exact.get(&host) {
             return Some(entry);
@@ -1130,7 +1144,7 @@ impl DnsResolver {
         NODE_LIST.get_or_init(|| RwLock::new(None))
     }
 
-    fn accel_update() -> &'static parking_lot::Mutex<AccelUpdate> {
+    pub(crate) fn accel_update() -> &'static parking_lot::Mutex<AccelUpdate> {
         ACCEL_UPDATE.get_or_init(|| parking_lot::Mutex::new(AccelUpdate::default()))
     }
 
@@ -1309,7 +1323,7 @@ impl DnsResolver {
     }
 
     /// 当前 resolver 可用的路由表；没登记、拉不到或已超 max_stale 时为 None
-    async fn active_route_table(&self) -> Option<Arc<RouteTable>> {
+    pub(crate) async fn active_route_table(&self) -> Option<Arc<RouteTable>> {
         let host = self.doh_ip.as_ref()?.host().to_string();
         let store = Self::route_table_registry().read().get(&host).cloned()?;
         store.current().await
@@ -1366,6 +1380,32 @@ impl DnsResolver {
         }
         let method = reqwest::Method::from_bytes(method.trim().to_ascii_uppercase().as_bytes())
             .map_err(|_| DohProxyError::InvalidUrl(format!("Invalid HTTP method: {}", method)))?;
+        // 优选覆盖的主机（atlas / cfhub6 / *.linux.do）先经赢家 IP + ECH 发，失败再走 reqwest
+        if let Some(host) = uri.host().filter(|host| Self::is_covered_host(host)) {
+            if let Some(selector) = Selector::global() {
+                let header_refs: Vec<(&str, &str)> = headers
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str()))
+                    .collect();
+                let path = uri
+                    .path_and_query()
+                    .map(|pq| pq.as_str())
+                    .unwrap_or("/");
+                if let Some(reply) = selector
+                    .https_via_winner(host, method.as_str(), path, &header_refs, body.map(<[u8]>::to_vec))
+                    .await
+                {
+                    debug!(
+                        "Accel {} {}{} -> {} via selector winner",
+                        method, host, path, reply.status
+                    );
+                    return Ok(AccelResponse {
+                        status: reply.status,
+                        body: String::from_utf8_lossy(&reply.body).into_owned(),
+                    });
+                }
+            }
+        }
         let upstream = Self::accel_upstream_for(&uri)?;
         let start = Instant::now();
         let response = upstream
@@ -1754,6 +1794,7 @@ impl DnsResolver {
             ech_cache: Arc::new(RwLock::new(HashMap::new())),
             ech_negative_cache: Arc::new(RwLock::new(HashMap::new())),
             ip_cache: Arc::new(RwLock::new(HashMap::new())),
+            ech_overrides: Arc::new(RwLock::new(HashMap::new())),
             ech_inflight: Arc::new(Mutex::new(HashMap::new())),
             ip_inflight: Arc::new(Mutex::new(HashMap::new())),
             ip_rtt_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -1777,6 +1818,19 @@ impl DnsResolver {
 
         // 定期清理过期缓存
         self.maybe_cleanup_caches();
+
+        // 服务端 retry_configs 给的新钥匙优先
+        if let Some(key) = self.ech_override(domain) {
+            debug!("ECH override used for {}", domain);
+            return Ok(Some(key));
+        }
+        // 优选覆盖的域名用 Selector 当前钥匙（含自愈后的新钥匙）
+        if Self::is_covered_host(domain) {
+            if let Some(key) = Selector::global().and_then(|s| s.current_ech_key()) {
+                debug!("Selector ECH key used for {}", domain);
+                return Ok(Some(key));
+            }
+        }
 
         // 查表模式：表里有就用表里的 ECH，没有按无 ECH 处理，都不再查 DoH
         if let Some(table) = self.active_route_table().await {
@@ -1911,6 +1965,11 @@ impl DnsResolver {
 
     /// 从 HTTPS/SVCB 记录中提取 ECH 配置和 IP hint
     fn extract_hints_from_https(&self, https: &HTTPS) -> HttpsHints {
+        Self::parse_https_hints(https)
+    }
+
+    /// 同上，不依赖 resolver 实例（优选模块经公共 DoH 查 HTTPS 记录时用）
+    pub(crate) fn parse_https_hints(https: &HTTPS) -> HttpsHints {
         use hickory_resolver::proto::rr::rdata::svcb::{SvcParamKey, SvcParamValue};
 
         let mut hints = HttpsHints::default();
@@ -1949,7 +2008,7 @@ impl DnsResolver {
         self.extract_hints_from_https(https).ech_config
     }
 
-    fn ensure_ech_config_list_len_prefix(bytes: Vec<u8>) -> Vec<u8> {
+    pub(crate) fn ensure_ech_config_list_len_prefix(bytes: Vec<u8>) -> Vec<u8> {
         if bytes.len() >= 2 {
             let declared = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
             if declared == bytes.len().saturating_sub(2) {
@@ -1978,12 +2037,35 @@ impl DnsResolver {
         if let Ok(ip) = domain.trim_matches(['[', ']']).parse::<IpAddr>() {
             return Ok(vec![ip]);
         }
+        let lookup_start = Instant::now();
 
         // 定期清理过期缓存
         self.maybe_cleanup_caches();
 
         // 查表模式：命中直接用表里的地址，不发 DoH；表外域名按表的 miss 策略
         let table = self.active_route_table().await;
+
+        // 一等：优选覆盖的域名先用赢家 IP，表地址跟在后面兜底；
+        // 等待竞速与等待拉表共用从 lookup 开始算的同一个 deadline
+        if Self::is_covered_host(domain) {
+            if let Some(selector) = Selector::global() {
+                let deadline = lookup_start + Duration::from_secs(SELECT_LOOKUP_WAIT_SECS);
+                if let Some(winner) = selector.winner_for_lookup(deadline).await {
+                    let mut addrs = vec![winner.ip];
+                    if let Some(entry) = table.as_ref().and_then(|table| table.lookup(domain)) {
+                        let mut extra = entry.addrs.clone();
+                        self.sort_addrs_by_preference(&mut extra);
+                        for ip in extra {
+                            if !addrs.contains(&ip) {
+                                addrs.push(ip);
+                            }
+                        }
+                    }
+                    debug!("Selector winner first for {}", domain);
+                    return Ok(addrs);
+                }
+            }
+        }
         if let Some(entry) = table.as_ref().and_then(|table| table.lookup(domain)) {
             if !entry.addrs.is_empty() {
                 let mut addrs = entry.addrs.clone();
@@ -2234,8 +2316,52 @@ impl DnsResolver {
         self.prefer_ipv6
     }
 
+    /// 登记额外由本地优选覆盖的主机名（atlas、cfhub6）
+    pub fn set_extra_covered_hosts(hosts: &[String]) {
+        let normalized: Vec<String> = hosts
+            .iter()
+            .map(|h| h.trim().trim_end_matches('.').to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect();
+        *EXTRA_COVERED_HOSTS
+            .get_or_init(|| RwLock::new(Vec::new()))
+            .write() = normalized;
+    }
+
+    /// 是否由本地优选覆盖：linux.do / *.linux.do，以及登记的额外主机名。
+    /// 不按「表内地址在 CF 网段」扩展：别的 zone 可能用 CF 专用边缘，赢家 IP 对它们是 403，
+    /// 会把无关失败算到赢家头上
+    pub(crate) fn is_covered_host(host: &str) -> bool {
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if host == "linux.do" || host.ends_with(".linux.do") {
+            return true;
+        }
+        EXTRA_COVERED_HOSTS
+            .get()
+            .is_some_and(|hosts| hosts.read().contains(&host))
+    }
+
+    /// 写入服务端 retry_configs 给的新钥匙，覆盖表和缓存里的旧钥匙
+    pub fn override_ech_config(&self, domain: &str, key: EchConfigListBytes<'static>, ttl: Duration) {
+        let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+        self.ech_overrides
+            .write()
+            .insert(domain, (key, std::time::Instant::now() + ttl));
+    }
+
+    fn ech_override(&self, domain: &str) -> Option<EchConfigListBytes<'static>> {
+        let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+        let now = std::time::Instant::now();
+        self.ech_overrides
+            .read()
+            .get(&domain)
+            .filter(|(_, expires_at)| *expires_at > now)
+            .map(|(key, _)| key.clone())
+    }
+
     pub fn clear_host_cache(&self, domain: &str) {
         self.ip_cache.write().remove(domain);
+        self.ech_overrides.write().remove(domain);
         self.ech_cache.write().remove(domain);
         self.ech_negative_cache.write().remove(domain);
         self.preferred_host_ip_cache.write().remove(domain);
@@ -2243,6 +2369,7 @@ impl DnsResolver {
 
     pub fn clear_all_caches(&self) {
         self.ip_cache.write().clear();
+        self.ech_overrides.write().clear();
         self.ech_cache.write().clear();
         self.ech_negative_cache.write().clear();
         self.ip_rtt_cache.write().clear();
@@ -2618,6 +2745,7 @@ impl DnsResolver {
         }
         let now = std::time::Instant::now();
         self.ip_cache.write().retain(|_, v| v.expires_at > now);
+        self.ech_overrides.write().retain(|_, (_, exp)| *exp > now);
         self.ech_cache.write().retain(|_, v| v.expires_at > now);
         self.ech_negative_cache.write().retain(|_, exp| *exp > now);
         self.ip_rtt_cache.write().retain(|_, v| v.expires_at > now);
@@ -2653,7 +2781,7 @@ impl DnsResolver {
         Duration::from_secs(clamped)
     }
 
-    fn build_doh_upstream(
+    pub(crate) fn build_doh_upstream(
         uri: Uri,
         bootstrap_ips: &[IpAddr],
         timeout: Duration,
@@ -2882,7 +3010,7 @@ impl DnsResolver {
 
     /// 编码一条 DNS 查询报文：RD=1、EDNS(0) 1232 字节，并按 RFC 8467 用 Padding 选项
     /// 把整个报文填到 `DNS_QUERY_PAD_BLOCK` 的整倍数，去掉报文长度特征
-    fn encode_query(
+    pub(crate) fn encode_query(
         domain: &str,
         record_type: hickory_resolver::proto::rr::RecordType,
     ) -> Result<Vec<u8>> {

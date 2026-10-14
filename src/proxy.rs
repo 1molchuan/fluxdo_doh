@@ -105,6 +105,7 @@ impl DohProxyServer {
             None
         };
 
+        let dns_resolver_for_selector = dns_resolver.clone();
         let doh_tls_connector = Arc::new(DohTlsConnector::new(
             dns_resolver,
             config.enable_doh,
@@ -112,6 +113,22 @@ impl DohProxyServer {
             config.upstream_proxy.clone(),
             config.server_ip.clone(),
         ));
+
+        // 本地动态优选：一等链路。先卸载上一轮的实例（重启网关时）
+        crate::dns::DnsResolver::set_extra_covered_hosts(&config.extra_covered_hosts);
+        crate::select::Selector::uninstall();
+        match crate::select::Selector::new(
+            &config,
+            doh_tls_connector.root_store().clone(),
+            doh_tls_connector.crypto_provider(),
+            dns_resolver_for_selector,
+        ) {
+            Some(selector) => {
+                crate::select::Selector::install(selector.clone());
+                selector.start();
+            }
+            None => info!("select: disabled (mode {})", config.select_mode),
+        }
 
         // gateway 模式下仍需要 cert_manager：WebView 通过 CONNECT 走 MITM
         let cert_manager = if config.enable_doh {
@@ -221,6 +238,7 @@ impl DohProxyServer {
 
     /// Stop the proxy server
     pub fn stop(&self) {
+        crate::select::Selector::uninstall();
         let _ = self.shutdown_tx.send(());
     }
 }

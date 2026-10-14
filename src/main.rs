@@ -112,6 +112,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|i| args.get(i + 1))
         .cloned();
 
+    // Parse --select-mode <off|local_atlas|atlas_only>：本地优选模式。桌面二进制默认关，
+    // App 的测试环境会用进程模式拉起它，不该在测试里真跑竞速
+    let select_mode = args
+        .iter()
+        .position(|a| a == "--select-mode")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| "off".to_string());
+
     let upstream_proxy = match (upstream_host, upstream_port) {
         (Some(host), Some(port)) if !host.trim().is_empty() && port > 0 => {
             Some(UpstreamProxyConfig {
@@ -141,6 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         server_ip,
         h2_mitm,
         doh_routes_url,
+        select_mode,
         ..Default::default()
     };
 

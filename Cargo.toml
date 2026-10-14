@@ -17,6 +17,11 @@ path = "src/main.rs"
 name = "gen_ca"
 path = "src/bin/gen_ca.rs"
 
+[[example]]
+name = "race"
+path = "examples/race.rs"
+required-features = ["ech"]
+
 [features]
 default = []
 # Enable ECH support (requires cmake, NASM on Windows)

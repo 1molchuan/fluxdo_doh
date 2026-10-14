@@ -9,11 +9,14 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 pub mod cert;
+pub mod cfnet;
 pub mod dns;
 pub mod ech;
 pub mod error;
 pub mod ffi;
+pub mod probe;
 pub mod proxy;
+pub mod select;
 pub mod tls_crypto;
 pub mod upstream;
 
@@ -114,6 +117,26 @@ impl UpstreamProxyConfig {
     }
 }
 
+
+/// 不能进日志的字符串（令牌等）：Debug 固定打 "***"
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Secret(pub String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("***")
+    }
+}
+
+/// 候选收集用的公共 DoH 服务器
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PublicDohServerConfig {
+    pub url: String,
+    #[serde(default)]
+    pub bootstrap_ips: Vec<String>,
+}
+
 /// Proxy configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
@@ -181,6 +204,36 @@ pub struct ProxyConfig {
     /// App 持久化的签名节点列表信封（JSON `{kid,payload,sig}`），启动时重新验签后生效
     #[serde(default)]
     pub doh_node_list_json: Option<String>,
+    /// 本地优选模式："off" | "local_atlas"（默认）| "atlas_only"
+    #[serde(default = "default_select_mode")]
+    pub select_mode: String,
+    /// App 持久化的优选状态 JSON，启动时回灌
+    #[serde(default)]
+    pub select_state_json: Option<String>,
+    /// 是否把握手测量结果分享给 cfhub（默认关）
+    #[serde(default)]
+    pub share_measurements: bool,
+    /// atlas 池地址（`GET /v1/routes`）；None 表示不拉 atlas
+    #[serde(default)]
+    pub atlas_routes_url: Option<String>,
+    /// 候选收集用的国内公共 DoH；为空时用内置的 doh.pub / AliDNS
+    #[serde(default)]
+    pub public_doh: Vec<PublicDohServerConfig>,
+    /// 上报地址（cfhub6 的 `/api/v1/probe/report`）
+    #[serde(default)]
+    pub report_url: Option<String>,
+    /// 上报用的 cfhub 令牌；Debug 输出为 "***"
+    #[serde(default)]
+    pub report_bearer: Option<Secret>,
+    /// 除 linux.do 外也走赢家 IP 的主机名（atlas、cfhub6）
+    #[serde(default)]
+    pub extra_covered_hosts: Vec<String>,
+    /// App 版本，上报里的 version 为 "cfluxdo/<app_version>"
+    #[serde(default)]
+    pub app_version: Option<String>,
+    /// 启动时的网络签名（Dart 的连接类型集合）
+    #[serde(default)]
+    pub network_sig: Option<String>,
 }
 
 impl Default for ProxyConfig {
@@ -207,6 +260,16 @@ impl Default for ProxyConfig {
             doh_routes_url: None,
             doh_route_table_json: None,
             doh_node_list_json: None,
+            select_mode: default_select_mode(),
+            select_state_json: None,
+            share_measurements: false,
+            atlas_routes_url: None,
+            public_doh: Vec::new(),
+            report_url: None,
+            report_bearer: None,
+            extra_covered_hosts: Vec::new(),
+            app_version: None,
+            network_sig: None,
         }
     }
 }
@@ -217,6 +280,10 @@ fn default_upstream_protocol() -> String {
 
 fn default_enable_doh() -> bool {
     true
+}
+
+fn default_select_mode() -> String {
+    "local_atlas".to_string()
 }
 
 fn default_true() -> bool {

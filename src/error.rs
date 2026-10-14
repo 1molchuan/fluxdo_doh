@@ -33,6 +33,13 @@ pub enum DohProxyError {
 
     #[error("Certificate error: {0}")]
     Certificate(String),
+
+    /// ECH 被拒且服务端给了 retry_configs：换钥匙后对同一地址重试
+    #[error("ECH rejected by {addr}, retry_configs available ({} bytes)", configs.len())]
+    EchRetry {
+        addr: std::net::SocketAddr,
+        configs: Vec<u8>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, DohProxyError>;

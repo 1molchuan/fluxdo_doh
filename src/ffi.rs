@@ -510,7 +510,65 @@ pub extern "C" fn doh_proxy_take_accel_update() -> *mut c_char {
         "route_table": update.route_table,
         "nodes": update.nodes,
         "nodes_envelope": update.nodes_envelope,
+        "select_state": update.select_state,
+        "report_auth_rejected": update.report_auth_rejected,
     }))
+}
+
+/// 网络变化通知（Dart 传连接类型集合的签名）。返回 1 受理、0 没有优选实例、-1 参数错
+#[no_mangle]
+pub extern "C" fn doh_proxy_network_changed(sig: *const c_char) -> c_int {
+    let Some(sig) = parse_optional_string(sig) else {
+        return -1;
+    };
+    match crate::select::Selector::global() {
+        Some(selector) => {
+            let _guard = get_runtime().enter();
+            selector.on_network_changed(&sig);
+            1
+        }
+        None => 0,
+    }
+}
+
+/// 本地优选状态：`{"ok":true,"mode","phase","winner":{ip,latency_ms,verified_at,source,ech_source}|null,
+/// "last_race_at","last_error","fail_streak","share"}`；没有实例时 `{"ok":false,"error":"no selector"}`。
+/// 返回的字符串需要调用 doh_proxy_free_string 释放
+#[no_mangle]
+pub extern "C" fn doh_proxy_select_status() -> *mut c_char {
+    match crate::select::Selector::global() {
+        Some(selector) => json_to_c_string(selector.status_json()),
+        None => error_json("no selector"),
+    }
+}
+
+/// 手动重新优选。返回 1 已发车、0 冷却中 / 没有实例
+#[no_mangle]
+pub extern "C" fn doh_proxy_select_rerace() -> c_int {
+    match crate::select::Selector::global() {
+        Some(selector) => {
+            let _guard = get_runtime().enter();
+            if selector.request_rerace(true) {
+                1
+            } else {
+                0
+            }
+        }
+        None => 0,
+    }
+}
+
+/// 开关「帮助优选」（把握手测量结果分享给 cfhub）。`bearer` 为 cfhub 令牌，关闭时可为 null。
+/// 返回 1 已应用、0 没有实例。令牌不进日志
+#[no_mangle]
+pub extern "C" fn doh_proxy_set_share_measurements(enabled: c_int, bearer: *const c_char) -> c_int {
+    match crate::select::Selector::global() {
+        Some(selector) => {
+            selector.set_share(enabled != 0, parse_optional_string(bearer).map(crate::Secret));
+            1
+        }
+        None => 0,
+    }
 }
 
 /// 经 DoH 同一套 HTTP 客户端发加速接口请求（令牌申请/续期等），让 Dart 侧不再有第二套 TLS 栈。
@@ -716,6 +774,9 @@ pub extern "C" fn doh_proxy_init_logging() {
         use tracing_subscriber::EnvFilter;
         let filter = EnvFilter::from_default_env()
             .add_directive("doh_proxy=info".parse().unwrap())
+            // 本地优选的逐 IP / 逐 DoH 结果开 debug：真机排障全靠这些行
+            .add_directive("doh_proxy::select=debug".parse().unwrap())
+            .add_directive("doh_proxy::probe=debug".parse().unwrap())
             .add_directive("rustls=warn".parse().unwrap())
             .add_directive("hickory_resolver=info".parse().unwrap())
             .add_directive("hickory_proto=warn".parse().unwrap())

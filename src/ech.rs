@@ -4,6 +4,7 @@
 //! and enables true ECH encryption of the SNI field.
 
 use crate::dns::{DnsCacheRecord, DnsCacheStats, DnsResolver};
+use crate::select::Selector;
 use crate::error::{DohProxyError, Result};
 use crate::upstream::connect_tunnel;
 use crate::{BoxStream, UpstreamProxyConfig};
@@ -19,6 +20,10 @@ use tracing::{debug, info, warn};
 
 #[cfg(feature = "ech")]
 use rustls::client::EchConfig;
+
+/// 服务端 retry_configs 给的新钥匙在 resolver 里覆盖多久
+#[cfg(feature = "ech")]
+const ECH_OVERRIDE_TTL_SECS: u64 = 21600;
 
 /// ECH-enabled TLS connector
 pub struct DohTlsConnector {
@@ -186,6 +191,67 @@ impl DohTlsConnector {
         self.connect_inner(host, port, true).await
     }
 
+    pub fn root_store(&self) -> &RootCertStore {
+        &self.root_store
+    }
+
+    pub fn crypto_provider(&self) -> Arc<rustls::crypto::CryptoProvider> {
+        self.crypto_provider.clone()
+    }
+
+    /// 优选覆盖的域名才拿全局 Selector
+    fn selector_for_host(host: &str) -> Option<Arc<Selector>> {
+        if !DnsResolver::is_covered_host(host) {
+            return None;
+        }
+        Selector::global()
+    }
+
+    /// 从建连错误里取 ECH retry_configs：(地址, ECHConfigList 字节)
+    #[cfg(feature = "ech")]
+    fn ech_retry_from_err(error: &DohProxyError) -> Option<(Option<SocketAddr>, Vec<u8>)> {
+        match error {
+            DohProxyError::EchRetry { addr, configs } => Some((Some(*addr), configs.clone())),
+            DohProxyError::Io(e) => crate::probe::ech_retry_configs(e)
+                .filter(|configs| !configs.is_empty())
+                .map(|configs| {
+                    (
+                        None,
+                        crate::probe::encode_ech_config_list(&configs)
+                            .as_ref()
+                            .to_vec(),
+                    )
+                }),
+            _ => None,
+        }
+    }
+
+    /// 采纳服务端给的新钥匙：写进 resolver 覆盖（6 h）并交给 Selector，返回钥匙
+    #[cfg(feature = "ech")]
+    fn adopt_retry_key(
+        &self,
+        host: &str,
+        configs: Vec<u8>,
+    ) -> rustls::pki_types::EchConfigListBytes<'static> {
+        let key = rustls::pki_types::EchConfigListBytes::from(configs);
+        if let Some(resolver) = &self.dns_resolver {
+            resolver.override_ech_config(
+                host,
+                key.clone(),
+                Duration::from_secs(ECH_OVERRIDE_TTL_SECS),
+            );
+        }
+        if let Some(selector) = Selector::global() {
+            selector.adopt_ech_key(&key, crate::select::EchKeySource::RetryConfigs);
+        }
+        info!(
+            "ECH retry_configs adopted for {}: {} bytes",
+            host,
+            key.as_ref().len()
+        );
+        key
+    }
+
     fn apply_alpn(config: Arc<ClientConfig>, h2: bool) -> Arc<ClientConfig> {
         if !h2 {
             return config;
@@ -295,14 +361,37 @@ impl DohTlsConnector {
 
         // 2. Prefer recently successful IP for this host (shared with query mode)
         //    preferred_host_ip 已按地址族亲和过滤：亲和切换前记下的另一族粘性 IP 不会再用
-        if let Some(cached_addr) = dns_resolver.preferred_host_ip(host) {
+        let selector = Self::selector_for_host(host);
+        let winner_ip = selector.as_ref().and_then(|s| s.winner_ip());
+        // 优选有赢家时粘性 IP 必须就是赢家，否则走地址列表（lookup 已把赢家放在首位）
+        let sticky = dns_resolver
+            .preferred_host_ip(host)
+            .filter(|ip| winner_ip.is_none_or(|winner| winner == *ip));
+        #[allow(unused_mut)]
+        let mut connector = connector;
+        if let Some(cached_addr) = sticky {
             let socket_addr = SocketAddr::new(cached_addr, port);
             debug!("Trying sticky IP for {}:{} via {}", host, port, socket_addr);
-            match self
+            #[allow(unused_mut)]
+            let mut attempt = self
                 .try_connect(&connector, socket_addr, host, server_name.clone())
-                .await
-            {
+                .await;
+            // ECH 被拒且带 retry_configs：换钥匙后同地址重试一次
+            #[cfg(feature = "ech")]
+            if let Some((_, configs)) = attempt.as_ref().err().and_then(Self::ech_retry_from_err) {
+                let key = self.adopt_retry_key(host, configs);
+                if let Ok(tls_config) = self.get_or_build_tls_config(Some(&key)).await {
+                    connector = TlsConnector::from(Self::apply_alpn(tls_config, h2_alpn));
+                    attempt = self
+                        .try_connect(&connector, socket_addr, host, server_name.clone())
+                        .await;
+                }
+            }
+            match attempt {
                 Ok(stream) => {
+                    if let Some(selector) = &selector {
+                        selector.record_connect_result(socket_addr.ip(), true);
+                    }
                     dns_resolver.record_host_success(host, socket_addr.ip());
                     dns_resolver.record_ip_rtt(socket_addr.ip(), start.elapsed());
                     dns_resolver.record_family_affinity(socket_addr.ip(), false);
@@ -332,6 +421,9 @@ impl DohTlsConnector {
                         "Sticky IP failed for {}:{} via {}: {}",
                         host, port, socket_addr, e
                     );
+                    if let Some(selector) = &selector {
+                        selector.record_connect_result(socket_addr.ip(), false);
+                    }
                     dns_resolver.clear_preferred_host_ip(host);
                 }
             }
@@ -470,8 +562,26 @@ impl DohTlsConnector {
             }
         };
 
+        // 赛跑里有节点拒绝 ECH 并给了 retry_configs：采纳新钥匙后对该地址单次重试
+        #[cfg(feature = "ech")]
+        let result = match result {
+            Err(DohProxyError::EchRetry { addr, configs }) => {
+                let key = self.adopt_retry_key(host, configs);
+                let tls_config = self.get_or_build_tls_config(Some(&key)).await?;
+                let retry_connector = TlsConnector::from(Self::apply_alpn(tls_config, h2_alpn));
+                let retry_start = std::time::Instant::now();
+                self.try_connect(&retry_connector, addr, host, server_name.clone())
+                    .await
+                    .map(|stream| ((stream, addr, retry_start.elapsed()), false))
+            }
+            other => other,
+        };
+
         match result {
             Ok(((stream, socket_addr, rtt), switched_family)) => {
+                if let Some(selector) = &selector {
+                    selector.record_connect_result(socket_addr.ip(), true);
+                }
                 dns_resolver.record_host_success(host, socket_addr.ip());
                 dns_resolver.record_ip_rtt(socket_addr.ip(), rtt);
                 dns_resolver.record_family_affinity(socket_addr.ip(), switched_family);
@@ -496,7 +606,13 @@ impl DohTlsConnector {
                 );
                 Ok(stream)
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                // 赢家在列表首位先试过，整体失败就记它一次
+                if let (Some(selector), Some(winner_ip)) = (&selector, winner_ip) {
+                    selector.record_connect_result(winner_ip, false);
+                }
+                Err(e)
+            }
         }
     }
 
@@ -712,8 +828,28 @@ impl DohTlsConnector {
                         let _ = tx.send(Ok((stream, socket_addr, rtt))).await;
                     }
                     Ok(Err(e)) => {
-                        warn!("TLS handshake failed to {}: {}", socket_addr, e);
-                        let _ = tx.send(Err(DohProxyError::Io(e))).await;
+                        match crate::probe::ech_retry_configs(&e).filter(|c| !c.is_empty()) {
+                            Some(configs) => {
+                                warn!(
+                                    "ECH rejected by {} with retry_configs (public_name {:?})",
+                                    socket_addr,
+                                    crate::probe::ech_public_names(&configs)
+                                );
+                                let configs = crate::probe::encode_ech_config_list(&configs)
+                                    .as_ref()
+                                    .to_vec();
+                                let _ = tx
+                                    .send(Err(DohProxyError::EchRetry {
+                                        addr: socket_addr,
+                                        configs,
+                                    }))
+                                    .await;
+                            }
+                            None => {
+                                warn!("TLS handshake failed to {}: {}", socket_addr, e);
+                                let _ = tx.send(Err(DohProxyError::Io(e))).await;
+                            }
+                        }
                     }
                     Err(_) => {
                         warn!("TLS handshake timed out to {}", socket_addr);
@@ -741,7 +877,10 @@ impl DohTlsConnector {
                     return Ok((stream, socket_addr, rtt));
                 }
                 Err(e) => {
-                    last_error = Some(e);
+                    // ECH 被拒（带 retry_configs）优先保留，调用方据此换钥匙重试
+                    if !matches!(last_error, Some(DohProxyError::EchRetry { .. })) {
+                        last_error = Some(e);
+                    }
                     if received >= total {
                         break;
                     }
