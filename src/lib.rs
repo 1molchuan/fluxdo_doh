@@ -12,6 +12,7 @@ pub mod cert;
 pub mod cfnet;
 pub mod dns;
 pub mod ech;
+pub mod edge_pin;
 pub mod error;
 pub mod ffi;
 pub mod probe;

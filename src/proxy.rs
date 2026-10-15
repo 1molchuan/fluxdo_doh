@@ -115,7 +115,7 @@ impl DohProxyServer {
         ));
 
         // 本地动态优选：一等链路。先卸载上一轮的实例（重启网关时）
-        crate::dns::DnsResolver::set_extra_covered_hosts(&config.extra_covered_hosts);
+        crate::edge_pin::EdgePin::set_extra_covered_hosts(&config.extra_covered_hosts);
         crate::select::Selector::uninstall();
         match crate::select::Selector::new(
             &config,

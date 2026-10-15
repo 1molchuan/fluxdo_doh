@@ -416,7 +416,7 @@ pub extern "C" fn doh_proxy_record_host_success(
             None,
         )
         .await?;
-        resolver.record_host_success(&host_str, ip_addr);
+        resolver.edge_pin().remember_sticky(&host_str, ip_addr);
         Ok::<(), crate::error::DohProxyError>(())
     });
 
@@ -465,7 +465,7 @@ pub extern "C" fn doh_proxy_clear_preferred_host_ip(
             None,
         )
         .await?;
-        resolver.clear_preferred_host_ip(&host_str);
+        resolver.edge_pin().forget_host(&host_str);
         Ok::<(), crate::error::DohProxyError>(())
     });
 

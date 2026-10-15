@@ -8,6 +8,7 @@
 
 use crate::cfnet;
 use crate::dns::{DnsResolver, DohUpstream};
+use crate::edge_pin::{EdgePin, Pin, PinListener, WINNER_FAIL_THRESHOLD, WINNER_FAIL_WINDOW_SECS};
 use crate::error::{DohProxyError, Result};
 use crate::probe::{self, HttpsReply, ProbeFailure, ProbeOutcome, ProbeTarget, ProbeTimeouts};
 use crate::{ProxyConfig, Secret};
@@ -23,9 +24,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Semaphore;
 use tokio::task::{AbortHandle, JoinSet};
 use tracing::{debug, info, warn};
 
@@ -61,9 +62,6 @@ const ATLAS_MIN_FETCH_INTERVAL_SECS: u64 = 120;
 const ATLAS_BACKOFF_429_SECS: u64 = 60;
 const ATLAS_BACKOFF_MAX_SECS: u64 = 600;
 const ATLAS_MAX_BODY: usize = 256 * 1024;
-/// 赢家连续失败阈值与窗口
-const SELECT_FAIL_THRESHOLD: usize = 3;
-const SELECT_FAIL_WINDOW_SECS: u64 = 60;
 /// 自动发车：最小间隔、每小时上限；手动冷却；Failed 后重试间隔
 const SELECT_MIN_RACE_INTERVAL_SECS: u64 = 60;
 const SELECT_MAX_AUTO_RACES_PER_HOUR: usize = 4;
@@ -319,7 +317,6 @@ struct Inner {
     atlas_backoff_until: Option<Instant>,
     last_manual_race: Option<Instant>,
     failed_at: Option<Instant>,
-    fail_times: Vec<Instant>,
     netchange_gen: u64,
     /// 本次竞速结束后待上报的结果
     report_pending: bool,
@@ -327,13 +324,13 @@ struct Inner {
 
 pub struct Selector {
     mode: SelectMode,
-    /// 赢家优先选这个地址族（与 ech.rs 的地址族亲和一致）
-    prefer_ipv6: bool,
     inner: Mutex<Inner>,
+    /// 出站钉选：赢家只经它交给建连路径，赢家的地址族按它的亲和挑
+    edge: Arc<EdgePin>,
+    /// shutdown 后为 false：不再改钉住状态，也不响应 EdgePin 回调
+    alive: AtomicBool,
     /// single-flight：竞速或校验进行中
     racing: AtomicBool,
-    /// 竞速 / 校验结束（无论成败）时唤醒等待的 lookup
-    raced: Notify,
     tls_cache: Mutex<Vec<(Vec<u8>, Arc<ClientConfig>)>>,
     roots: RootCertStore,
     provider: Arc<CryptoProvider>,
@@ -398,13 +395,12 @@ fn split_url(url: &str) -> Option<(String, String)> {
     Some((host, path))
 }
 
-/// 竞速结束时复位 single-flight 并唤醒等待者，任务被取消也会执行
+/// 竞速结束时复位 single-flight，任务被取消也会执行
 struct RaceGuard(Arc<Selector>);
 
 impl Drop for RaceGuard {
     fn drop(&mut self) {
         self.0.racing.store(false, Ordering::Release);
-        self.0.raced.notify_waiters();
     }
 }
 
@@ -425,7 +421,8 @@ impl Selector {
         holder().read().clone()
     }
 
-    /// 按启动配置构造；模式 off、DoH 关闭、配了上游代理或非网关模式时返回 None
+    /// 按启动配置构造；模式 off、DoH 关闭、配了上游代理或非网关模式时返回 None。
+    /// 赢家交给 `resolver` 的 EdgePin（也就是网关建连用的那份）
     pub fn new(
         config: &ProxyConfig,
         roots: RootCertStore,
@@ -443,6 +440,7 @@ impl Selector {
         {
             return None;
         }
+        let edge = resolver.as_ref()?.edge_pin().clone();
         let public_doh = Self::build_public_doh_list(&config.public_doh);
         let atlas = config
             .atlas_routes_url
@@ -468,7 +466,6 @@ impl Selector {
             .unwrap_or_default();
         let selector = Self::build(
             mode,
-            config.prefer_ipv6,
             state,
             config.network_sig.clone(),
             roots,
@@ -477,6 +474,7 @@ impl Selector {
             atlas,
             report,
             resolver,
+            edge,
             Prober::Real,
         );
         if config.share_measurements {
@@ -503,7 +501,6 @@ impl Selector {
             .unwrap_or_default();
         Self::build(
             mode,
-            false,
             state,
             network_sig.map(str::to_string),
             roots,
@@ -512,6 +509,7 @@ impl Selector {
             atlas,
             None,
             None,
+            Arc::new(EdgePin::new(false)),
             Prober::Real,
         )
     }
@@ -519,7 +517,6 @@ impl Selector {
     #[allow(clippy::too_many_arguments)]
     fn build(
         mode: SelectMode,
-        prefer_ipv6: bool,
         state: SelectState,
         current_sig: Option<String>,
         roots: RootCertStore,
@@ -528,11 +525,11 @@ impl Selector {
         atlas: Option<AtlasEndpoint>,
         report: Option<ReportEndpoint>,
         resolver: Option<Arc<DnsResolver>>,
+        edge: Arc<EdgePin>,
         prober: Prober,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        let selector = Arc::new(Self {
             mode,
-            prefer_ipv6,
             inner: Mutex::new(Inner {
                 state,
                 phase: Phase::Idle,
@@ -541,12 +538,12 @@ impl Selector {
                 atlas_backoff_until: None,
                 last_manual_race: None,
                 failed_at: None,
-                fail_times: Vec::new(),
                 netchange_gen: 0,
                 report_pending: false,
             }),
+            edge,
+            alive: AtomicBool::new(true),
             racing: AtomicBool::new(false),
-            raced: Notify::new(),
             tls_cache: Mutex::new(Vec::new()),
             roots,
             provider,
@@ -559,7 +556,11 @@ impl Selector {
             resolver,
             tasks: Mutex::new(Vec::new()),
             generation: AtomicU64::new(0),
-        })
+        });
+        let listener: Weak<dyn PinListener> = Arc::downgrade(&selector) as Weak<dyn PinListener>;
+        selector.edge.attach(listener);
+        selector.sync_pin();
+        selector
     }
 
     /// 公共 DoH 上游列表：内置端点 + Dart 传入的（按其引导 IP 建 IP 字面量地址），按 URL 去重
@@ -659,6 +660,7 @@ impl Selector {
     }
 
     pub fn shutdown(&self) {
+        self.alive.store(false, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
         for handle in self.tasks.lock().drain(..) {
             handle.abort();
@@ -667,7 +669,8 @@ impl Selector {
         inner.phase = Phase::Idle;
         drop(inner);
         self.racing.store(false, Ordering::Release);
-        self.raced.notify_waiters();
+        // 停了就不再钉住：EdgePin 可能还被下一个 Selector / FFI 用着
+        self.edge.set_pin(Pin::None);
     }
 
     fn track(&self, handle: AbortHandle) {
@@ -676,15 +679,35 @@ impl Selector {
         tasks.push(handle);
     }
 
+    /// 可用的赢家：Ready，或 Verifying 且网络签名未变（乐观沿用）
     pub fn winner_ip(&self) -> Option<IpAddr> {
-        let inner = self.inner.lock();
-        match inner.phase {
-            Phase::Ready => inner.state.winner.as_ref().map(|w| w.ip),
-            Phase::Verifying if inner.state.network_sig == inner.current_sig => {
-                inner.state.winner.as_ref().map(|w| w.ip)
-            }
+        match Self::pin_of(&self.inner.lock()) {
+            Pin::Winner(ip) => Some(ip),
             _ => None,
         }
+    }
+
+    /// 当前状态对应的钉住状态：可用赢家 → 钉住；竞速 / 校验中（签名变了）→ 待定，
+    /// 冷启动的解析可以等；Idle / Failed → 没有
+    fn pin_of(inner: &Inner) -> Pin {
+        let winner = inner.state.winner.as_ref().map(|w| w.ip);
+        match inner.phase {
+            Phase::Ready => winner.map(Pin::Winner).unwrap_or(Pin::None),
+            Phase::Verifying if inner.state.network_sig == inner.current_sig => {
+                winner.map(Pin::Winner).unwrap_or(Pin::Pending)
+            }
+            Phase::Verifying | Phase::Racing => Pin::Pending,
+            Phase::Idle | Phase::Failed => Pin::None,
+        }
+    }
+
+    /// 把当前赢家状态交给 EdgePin。phase / 赢家 / 网络签名变了都要调
+    fn sync_pin(&self) {
+        if !self.alive.load(Ordering::Acquire) {
+            return;
+        }
+        let pin = Self::pin_of(&self.inner.lock());
+        self.edge.set_pin(pin);
     }
 
     /// 当前首选钥匙（钥匙池第一把）
@@ -765,102 +788,11 @@ impl Selector {
             "winner": inner.state.winner,
             "last_race_at": inner.state.last_race_at,
             "last_error": inner.last_error,
-            "fail_streak": inner.state.fail_streak,
+            "fail_streak": self.edge.winner_fail_streak(),
             "share": self.share.load(Ordering::Relaxed),
             "keys": inner.state.ech_keys.len(),
             "network_sig": inner.current_sig,
         })
-    }
-
-    // ---------- lookup 接口 ----------
-
-    /// 给 lookup 用的赢家：Ready 立即返回；Verifying 且网络签名未变则乐观返回；
-    /// Racing / Verifying 最多等到 deadline；Idle / Failed 返回 None（Failed 过了重试间隔会顺手发车）
-    pub async fn winner_for_lookup(self: &Arc<Self>, deadline: Instant) -> Option<Winner> {
-        loop {
-            let notified = self.raced.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let decision = {
-                let inner = self.inner.lock();
-                match inner.phase {
-                    Phase::Ready => return inner.state.winner.clone(),
-                    Phase::Verifying if inner.state.network_sig == inner.current_sig => {
-                        return inner.state.winner.clone();
-                    }
-                    Phase::Verifying | Phase::Racing => None,
-                    Phase::Idle => Some(false),
-                    Phase::Failed => Some(
-                        inner.failed_at.is_some_and(|at| {
-                            at.elapsed() >= Duration::from_secs(SELECT_FAILED_RETRY_SECS)
-                        }),
-                    ),
-                }
-            };
-            match decision {
-                Some(retry) => {
-                    if retry {
-                        self.spawn_race(RaceTrigger::Failed);
-                    }
-                    return None;
-                }
-                None => {
-                    if tokio::time::timeout_at(deadline.into(), notified)
-                        .await
-                        .is_err()
-                    {
-                        return None;
-                    }
-                }
-            }
-        }
-    }
-
-    /// 建连结果回报：只统计赢家 IP。连败达阈值则降级并重跑
-    pub fn record_connect_result(self: &Arc<Self>, ip: IpAddr, ok: bool) {
-        let demote = {
-            let mut inner = self.inner.lock();
-            let Some(winner_ip) = inner.state.winner.as_ref().map(|w| w.ip) else {
-                return;
-            };
-            if winner_ip != ip {
-                return;
-            }
-            if ok {
-                inner.fail_times.clear();
-                inner.state.fail_streak = 0;
-                return;
-            }
-            let now = Instant::now();
-            inner.fail_times.push(now);
-            inner.fail_times.retain(|at| {
-                now.saturating_duration_since(*at) < Duration::from_secs(SELECT_FAIL_WINDOW_SECS)
-            });
-            inner.state.fail_streak = inner.fail_times.len().min(u8::MAX as usize) as u8;
-            if inner.fail_times.len() >= SELECT_FAIL_THRESHOLD {
-                warn!(
-                    "select: winner {} failed {} times within {}s, demoting",
-                    ip,
-                    inner.fail_times.len(),
-                    SELECT_FAIL_WINDOW_SECS
-                );
-                inner.state.winner = None;
-                inner.fail_times.clear();
-                inner.state.fail_streak = 0;
-                true
-            } else {
-                false
-            }
-        };
-        if demote {
-            self.push_state();
-            if !self.spawn_race(RaceTrigger::Auto) {
-                let mut inner = self.inner.lock();
-                inner.phase = Phase::Failed;
-                inner.failed_at = Some(Instant::now());
-                inner.last_error = Some("race budget exhausted".to_string());
-            }
-        }
     }
 
     /// 网络变化（Dart 传入结果集签名）：防抖后有赢家校验、无赢家竞速
@@ -875,11 +807,16 @@ impl Selector {
             if inner.current_sig.is_none() {
                 info!("select: network signature known: {}", sig);
                 inner.current_sig = Some(sig.clone());
-                if inner.phase == Phase::Ready || inner.phase == Phase::Verifying {
+                let settled = inner.phase == Phase::Ready || inner.phase == Phase::Verifying;
+                if settled {
                     inner.state.network_sig = Some(sig);
-                    drop(inner);
+                }
+                drop(inner);
+                if settled {
                     self.push_state();
                 }
+                // 校验中的赢家签名对上了：从待定转为钉住
+                self.sync_pin();
                 return;
             }
             info!(
@@ -888,10 +825,12 @@ impl Selector {
                 sig
             );
             inner.current_sig = Some(sig);
-            inner.fail_times.clear();
             inner.netchange_gen += 1;
             inner.netchange_gen
         };
+        // 旧网络上的失败不再算到赢家头上；校验中的赢家签名对不上了就转为待定
+        self.edge.network_changed();
+        self.sync_pin();
         let selector = self.clone();
         let handle = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(SELECT_NETCHANGE_DEBOUNCE_MS)).await;
@@ -981,6 +920,7 @@ impl Selector {
             inner.phase = Phase::Racing;
             inner.last_error = None;
         }
+        self.sync_pin();
         info!("select: racing ({:?})", trigger);
         let selector = self.clone();
         let generation = self.generation.load(Ordering::Acquire);
@@ -1010,6 +950,7 @@ impl Selector {
             inner.phase = Phase::Verifying;
             inner.state.winner.clone()
         };
+        self.sync_pin();
         let Some(winner) = winner else {
             self.racing.store(false, Ordering::Release);
             self.spawn_race(RaceTrigger::Start);
@@ -1038,6 +979,7 @@ impl Selector {
                         inner.last_error = None;
                         changed
                     };
+                    selector.sync_pin();
                     if sig_changed {
                         selector.push_state();
                     }
@@ -1823,11 +1765,7 @@ impl Selector {
 
         // 先按地址族，再按延迟。地址族优先沿用连接层当前的亲和（已经用它铸过 cf_clearance），
         // 没有亲和才看配置偏好：重新优选不能把整个 App 翻到另一个出口 IP 上
-        let prefer_ipv6 = self
-            .resolver
-            .as_ref()
-            .and_then(|resolver| resolver.family_affinity())
-            .unwrap_or(self.prefer_ipv6);
+        let prefer_ipv6 = self.edge.effective_prefer_ipv6();
         let Some((best, outcome)) = passes
             .iter()
             .min_by_key(|(candidate, outcome)| {
@@ -1902,14 +1840,13 @@ impl Selector {
             });
             inner.state.network_sig = inner.current_sig.clone();
             inner.state.fail_streak = 0;
-            inner.fail_times.clear();
             inner.failed_at = None;
             inner.phase = Phase::Ready;
             inner.last_error = None;
             inner.report_pending = passes.len() >= 2;
         }
+        self.sync_pin();
         self.push_state();
-        self.raced.notify_waiters();
         self.maybe_report(&all).await;
     }
 
@@ -1920,6 +1857,7 @@ impl Selector {
         inner.failed_at = Some(Instant::now());
         inner.last_error = Some(reason.to_string());
         drop(inner);
+        self.sync_pin();
         self.push_state();
     }
 
@@ -2080,6 +2018,61 @@ impl Selector {
     }
 }
 
+/// EdgePin 的回调：赢家连败降级、覆盖域名要赢家时没有
+impl PinListener for Selector {
+    /// 赢家在窗口内连败达阈值（EdgePin 已解除钉住）：降级并重跑，预算不够就转 Failed
+    fn winner_failed(self: Arc<Self>, ip: IpAddr) {
+        if !self.alive.load(Ordering::Acquire) {
+            return;
+        }
+        let demote = {
+            let mut inner = self.inner.lock();
+            if inner.state.winner.as_ref().map(|w| w.ip) == Some(ip) {
+                warn!(
+                    "select: winner {} failed {} times within {}s, demoting",
+                    ip, WINNER_FAIL_THRESHOLD, WINNER_FAIL_WINDOW_SECS
+                );
+                inner.state.winner = None;
+                inner.state.fail_streak = 0;
+                true
+            } else {
+                false
+            }
+        };
+        if !demote {
+            self.sync_pin();
+            return;
+        }
+        self.push_state();
+        if !self.spawn_race(RaceTrigger::Auto) {
+            {
+                let mut inner = self.inner.lock();
+                inner.phase = Phase::Failed;
+                inner.failed_at = Some(Instant::now());
+                inner.last_error = Some("race budget exhausted".to_string());
+            }
+            self.sync_pin();
+        }
+    }
+
+    /// 覆盖域名要建连但没有赢家：Failed 过了重试间隔就顺手发车
+    fn pin_missed(self: Arc<Self>) {
+        if !self.alive.load(Ordering::Acquire) {
+            return;
+        }
+        let retry = {
+            let inner = self.inner.lock();
+            inner.phase == Phase::Failed
+                && inner.failed_at.is_some_and(|at| {
+                    at.elapsed() >= Duration::from_secs(SELECT_FAILED_RETRY_SECS)
+                })
+        };
+        if retry {
+            self.spawn_race(RaceTrigger::Failed);
+        }
+    }
+}
+
 /// atlas `GET /v1/routes` 响应里本模块关心的部分
 #[derive(Deserialize)]
 struct AtlasRoutesJson {
@@ -2197,20 +2190,20 @@ mod tests {
 
     /// 用假探测构造一个 selector；`f(ip, key_bytes)` 决定结果
     fn fake_selector(mode: SelectMode, state: SelectState, f: ProbeFn) -> Arc<Selector> {
-        fake_selector_with(mode, state, f, None)
+        fake_selector_with(mode, state, f, Arc::new(EdgePin::new(false)))
     }
 
+    /// 同上，赢家交给指定的 EdgePin
     fn fake_selector_with(
         mode: SelectMode,
         state: SelectState,
         f: ProbeFn,
-        resolver: Option<Arc<DnsResolver>>,
+        edge: Arc<EdgePin>,
     ) -> Arc<Selector> {
         let roots = RootCertStore::empty();
         let provider = Arc::new(crate::tls_crypto::build_provider());
         Selector::build(
             mode,
-            false,
             state,
             Some("wifi".to_string()),
             roots,
@@ -2222,7 +2215,8 @@ mod tests {
                 path: "/api/v1/probe/report".to_string(),
                 version: "cfluxdo/test".to_string(),
             }),
-            resolver,
+            None,
+            edge,
             Prober::Fake(f),
         )
     }
@@ -2309,15 +2303,15 @@ mod tests {
     #[tokio::test]
     async fn winner_follows_connection_family_affinity() {
         // 连接层已把亲和定在 IPv6：即使 v4 候选更快，赢家也要选 v6，否则整个 App 会翻到另一个出口 IP
-        let resolver = Arc::new(
-            DnsResolver::with_resolver_config(
-                hickory_resolver::config::ResolverConfig::new(),
-                false,
-            )
-            .await
-            .unwrap(),
+        let edge = Arc::new(EdgePin::new(false));
+        edge.report(
+            "linux.do",
+            ip("2606:4700::1"),
+            crate::edge_pin::Outcome::Connected {
+                rtt: None,
+                took_over: false,
+            },
         );
-        resolver.record_family_affinity(ip("2606:4700::1"), true);
         let selector = fake_selector_with(
             SelectMode::LocalAtlas,
             state_with_key(1),
@@ -2328,7 +2322,7 @@ mod tests {
                     outcome(ip, true, 60, None)
                 }
             }),
-            Some(resolver),
+            edge,
         );
         selector
             .race_candidates(
@@ -2371,7 +2365,8 @@ mod tests {
         assert_eq!(selector.phase(), Phase::Failed);
         assert!(selector.winner_ip().is_none());
         let got = selector
-            .winner_for_lookup(Instant::now() + Duration::from_millis(50))
+            .edge
+            .settled_winner("linux.do", Instant::now() + Duration::from_millis(50))
             .await;
         assert!(got.is_none());
     }
@@ -2476,14 +2471,25 @@ mod tests {
         // 把 last_race_at 拨回去，让自动发车不被最小间隔挡住
         selector.inner.lock().state.last_race_at = 0;
         let winner = ip("104.21.0.1");
-        selector.record_connect_result(ip("104.21.0.9"), false); // 非赢家不计
-        selector.record_connect_result(winner, false);
-        selector.record_connect_result(winner, false);
-        assert_eq!(selector.inner.lock().state.fail_streak, 2);
-        selector.record_connect_result(winner, true);
-        assert_eq!(selector.inner.lock().state.fail_streak, 0);
+        let edge = selector.edge.clone();
+        let failed = crate::edge_pin::Outcome::Failed;
+        edge.report("linux.do", ip("104.21.0.9"), failed); // 非赢家不计
+        edge.report("example.com", winner, failed); // 非覆盖域名不计
+        edge.report("linux.do", winner, failed);
+        edge.report("linux.do", winner, failed);
+        assert_eq!(edge.winner_fail_streak(), 2);
+        assert_eq!(selector.status_json()["fail_streak"], 2);
+        edge.report(
+            "linux.do",
+            winner,
+            crate::edge_pin::Outcome::Connected {
+                rtt: None,
+                took_over: false,
+            },
+        );
+        assert_eq!(edge.winner_fail_streak(), 0);
         for _ in 0..3 {
-            selector.record_connect_result(winner, false);
+            edge.report("linux.do", winner, failed);
         }
         // 降级后发车：run_race 走 gather（无公共 DoH、无 atlas）→ 无候选 → Failed
         wait_phase(&selector, Phase::Failed).await;
@@ -2555,18 +2561,22 @@ mod tests {
         state.network_sig = Some("wifi".to_string());
         let selector = fake_selector(SelectMode::LocalAtlas, state.clone(), Arc::new(|ip, _| outcome(ip, true, 20, None)));
         selector.inner.lock().phase = Phase::Verifying;
+        selector.sync_pin();
         assert_eq!(selector.winner_ip(), Some(ip("104.21.0.1")));
         let got = selector
-            .winner_for_lookup(Instant::now() + Duration::from_millis(10))
+            .edge
+            .settled_winner("linux.do", Instant::now() + Duration::from_millis(10))
             .await;
         assert!(got.is_some());
 
         let selector = fake_selector(SelectMode::LocalAtlas, state, Arc::new(|ip, _| outcome(ip, true, 20, None)));
         selector.inner.lock().current_sig = Some("mobile".to_string());
         selector.inner.lock().phase = Phase::Verifying;
+        selector.sync_pin();
         assert!(selector.winner_ip().is_none());
         let got = selector
-            .winner_for_lookup(Instant::now() + Duration::from_millis(10))
+            .edge
+            .settled_winner("linux.do", Instant::now() + Duration::from_millis(10))
             .await;
         assert!(got.is_none());
     }

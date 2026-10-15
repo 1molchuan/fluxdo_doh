@@ -4,7 +4,7 @@
 //! and enables true ECH encryption of the SNI field.
 
 use crate::dns::{DnsCacheRecord, DnsCacheStats, DnsResolver};
-use crate::select::Selector;
+use crate::edge_pin::Outcome;
 use crate::error::{DohProxyError, Result};
 use crate::upstream::connect_tunnel;
 use crate::{BoxStream, UpstreamProxyConfig};
@@ -118,7 +118,7 @@ impl DohTlsConnector {
         if let Some(resolver) = self.dns_resolver.as_ref() {
             match resolver.lookup_ip(host).await {
                 Ok(addrs) if !addrs.is_empty() => {
-                    let ordered = resolver.order_addrs_by_rtt(addrs);
+                    let ordered = resolver.edge_pin().route(host, addrs).addrs;
                     let mut last_err: Option<DohProxyError> = None;
                     for ip in ordered {
                         match self.tcp_connect_addr(SocketAddr::new(ip, port)).await {
@@ -199,14 +199,6 @@ impl DohTlsConnector {
         self.crypto_provider.clone()
     }
 
-    /// 优选覆盖的域名才拿全局 Selector
-    fn selector_for_host(host: &str) -> Option<Arc<Selector>> {
-        if !DnsResolver::is_covered_host(host) {
-            return None;
-        }
-        Selector::global()
-    }
-
     /// 从建连错误里取 ECH retry_configs：(地址, ECHConfigList 字节)
     #[cfg(feature = "ech")]
     fn ech_retry_from_err(error: &DohProxyError) -> Option<(Option<SocketAddr>, Vec<u8>)> {
@@ -241,7 +233,7 @@ impl DohTlsConnector {
                 Duration::from_secs(ECH_OVERRIDE_TTL_SECS),
             );
         }
-        if let Some(selector) = Selector::global() {
+        if let Some(selector) = crate::select::Selector::global() {
             selector.adopt_ech_key(&key, crate::select::EchKeySource::RetryConfigs);
         }
         info!(
@@ -359,20 +351,18 @@ impl DohTlsConnector {
             return Ok(tls_stream);
         }
 
-        // 2. Prefer recently successful IP for this host (shared with query mode)
-        //    preferred_host_ip 已按地址族亲和过滤：亲和切换前记下的另一族粘性 IP 不会再用
-        let selector = Self::selector_for_host(host);
-        let winner_ip = selector.as_ref().and_then(|s| s.winner_ip());
-        // 优选有赢家：所有覆盖域名一律先连赢家，不看各自的粘性 IP 和当前地址族亲和。
-        // cf_clearance 绑定出口 IP，双栈下 v4/v6 出口是两个地址，linux.do 与其子域
-        // 必须是同一个边缘 IP、同一个地址族，否则必撞盾
-        let sticky = match winner_ip {
-            Some(winner) => Some(winner),
-            None => dns_resolver.preferred_host_ip(host),
+        // 2. 先单独试 EdgePin 给的首选地址：覆盖域名有赢家时是赢家（不看各自的粘性 IP
+        //    和当前地址族亲和），否则是该域名验证过、与亲和族一致的粘性 IP
+        let edge = dns_resolver.edge_pin();
+        let doh_addrs = match &ip_result {
+            Ok(addrs) => addrs.clone(),
+            Err(_) => Vec::new(),
         };
+        let route = edge.route(host, doh_addrs);
+        let pinned_winner = route.first.filter(|_| route.pinned);
         #[allow(unused_mut)]
         let mut connector = connector;
-        if let Some(cached_addr) = sticky {
+        if let Some(cached_addr) = route.first {
             let socket_addr = SocketAddr::new(cached_addr, port);
             debug!("Trying sticky IP for {}:{} via {}", host, port, socket_addr);
             #[allow(unused_mut)]
@@ -392,13 +382,15 @@ impl DohTlsConnector {
             }
             match attempt {
                 Ok(stream) => {
-                    if let Some(selector) = &selector {
-                        selector.record_connect_result(socket_addr.ip(), true);
-                    }
-                    dns_resolver.record_host_success(host, socket_addr.ip());
-                    dns_resolver.record_ip_rtt(socket_addr.ip(), start.elapsed());
-                    // 赢家连通即把亲和强制定到赢家的地址族，后续所有域名跟着走
-                    dns_resolver.record_family_affinity(socket_addr.ip(), winner_ip.is_some());
+                    // 经赢家连通时 EdgePin 把亲和强制定到赢家的地址族，后续所有域名跟着走
+                    edge.report(
+                        host,
+                        socket_addr.ip(),
+                        Outcome::Connected {
+                            rtt: Some(start.elapsed()),
+                            took_over: false,
+                        },
+                    );
                     #[cfg(feature = "ech")]
                     {
                         let (_, conn) = stream.get_ref();
@@ -425,10 +417,7 @@ impl DohTlsConnector {
                         "Sticky IP failed for {}:{} via {}: {}",
                         host, port, socket_addr, e
                     );
-                    if let Some(selector) = &selector {
-                        selector.record_connect_result(socket_addr.ip(), false);
-                    }
-                    dns_resolver.clear_preferred_host_ip(host);
+                    edge.report(host, socket_addr.ip(), Outcome::Failed);
                 }
             }
         }
@@ -451,19 +440,12 @@ impl DohTlsConnector {
                 self.system_lookup_ip(host, port).await?
             }
         };
-        let addrs = dns_resolver.order_addrs_by_rtt(addrs);
-
-        let (v6_addrs, v4_addrs): (Vec<_>, Vec<_>) =
-            addrs.into_iter().partition(|addr| addr.is_ipv6());
+        // 失败回报后重新问一次：亲和可能刚被别的连接改过。
         // 地址族亲和：首次建连后固定出站地址族，所有域名共用，保证 cf_clearance
-        // 绑定的出口 IP 在 linux.do 与其子域之间一致（见 DnsResolver::family_affinity）
-        let affinity = dns_resolver.family_affinity();
-        let prefer_ipv6 = affinity.unwrap_or(dns_resolver.prefer_ipv6());
-        let (primary, secondary) = if prefer_ipv6 {
-            (v6_addrs, v4_addrs)
-        } else {
-            (v4_addrs, v6_addrs)
-        };
+        // 绑定的出口 IP 在 linux.do 与其子域之间一致（见 edge_pin.rs）
+        let route = edge.route(host, addrs);
+        let (primary, secondary) = route.split();
+        let prefer_ipv6 = route.primary_is_v6;
         let family_name = |is_ipv6: bool| if is_ipv6 { "IPv6" } else { "IPv4" };
 
         // 某一族没有地址（如只有 AAAA 的域名）：直接连另一族，不做空赛跑——否则
@@ -479,7 +461,7 @@ impl DohTlsConnector {
             self.connect_to_addrs(&connector, server_name.clone(), host, port, primary)
                 .await
                 .map(|ok| (ok, false))
-        } else if affinity.is_some() {
+        } else if route.family_decided {
             match self
                 .connect_to_addrs(&connector, server_name.clone(), host, port, primary)
                 .await
@@ -583,12 +565,14 @@ impl DohTlsConnector {
 
         match result {
             Ok(((stream, socket_addr, rtt), switched_family)) => {
-                if let Some(selector) = &selector {
-                    selector.record_connect_result(socket_addr.ip(), true);
-                }
-                dns_resolver.record_host_success(host, socket_addr.ip());
-                dns_resolver.record_ip_rtt(socket_addr.ip(), rtt);
-                dns_resolver.record_family_affinity(socket_addr.ip(), switched_family);
+                edge.report(
+                    host,
+                    socket_addr.ip(),
+                    Outcome::Connected {
+                        rtt: Some(rtt),
+                        took_over: switched_family,
+                    },
+                );
                 #[cfg(feature = "ech")]
                 {
                     let (_, conn) = stream.get_ref();
@@ -612,8 +596,8 @@ impl DohTlsConnector {
             }
             Err(e) => {
                 // 赢家在列表首位先试过，整体失败就记它一次
-                if let (Some(selector), Some(winner_ip)) = (&selector, winner_ip) {
-                    selector.record_connect_result(winner_ip, false);
+                if let Some(winner_ip) = pinned_winner {
+                    edge.report(host, winner_ip, Outcome::Failed);
                 }
                 Err(e)
             }

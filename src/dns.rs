@@ -1,5 +1,6 @@
 //! DNS resolver with DOH and HTTPS record support for ECH config retrieval
 
+use crate::edge_pin::EdgePin;
 use crate::error::{DohProxyError, Result};
 use crate::select::{Selector, SELECT_LOOKUP_WAIT_SECS};
 use crate::UpstreamProxyConfig;
@@ -36,8 +37,6 @@ const MAX_TTL_SECS: u64 = 1800;
 const DEFAULT_TTL_SECS: u64 = 300;
 /// 每隔多少次查询清理一次过期缓存
 const CLEANUP_INTERVAL: u64 = 100;
-/// 成功连通后的 host -> ip 粘性缓存时长
-const STICKY_IP_TTL_SECS: u64 = 600;
 /// ECH 负结果（确定无 ECH）缓存时长，取短值以便域名启用 ECH 后尽快生效
 const ECH_NEGATIVE_TTL_SECS: u64 = 60;
 /// 有备用节点时，主客户端（系统 DNS）的连接超时（含 DNS 解析和 TLS 握手），超时即改走备用节点
@@ -104,9 +103,6 @@ static ACCEL_UPDATE: OnceLock<parking_lot::Mutex<AccelUpdate>> = OnceLock::new()
 
 /// `accel_request` 用的客户端缓存：scheme://authority -> 上游（复用连接，与 DoH 同一套 TLS 栈）
 static ACCEL_UPSTREAMS: OnceLock<RwLock<HashMap<String, DohUpstream>>> = OnceLock::new();
-
-/// 除 linux.do 外也由本地优选覆盖的主机名（atlas、cfhub6），由启动配置登记
-static EXTRA_COVERED_HOSTS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
 
 /// 测试用的额外公钥（kid -> 公钥），与 `NODE_LIST_PUBKEYS` 一起查
 #[cfg(test)]
@@ -543,16 +539,9 @@ pub struct DnsResolver {
     ech_overrides: Arc<RwLock<HashMap<String, (EchConfigListBytes<'static>, std::time::Instant)>>>,
     ech_inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     ip_inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
-    ip_rtt_cache: Arc<RwLock<HashMap<IpAddr, CachedIpRtt>>>,
-    preferred_host_ip_cache: Arc<RwLock<HashMap<String, CachedPreferredHostIp>>>,
-    /// 出站地址族亲和：首次成功建连后固定下来（`true` = IPv6），之后所有域名都
-    /// 优先用同一个地址族，只有该族整体连不上才切换。
-    ///
-    /// CF 的 cf_clearance 绑定出口 IP，而双栈网络下 v4 与 v6 的出口是两个地址。
-    /// 以前 Happy Eyeballs 让两族赛跑、谁赢谁做该域名的粘性 IP，结果 `linux.do`
-    /// 可能走 v6、`credit.linux.do` 走 v4：WebView 在 linux.do 过盾铸出的 clearance
-    /// 到了 credit.linux.do 的请求上就被 CF 判成另一个 IP，稳定 403。
-    family_affinity: Arc<RwLock<Option<bool>>>,
+    /// 出站钉选（优选赢家、地址族亲和、粘性 IP、RTT），与本 resolver 同生命周期。
+    /// resolver 只负责解析，连哪个地址、走哪个地址族都由它决定（见 edge_pin.rs）
+    edge_pin: Arc<EdgePin>,
     prefer_ipv6: bool,
     resolve_timeout: Duration,
     /// 查询计数器，用于定期清理缓存
@@ -601,16 +590,6 @@ struct CachedEchConfig {
 
 struct CachedIpAddrs {
     addrs: Vec<IpAddr>,
-    expires_at: std::time::Instant,
-}
-
-struct CachedIpRtt {
-    rtt_ms: u128,
-    expires_at: std::time::Instant,
-}
-
-struct CachedPreferredHostIp {
-    addr: IpAddr,
     expires_at: std::time::Instant,
 }
 
@@ -1381,7 +1360,7 @@ impl DnsResolver {
         let method = reqwest::Method::from_bytes(method.trim().to_ascii_uppercase().as_bytes())
             .map_err(|_| DohProxyError::InvalidUrl(format!("Invalid HTTP method: {}", method)))?;
         // 优选覆盖的主机（atlas / cfhub6 / *.linux.do）先经赢家 IP + ECH 发，失败再走 reqwest
-        if let Some(host) = uri.host().filter(|host| Self::is_covered_host(host)) {
+        if let Some(host) = uri.host().filter(|host| EdgePin::is_covered(host)) {
             if let Some(selector) = Selector::global() {
                 let header_refs: Vec<(&str, &str)> = headers
                     .iter()
@@ -1797,9 +1776,7 @@ impl DnsResolver {
             ech_overrides: Arc::new(RwLock::new(HashMap::new())),
             ech_inflight: Arc::new(Mutex::new(HashMap::new())),
             ip_inflight: Arc::new(Mutex::new(HashMap::new())),
-            ip_rtt_cache: Arc::new(RwLock::new(HashMap::new())),
-            preferred_host_ip_cache: Arc::new(RwLock::new(HashMap::new())),
-            family_affinity: Arc::new(RwLock::new(None)),
+            edge_pin: Arc::new(EdgePin::new(prefer_ipv6)),
             prefer_ipv6,
             resolve_timeout,
             query_count: AtomicU64::new(0),
@@ -1825,7 +1802,7 @@ impl DnsResolver {
             return Ok(Some(key));
         }
         // 优选覆盖的域名用 Selector 当前钥匙（含自愈后的新钥匙）
-        if Self::is_covered_host(domain) {
+        if EdgePin::is_covered(domain) {
             if let Some(key) = Selector::global().and_then(|s| s.current_ech_key()) {
                 debug!("Selector ECH key used for {}", domain);
                 return Ok(Some(key));
@@ -2045,26 +2022,22 @@ impl DnsResolver {
         // 查表模式：命中直接用表里的地址，不发 DoH；表外域名按表的 miss 策略
         let table = self.active_route_table().await;
 
-        // 一等：优选覆盖的域名先用赢家 IP，表地址跟在后面兜底；
+        // 一等：优选覆盖的域名有赢家（EdgePin 钉住）时不再解析，赢家在前、表地址兜底；
         // 等待竞速与等待拉表共用从 lookup 开始算的同一个 deadline
-        if Self::is_covered_host(domain) {
-            if let Some(selector) = Selector::global() {
-                let deadline = lookup_start + Duration::from_secs(SELECT_LOOKUP_WAIT_SECS);
-                if let Some(winner) = selector.winner_for_lookup(deadline).await {
-                    let mut addrs = vec![winner.ip];
-                    if let Some(entry) = table.as_ref().and_then(|table| table.lookup(domain)) {
-                        let mut extra = entry.addrs.clone();
-                        self.sort_addrs_by_preference(&mut extra);
-                        for ip in extra {
-                            if !addrs.contains(&ip) {
-                                addrs.push(ip);
-                            }
-                        }
+        let deadline = lookup_start + Duration::from_secs(SELECT_LOOKUP_WAIT_SECS);
+        if let Some(winner) = self.edge_pin.settled_winner(domain, deadline).await {
+            let mut addrs = vec![winner];
+            if let Some(entry) = table.as_ref().and_then(|table| table.lookup(domain)) {
+                let mut extra = entry.addrs.clone();
+                self.sort_addrs_by_preference(&mut extra);
+                for ip in extra {
+                    if !addrs.contains(&ip) {
+                        addrs.push(ip);
                     }
-                    debug!("Selector winner first for {}", domain);
-                    return Ok(addrs);
                 }
             }
+            debug!("Selector winner first for {}", domain);
+            return Ok(addrs);
         }
         if let Some(entry) = table.as_ref().and_then(|table| table.lookup(domain)) {
             if !entry.addrs.is_empty() {
@@ -2269,7 +2242,7 @@ impl DnsResolver {
 
         let (ech_config, ip_result) = self.lookup_ech_and_ip(domain).await;
         let addrs = match ip_result {
-            Ok(addrs) => self.order_addrs_by_rtt(addrs),
+            Ok(addrs) => self.edge_pin.route(domain, addrs).addrs,
             Err(error) => {
                 if ech_config.is_none() {
                     return Err(error);
@@ -2285,7 +2258,14 @@ impl DnsResolver {
         // 冷启动时不要把排序后的首个地址直接提升为 preferred_ip，
         // 否则 query 模式会把一个未验证的单 IP 提前钉死给 rhttp，
         // 一旦这个边缘节点不稳定，就会持续触发连接重置/超时。
-        let preferred_ip = self.preferred_host_ip_for_addrs(domain, &addrs);
+        let preferred_ip = match self.edge_pin.sticky(domain) {
+            Some(ip) if addrs.contains(&ip) => Some(ip),
+            Some(_) => {
+                self.edge_pin.forget_host(domain);
+                None
+            }
+            None => None,
+        };
         // 表命中的域名不进 ip_cache，缓存时长按表的新鲜期给
         let table_ttl = match self.active_route_table().await {
             Some(table) if table.lookup(domain).is_some_and(|e| !e.addrs.is_empty()) => {
@@ -2305,40 +2285,13 @@ impl DnsResolver {
         })
     }
 
-    /// Set IPv6 preference
-    pub fn set_prefer_ipv6(&mut self, prefer: bool) {
-        self.prefer_ipv6 = prefer;
-        // Clear IP cache when preference changes
-        self.ip_cache.write().clear();
-    }
-
     pub fn prefer_ipv6(&self) -> bool {
         self.prefer_ipv6
     }
 
-    /// 登记额外由本地优选覆盖的主机名（atlas、cfhub6）
-    pub fn set_extra_covered_hosts(hosts: &[String]) {
-        let normalized: Vec<String> = hosts
-            .iter()
-            .map(|h| h.trim().trim_end_matches('.').to_ascii_lowercase())
-            .filter(|h| !h.is_empty())
-            .collect();
-        *EXTRA_COVERED_HOSTS
-            .get_or_init(|| RwLock::new(Vec::new()))
-            .write() = normalized;
-    }
-
-    /// 是否由本地优选覆盖：linux.do / *.linux.do，以及登记的额外主机名。
-    /// 不按「表内地址在 CF 网段」扩展：别的 zone 可能用 CF 专用边缘，赢家 IP 对它们是 403，
-    /// 会把无关失败算到赢家头上
-    pub(crate) fn is_covered_host(host: &str) -> bool {
-        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
-        if host == "linux.do" || host.ends_with(".linux.do") {
-            return true;
-        }
-        EXTRA_COVERED_HOSTS
-            .get()
-            .is_some_and(|hosts| hosts.read().contains(&host))
+    /// 本 resolver 这套 DoH 配置下的出站钉选
+    pub fn edge_pin(&self) -> &Arc<EdgePin> {
+        &self.edge_pin
     }
 
     /// 写入服务端 retry_configs 给的新钥匙，覆盖表和缓存里的旧钥匙
@@ -2364,7 +2317,7 @@ impl DnsResolver {
         self.ech_overrides.write().remove(domain);
         self.ech_cache.write().remove(domain);
         self.ech_negative_cache.write().remove(domain);
-        self.preferred_host_ip_cache.write().remove(domain);
+        self.edge_pin.forget_host(domain);
     }
 
     pub fn clear_all_caches(&self) {
@@ -2372,45 +2325,8 @@ impl DnsResolver {
         self.ech_overrides.write().clear();
         self.ech_cache.write().clear();
         self.ech_negative_cache.write().clear();
-        self.ip_rtt_cache.write().clear();
-        self.preferred_host_ip_cache.write().clear();
-        // 网络切换后地址族可能变化（如 Wi-Fi 双栈 → 蜂窝 v4-only），亲和一并重置
-        *self.family_affinity.write() = None;
-    }
-
-    /// 当前出站地址族亲和（`Some(true)` = IPv6 优先），未建连过时为 `None`
-    pub fn family_affinity(&self) -> Option<bool> {
-        *self.family_affinity.read()
-    }
-
-    /// 本次建连应优先的地址族：有亲和用亲和，否则按配置的 prefer_ipv6
-    pub fn effective_prefer_ipv6(&self) -> bool {
-        self.family_affinity().unwrap_or(self.prefer_ipv6)
-    }
-
-    /// 记录一次成功建连所用的地址族。`force` 为 false 时只在尚无亲和时写入；
-    /// 为 true 表示原亲和族已整体连不上、由另一族接管，强制切换。
-    pub fn record_family_affinity(&self, addr: IpAddr, force: bool) {
-        let is_ipv6 = addr.is_ipv6();
-        let mut affinity = self.family_affinity.write();
-        match *affinity {
-            Some(current) if current == is_ipv6 => {}
-            Some(_) if !force => {}
-            Some(_) => {
-                info!(
-                    "Address family affinity switched to {}",
-                    if is_ipv6 { "IPv6" } else { "IPv4" }
-                );
-                *affinity = Some(is_ipv6);
-            }
-            None => {
-                info!(
-                    "Address family affinity set to {}",
-                    if is_ipv6 { "IPv6" } else { "IPv4" }
-                );
-                *affinity = Some(is_ipv6);
-            }
-        }
+        // 粘性 IP、RTT、地址族亲和一并重置（网络切换后地址族可能变化）
+        self.edge_pin.clear();
     }
 
     pub fn cache_stats(&self) -> DnsCacheStats {
@@ -2448,14 +2364,11 @@ impl DnsResolver {
                 .count()
         };
         let preferred_ip_count = {
-            let cache = self.preferred_host_ip_cache.read();
-            cache
-                .iter()
-                .filter(|(_, entry)| entry.expires_at > now)
-                .map(|(domain, _)| {
-                    hosts.insert(domain.clone());
-                })
-                .count()
+            let entries = self.edge_pin.sticky_entries();
+            for (domain, _, _) in &entries {
+                hosts.insert(domain.clone());
+            }
+            entries.len()
         };
 
         DnsCacheStats {
@@ -2464,12 +2377,7 @@ impl DnsResolver {
             ip_count,
             ech_count,
             ech_negative_count,
-            ip_rtt_count: self
-                .ip_rtt_cache
-                .read()
-                .values()
-                .filter(|entry| entry.expires_at > now)
-                .count(),
+            ip_rtt_count: self.edge_pin.rtt_count(),
             preferred_ip_count,
         }
     }
@@ -2523,19 +2431,13 @@ impl DnsResolver {
             }
         }
 
-        {
-            let cache = self.preferred_host_ip_cache.read();
-            for (host, entry) in cache.iter() {
-                if entry.expires_at <= now {
-                    continue;
-                }
-                records.push(DnsCacheRecord {
-                    host: host.clone(),
-                    kind: "preferred_ip",
-                    values: vec![entry.addr.to_string()],
-                    ttl_ms: Self::remaining_ttl_ms(entry.expires_at, now),
-                });
-            }
+        for (host, addr, expires_at) in self.edge_pin.sticky_entries() {
+            records.push(DnsCacheRecord {
+                host,
+                kind: "preferred_ip",
+                values: vec![addr.to_string()],
+                ttl_ms: Self::remaining_ttl_ms(expires_at, now),
+            });
         }
 
         records.sort_by(|a, b| a.host.cmp(&b.host).then(a.kind.cmp(b.kind)));
@@ -2548,105 +2450,6 @@ impl DnsResolver {
             .unwrap_or_default()
             .as_millis();
         ms.min(u64::MAX as u128) as u64
-    }
-
-    pub fn preferred_host_ip(&self, domain: &str) -> Option<IpAddr> {
-        let now = std::time::Instant::now();
-        let addr = self
-            .preferred_host_ip_cache
-            .read()
-            .get(domain)
-            .filter(|entry| entry.expires_at > now)
-            .map(|entry| entry.addr)?;
-        // 粘性 IP 与当前地址族亲和不一致（亲和切换前记下的）：作废，按亲和重连
-        if let Some(prefer_ipv6) = self.family_affinity() {
-            if addr.is_ipv6() != prefer_ipv6 {
-                debug!(
-                    "Dropping sticky IP {} for {}: address family differs from affinity",
-                    addr, domain
-                );
-                self.clear_preferred_host_ip(domain);
-                return None;
-            }
-        }
-        Some(addr)
-    }
-
-    pub fn preferred_host_ip_for_addrs(&self, domain: &str, addrs: &[IpAddr]) -> Option<IpAddr> {
-        let preferred = self.preferred_host_ip(domain)?;
-        if addrs.iter().any(|addr| *addr == preferred) {
-            Some(preferred)
-        } else {
-            self.clear_preferred_host_ip(domain);
-            None
-        }
-    }
-
-    pub fn record_host_success(&self, domain: &str, addr: IpAddr) {
-        self.preferred_host_ip_cache.write().insert(
-            domain.to_string(),
-            CachedPreferredHostIp {
-                addr,
-                expires_at: std::time::Instant::now() + Duration::from_secs(STICKY_IP_TTL_SECS),
-            },
-        );
-    }
-
-    pub fn record_host_preference(&self, domain: &str, addr: IpAddr, ttl: Duration) {
-        let ttl = if ttl > Duration::from_secs(STICKY_IP_TTL_SECS) {
-            Duration::from_secs(STICKY_IP_TTL_SECS)
-        } else if ttl < Duration::from_secs(MIN_TTL_SECS) {
-            Duration::from_secs(MIN_TTL_SECS)
-        } else {
-            ttl
-        };
-
-        self.preferred_host_ip_cache.write().insert(
-            domain.to_string(),
-            CachedPreferredHostIp {
-                addr,
-                expires_at: std::time::Instant::now() + ttl,
-            },
-        );
-    }
-
-    pub fn clear_preferred_host_ip(&self, domain: &str) {
-        self.preferred_host_ip_cache.write().remove(domain);
-    }
-
-    pub fn record_ip_rtt(&self, addr: IpAddr, rtt: Duration) {
-        let cached = CachedIpRtt {
-            rtt_ms: rtt.as_millis(),
-            expires_at: std::time::Instant::now() + Duration::from_secs(600),
-        };
-        self.ip_rtt_cache.write().insert(addr, cached);
-    }
-
-    pub fn order_addrs_by_rtt(&self, mut addrs: Vec<IpAddr>) -> Vec<IpAddr> {
-        let now = std::time::Instant::now();
-        let cache = self.ip_rtt_cache.read();
-        addrs.sort_by_key(|addr| {
-            let rtt = cache
-                .get(addr)
-                .filter(|entry| entry.expires_at > now)
-                .map(|entry| entry.rtt_ms)
-                .unwrap_or(u128::MAX);
-            let family_bias = if self.prefer_ipv6 {
-                if addr.is_ipv6() {
-                    0
-                } else {
-                    1
-                }
-            } else {
-                if addr.is_ipv4() {
-                    0
-                } else {
-                    1
-                }
-            };
-            (rtt, family_bias)
-        });
-        addrs
     }
 
     /// 写入 IP 缓存，超过上限时淘汰过期条目
@@ -2748,10 +2551,7 @@ impl DnsResolver {
         self.ech_overrides.write().retain(|_, (_, exp)| *exp > now);
         self.ech_cache.write().retain(|_, v| v.expires_at > now);
         self.ech_negative_cache.write().retain(|_, exp| *exp > now);
-        self.ip_rtt_cache.write().retain(|_, v| v.expires_at > now);
-        self.preferred_host_ip_cache
-            .write()
-            .retain(|_, v| v.expires_at > now);
+        self.edge_pin.prune();
     }
 
     fn remaining_ttl_for_host(&self, domain: &str) -> Option<Duration> {
@@ -4008,44 +3808,5 @@ mod tests {
         println!("linux.do -> {:?}", addrs);
         assert!(!addrs.is_empty());
         assert!(upstream.health.lock().prefer_bootstrap_until.is_some());
-    }
-
-    /// 地址族亲和：首次成功建连定下地址族，之后另一族的粘性 IP 作废；
-    /// 非强制记录不改亲和，强制记录（亲和族整族失败）才切换；清缓存重置
-    #[tokio::test]
-    async fn family_affinity_pins_address_family_across_hosts() {
-        let resolver = DnsResolver::with_resolver_config(ResolverConfig::new(), false)
-            .await
-            .unwrap();
-        let v4: IpAddr = "198.51.100.10".parse().unwrap();
-        let v6: IpAddr = "2001:db8::10".parse().unwrap();
-
-        assert_eq!(resolver.family_affinity(), None);
-        assert!(!resolver.effective_prefer_ipv6());
-
-        // 首次建连走了 v6（Happy Eyeballs 赛跑赢家）：亲和定为 v6
-        resolver.record_host_success("linux.do", v6);
-        resolver.record_family_affinity(v6, false);
-        assert_eq!(resolver.family_affinity(), Some(true));
-        assert!(resolver.effective_prefer_ipv6());
-        assert_eq!(resolver.preferred_host_ip("linux.do"), Some(v6));
-
-        // 另一域名早先记下的 v4 粘性 IP 与亲和不一致：读取时作废
-        resolver.record_host_success("credit.linux.do", v4);
-        assert_eq!(resolver.preferred_host_ip("credit.linux.do"), None);
-        assert_eq!(resolver.preferred_host_ip("credit.linux.do"), None);
-
-        // 只有 A 记录的域名走 v4 成功，不是亲和族失败：亲和不变
-        resolver.record_family_affinity(v4, false);
-        assert_eq!(resolver.family_affinity(), Some(true));
-
-        // 亲和族整族失败、v4 接管：切换亲和，原 v6 粘性 IP 作废
-        resolver.record_family_affinity(v4, true);
-        assert_eq!(resolver.family_affinity(), Some(false));
-        assert_eq!(resolver.preferred_host_ip("linux.do"), None);
-
-        // 网络切换清缓存：亲和重置
-        resolver.clear_all_caches();
-        assert_eq!(resolver.family_affinity(), None);
     }
 }
