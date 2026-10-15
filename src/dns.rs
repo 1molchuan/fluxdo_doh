@@ -597,6 +597,82 @@ struct CachedIpAddrs {
     expires_at: std::time::Instant,
 }
 
+/// 覆盖域名解析链上的 CF 网段检查：国内解析器会给 linux.do 塞 Twitter/Facebook 段的假地址，
+/// 连上去只会白等一次建连超时。非覆盖域名原样放行
+struct CfScreen<'a> {
+    domain: &'a str,
+    covered: bool,
+    /// 只给出 CF 网段外地址的来源：(来源, 地址)
+    poisoned: Vec<(&'static str, Vec<IpAddr>)>,
+}
+
+impl<'a> CfScreen<'a> {
+    fn new(domain: &'a str) -> Self {
+        Self {
+            domain,
+            covered: EdgePin::is_covered(domain),
+            poisoned: Vec::new(),
+        }
+    }
+
+    /// 一个来源的答案：非覆盖域名原样返回；覆盖域名只留 CF 网段内的地址，
+    /// 一个不剩时返回 None（当作没命中，调用方接着问下一个来源）
+    fn pass(&mut self, source: &'static str, addrs: Vec<IpAddr>) -> Option<Vec<IpAddr>> {
+        if !self.covered {
+            return Some(addrs);
+        }
+        let (cf, other): (Vec<IpAddr>, Vec<IpAddr>) = addrs
+            .into_iter()
+            .partition(|ip| crate::cfnet::is_cloudflare(*ip));
+        if cf.is_empty() {
+            if !other.is_empty() {
+                debug!(
+                    "{} answer for {} has no Cloudflare address ({:?}), trying next source",
+                    source, self.domain, other
+                );
+                self.poisoned.push((source, other));
+            }
+            return None;
+        }
+        if !other.is_empty() {
+            info!(
+                "{} answer for {}: dropped {} non-Cloudflare address(es) {:?}",
+                source,
+                self.domain,
+                other.len(),
+                other
+            );
+        }
+        Some(cf)
+    }
+
+    /// 所有来源都没给出可用地址时的错误：见过投毒答案就记警告并说明，否则沿用最后一个错误
+    fn into_error(self, last_error: Option<DohProxyError>) -> DohProxyError {
+        if self.poisoned.is_empty() {
+            return last_error
+                .unwrap_or_else(|| DohProxyError::Dns(format!("No IP found for {}", self.domain)));
+        }
+        let detail = self
+            .poisoned
+            .iter()
+            .map(|(source, addrs)| format!("{} {:?}", source, addrs))
+            .collect::<Vec<_>>()
+            .join("; ");
+        warn!(
+            "Answers for {} look poisoned: no Cloudflare address from any source ({}), failing fast",
+            self.domain, detail
+        );
+        DohProxyError::Dns(format!(
+            "Answers for {} look poisoned (no Cloudflare address)",
+            self.domain
+        ))
+    }
+}
+
+/// 测试用的系统 DNS 替身：域名 -> 地址（空表示解析失败）；没登记的域名照常走系统 DNS
+#[cfg(test)]
+static TEST_SYSTEM_DNS: OnceLock<RwLock<HashMap<String, Vec<IpAddr>>>> = OnceLock::new();
+
 /// HTTPS 记录中提取的 hint 信息
 #[derive(Default)]
 pub struct HttpsHints {
@@ -2111,15 +2187,36 @@ impl DnsResolver {
             return Err(DohProxyError::Dns(format!("No IP found for {}", domain)));
         }
 
+        // 结果（成功时已写缓存）出来后再唤醒跟随者，它们读的是缓存
+        let result = self.resolve_ip_chain(domain, system_first).await;
+        let mut inflight = self.ip_inflight.lock().await;
+        inflight.remove(domain);
+        notify.notify_waiters();
+        result
+    }
+
+    /// 表 / 缓存都没命中时的解析链：（表外且 system_first）系统 DNS → DoH（出错再 DoH GET）。
+    /// 成功的答案写进 ip_cache。
+    ///
+    /// 覆盖域名（[`EdgePin::is_covered`]）另有两条：每个来源的答案只留 Cloudflare 网段内的地址，
+    /// 一个都不剩就当这个来源没命中、接着问下一个；DoH 之后还没拿到就再问一次系统 DNS
+    /// （建连方对覆盖域名不再自己回退系统 DNS，见 ech.rs）。全部来源都只给出 CF 网段外的地址
+    /// 时按投毒处理：记警告、直接失败，不让建连去等 Twitter/Facebook 段假地址的超时。
+    /// 路由表不在这里检查：表由自家服务端按 CF 优选池生成、经 TLS 拉取，不是投毒来源。
+    /// 非覆盖域名行为不变
+    async fn resolve_ip_chain(&self, domain: &str, system_first: bool) -> Result<Vec<IpAddr>> {
+        let mut screen = CfScreen::new(domain);
+        let mut system_tried = false;
+
         // 表外域名先走系统 DNS，解析不出再落到 DoH
         if system_first {
+            system_tried = true;
             match self.system_lookup_ip(domain).await {
                 Ok(addrs) => {
-                    self.put_ip_cache(domain, addrs.clone(), Duration::from_secs(MIN_TTL_SECS));
-                    let mut inflight = self.ip_inflight.lock().await;
-                    inflight.remove(domain);
-                    notify.notify_waiters();
-                    return Ok(addrs);
+                    if let Some(addrs) = screen.pass("system DNS", addrs) {
+                        self.put_ip_cache(domain, addrs.clone(), Duration::from_secs(MIN_TTL_SECS));
+                        return Ok(addrs);
+                    }
                 }
                 Err(error) => {
                     debug!(
@@ -2130,42 +2227,58 @@ impl DnsResolver {
             }
         }
 
+        let last_error = match self.doh_lookup_ip(domain).await {
+            Ok((addrs, ttl)) => {
+                if let Some(addrs) = screen.pass("DoH", addrs) {
+                    self.put_ip_cache(domain, addrs.clone(), ttl);
+                    return Ok(addrs);
+                }
+                None
+            }
+            Err(error) if !screen.covered => return Err(error),
+            Err(error) => Some(error),
+        };
+
+        // 覆盖域名：DoH 没给出 CF 地址，系统 DNS 兜底（也要过 CF 网段检查）
+        if screen.covered && !system_tried {
+            match self.system_lookup_ip(domain).await {
+                Ok(addrs) => {
+                    if let Some(addrs) = screen.pass("system DNS", addrs) {
+                        self.put_ip_cache(domain, addrs.clone(), Duration::from_secs(MIN_TTL_SECS));
+                        return Ok(addrs);
+                    }
+                }
+                Err(error) => debug!("System DNS lookup failed for {}: {}", domain, error),
+            }
+        }
+
+        Err(screen.into_error(last_error))
+    }
+
+    /// 经 DoH 查 A/AAAA：hickory 出错或超时再用 DoH GET。返回排好序的地址和缓存时长，不写缓存
+    async fn doh_lookup_ip(&self, domain: &str) -> Result<(Vec<IpAddr>, Duration)> {
         if self.force_doh_get_ip {
-            let result = self.lookup_ip_via_doh_get(domain).await;
-            let mut inflight = self.ip_inflight.lock().await;
-            inflight.remove(domain);
-            notify.notify_waiters();
-            return result;
+            return self.lookup_ip_via_doh_get(domain).await;
         }
 
         let start = std::time::Instant::now();
         let lookup =
             match tokio::time::timeout(self.resolve_timeout, self.resolver.lookup_ip(domain)).await
             {
-                Ok(result) => match result {
-                    Ok(lookup) => lookup,
-                    Err(e) => {
-                        warn!(
-                            "IP lookup failed for {}, falling back to DoH GET: {}",
-                            domain, e
-                        );
-                        let result = self.lookup_ip_via_doh_get(domain).await;
-                        let mut inflight = self.ip_inflight.lock().await;
-                        inflight.remove(domain);
-                        notify.notify_waiters();
-                        return result;
-                    }
-                },
+                Ok(Ok(lookup)) => lookup,
+                Ok(Err(e)) => {
+                    warn!(
+                        "IP lookup failed for {}, falling back to DoH GET: {}",
+                        domain, e
+                    );
+                    return self.lookup_ip_via_doh_get(domain).await;
+                }
                 Err(_) => {
                     warn!(
                         "IP lookup timed out for {}, falling back to DoH GET",
                         domain
                     );
-                    let result = self.lookup_ip_via_doh_get(domain).await;
-                    let mut inflight = self.ip_inflight.lock().await;
-                    inflight.remove(domain);
-                    notify.notify_waiters();
-                    return result;
+                    return self.lookup_ip_via_doh_get(domain).await;
                 }
             };
 
@@ -2181,19 +2294,13 @@ impl DnsResolver {
         // Sort by preference
         self.sort_addrs_by_preference(&mut addrs);
 
-        // Cache the result with DNS TTL
-        self.put_ip_cache(domain, addrs.clone(), Duration::from_secs(ttl_secs));
-
         debug!(
             "IP lookup succeeded for {} in {} ms (TTL: {}s)",
             domain,
             start.elapsed().as_millis(),
             ttl_secs,
         );
-        let mut inflight = self.ip_inflight.lock().await;
-        inflight.remove(domain);
-        notify.notify_waiters();
-        Ok(addrs)
+        Ok((addrs, Duration::from_secs(ttl_secs)))
     }
 
     fn sort_addrs_by_preference(&self, addrs: &mut [IpAddr]) {
@@ -2207,6 +2314,17 @@ impl DnsResolver {
     /// 用系统 DNS 解析（查表模式下表外域名的首选路径）
     async fn system_lookup_ip(&self, domain: &str) -> Result<Vec<IpAddr>> {
         let host = domain.trim_end_matches('.').to_string();
+        #[cfg(test)]
+        if let Some(addrs) = TEST_SYSTEM_DNS
+            .get()
+            .and_then(|stub| stub.read().get(&host).cloned())
+        {
+            return if addrs.is_empty() {
+                Err(DohProxyError::Dns(format!("System DNS failed for {}", domain)))
+            } else {
+                Ok(addrs)
+            };
+        }
         let resolved = tokio::time::timeout(self.resolve_timeout, lookup_host((host, 0)))
             .await
             .map_err(|_| DohProxyError::Timeout)?
@@ -2723,7 +2841,8 @@ impl DnsResolver {
         Ok(None)
     }
 
-    async fn lookup_ip_via_doh_get(&self, domain: &str) -> Result<Vec<IpAddr>> {
+    /// DoH GET 查 A/AAAA：返回排好序的地址和缓存时长，不写缓存（由解析链过检查后再写）
+    async fn lookup_ip_via_doh_get(&self, domain: &str) -> Result<(Vec<IpAddr>, Duration)> {
         let start = std::time::Instant::now();
         let mut addrs = Vec::new();
         let mut min_ttl = MAX_TTL_SECS as u32;
@@ -2770,7 +2889,6 @@ impl DnsResolver {
         }
 
         let ttl = Self::clamp_ttl(min_ttl);
-        self.put_ip_cache(domain, addrs.clone(), ttl);
 
         debug!(
             "IP DoH GET lookup succeeded for {} in {} ms (TTL: {}s)",
@@ -2778,7 +2896,7 @@ impl DnsResolver {
             start.elapsed().as_millis(),
             ttl.as_secs(),
         );
-        Ok(addrs)
+        Ok((addrs, ttl))
     }
 
     async fn doh_get_message_with(
@@ -2886,7 +3004,8 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    const FAKE_ANSWER: Ipv4Addr = Ipv4Addr::new(1, 2, 3, 4);
+    /// 落在 Cloudflare 网段：覆盖域名（linux.do）的 DoH 答案要过 CF 网段检查
+    const FAKE_ANSWER: Ipv4Addr = Ipv4Addr::new(104, 21, 0, 4);
 
     /// 读完整的 HTTP 请求：头部文本，以及按 content-length 读满的请求体
     async fn read_request(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
@@ -2949,20 +3068,32 @@ mod tests {
         Message::from_vec(&URL_SAFE_NO_PAD.decode(encoded).unwrap()).unwrap()
     }
 
-    /// A 查询回 1.2.3.4，其他类型回空应答
+    /// A 查询回 FAKE_ANSWER，其他类型回空应答
     async fn write_dns_answer(stream: &mut tokio::net::TcpStream, query: &Message) {
+        write_dns_answers(stream, query, &[IpAddr::V4(FAKE_ANSWER)]).await;
+    }
+
+    /// A 查询回 `answers` 里的 IPv4，AAAA 查询回其中的 IPv6，其他类型回空应答
+    async fn write_dns_answers(
+        stream: &mut tokio::net::TcpStream,
+        query: &Message,
+        answers: &[IpAddr],
+    ) {
         let question = query.queries()[0].clone();
         let mut response = Message::new();
         response
             .set_id(query.id())
             .set_message_type(MessageType::Response)
             .add_query(question.clone());
-        if question.query_type() == RecordType::A {
-            response.add_answer(Record::from_rdata(
-                question.name().clone(),
-                120,
-                RData::A(A(FAKE_ANSWER)),
-            ));
+        for ip in answers {
+            let rdata = match (question.query_type(), ip) {
+                (RecordType::A, IpAddr::V4(v4)) => RData::A(A(*v4)),
+                (RecordType::AAAA, IpAddr::V6(v6)) => {
+                    RData::AAAA(hickory_resolver::proto::rr::rdata::AAAA(*v6))
+                }
+                _ => continue,
+            };
+            response.add_answer(Record::from_rdata(question.name().clone(), 120, rdata));
         }
         let body = response.to_vec().unwrap();
         let head = format!(
@@ -2994,6 +3125,108 @@ mod tests {
             }
         });
         (port, seen)
+    }
+
+    /// 按 `answers` 作答的假 DoH 服务器（A 回其中的 IPv4、AAAA 回 IPv6）；返回端口和收到的每个请求头部
+    async fn spawn_fake_doh_answering(
+        answers: Vec<IpAddr>,
+    ) -> (u16, Arc<parking_lot::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen_by_server = seen.clone();
+        let answers = Arc::new(answers);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let seen = seen_by_server.clone();
+                let answers = answers.clone();
+                tokio::spawn(async move {
+                    let (head, body) = read_request(&mut stream).await;
+                    if !is_doh_request(&mut stream, &head).await {
+                        return;
+                    }
+                    seen.lock().push(head.clone());
+                    let query = query_message(&head, &body);
+                    write_dns_answers(&mut stream, &query, &answers).await;
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    /// 给系统 DNS 登记替身答案（空 = 解析失败）。按域名全局登记，各测试用自己的域名
+    fn stub_system_dns(host: &str, addrs: &[&str]) {
+        TEST_SYSTEM_DNS
+            .get_or_init(|| RwLock::new(HashMap::new()))
+            .write()
+            .insert(
+                host.to_string(),
+                addrs.iter().map(|ip| ip.parse().unwrap()).collect(),
+            );
+    }
+
+    fn ips(list: &[&str]) -> Vec<IpAddr> {
+        list.iter().map(|ip| ip.parse().unwrap()).collect()
+    }
+
+    /// 覆盖域名：DoH 只给出 CF 网段外的地址（Facebook 段）当没命中，落到系统 DNS；
+    /// 假地址不进缓存
+    #[tokio::test]
+    async fn covered_host_poisoned_doh_falls_through_to_system_dns() {
+        let host = "poison-doh.linux.do";
+        let (port, seen) = spawn_fake_doh_answering(ips(&["31.13.94.36", "2a03:2880::1"])).await;
+        stub_system_dns(host, &["172.67.0.7"]);
+        let resolver = resolver_with(unresolvable_upstream(port)).await;
+
+        let addrs = resolver.lookup_ip(host).await.unwrap();
+        assert_eq!(addrs, ips(&["172.67.0.7"]));
+        assert!(!seen.lock().is_empty(), "DoH 应先被问过");
+        // 缓存里是系统 DNS 的 CF 地址，不是 DoH 的假地址
+        assert_eq!(resolver.lookup_ip(host).await.unwrap(), ips(&["172.67.0.7"]));
+    }
+
+    /// 覆盖域名：混合答案只留 CF 网段内的地址，不再问系统 DNS
+    #[tokio::test]
+    async fn covered_host_mixed_answer_keeps_only_cloudflare() {
+        let host = "mixed-answer.linux.do";
+        let (port, _) =
+            spawn_fake_doh_answering(ips(&["31.13.94.36", "104.21.0.8", "2606:4700::8"])).await;
+        stub_system_dns(host, &["172.67.0.9"]);
+        let resolver = resolver_with(unresolvable_upstream(port)).await;
+
+        let addrs = resolver.lookup_ip(host).await.unwrap();
+        assert_eq!(addrs, ips(&["104.21.0.8", "2606:4700::8"]));
+    }
+
+    /// 覆盖域名：DoH 和系统 DNS 都只给出 CF 网段外的地址：不返回任何地址、按投毒报错，也不写缓存
+    #[tokio::test]
+    async fn covered_host_all_poisoned_fails_fast() {
+        let host = "all-poisoned.linux.do";
+        let (port, seen) = spawn_fake_doh_answering(ips(&["31.13.94.36"])).await;
+        stub_system_dns(host, &["108.160.166.9"]);
+        let resolver = resolver_with(unresolvable_upstream(port)).await;
+
+        let error = resolver.lookup_ip(host).await.unwrap_err();
+        assert!(error.to_string().contains("poisoned"), "{}", error);
+        assert!(!seen.lock().is_empty());
+        assert!(resolver.ip_cache.read().get(host).is_none());
+
+        // 系统 DNS 解析失败、DoH 给假地址：同样按投毒失败
+        let host = "poisoned-no-system.linux.do";
+        stub_system_dns(host, &[]);
+        let error = resolver.lookup_ip(host).await.unwrap_err();
+        assert!(error.to_string().contains("poisoned"), "{}", error);
+    }
+
+    /// 非覆盖域名不做 CF 网段检查：DoH 给什么用什么，也不追加系统 DNS
+    #[tokio::test]
+    async fn non_covered_host_answers_are_untouched() {
+        let host = "not-covered.example";
+        let (port, _) = spawn_fake_doh_answering(ips(&["31.13.94.36"])).await;
+        stub_system_dns(host, &["172.67.0.10"]);
+        let resolver = resolver_with(unresolvable_upstream(port)).await;
+
+        assert_eq!(resolver.lookup_ip(host).await.unwrap(), ips(&["31.13.94.36"]));
     }
 
     /// 只支持 GET 的假 DoH 服务器：POST 一律回 405；返回端口和收到的每个请求头部

@@ -98,7 +98,8 @@ impl DohTlsConnector {
     ///
     /// 无上游代理时优先用 DoH 解析目标 IP（不经系统 DNS），按 EdgePin 排好的顺序逐个连接，
     /// 和 TLS 主路径同一套钉选：覆盖域名有赢家时先连赢家，其余先亲和族；结果回报给 EdgePin。
-    /// 无 DoH resolver（enable_doh=false）或解析失败时回退系统 DNS。
+    /// 无 DoH resolver（enable_doh=false）或解析失败时回退系统 DNS（覆盖域名除外：
+    /// 它们的系统 DNS 兜底在 lookup_ip 里、过了 CF 网段检查）。
     /// CF 验证域名（challenges.cloudflare.com）以隧道方式直连时走此路径：
     /// 既保证与真 CF 端到端 TLS，又不把域名泄漏给系统 DNS。
     pub async fn connect_tcp(&self, host: &str, port: u16) -> Result<BoxStream> {
@@ -128,6 +129,11 @@ impl DohTlsConnector {
                     let route = edge.route(host, addrs);
                     return self.connect_tcp_route(host, port, edge, &route).await;
                 }
+                // 覆盖域名的系统 DNS 兜底和 CF 网段检查已在 lookup_ip 里做完：不再按域名直连
+                Ok(_) if EdgePin::is_covered(host) => {
+                    return Err(DohProxyError::Dns(format!("No IP found for {}", host)));
+                }
+                Err(e) if EdgePin::is_covered(host) => return Err(e),
                 Ok(_) => warn!(
                     "DoH returned no IP for {}, falling back to system DNS",
                     host
@@ -481,9 +487,14 @@ impl DohTlsConnector {
             }
         }
 
-        // 3. 使用 IP 列表连接；DoH 查不到时回退系统 DNS，不让请求直接失败
+        // 3. 使用 IP 列表连接；DoH 查不到时回退系统 DNS，不让请求直接失败。
+        //    覆盖域名的系统 DNS 兜底和 CF 网段检查已在 lookup_ip 里做完，这里再查只会拿回假地址
         let addrs = match ip_result {
             Ok(addrs) if !addrs.is_empty() => addrs,
+            Ok(_) if EdgePin::is_covered(host) => {
+                return Err(DohProxyError::Dns(format!("No IP found for {}", host)));
+            }
+            Err(e) if EdgePin::is_covered(host) => return Err(e),
             Ok(_) => {
                 warn!(
                     "DoH returned no IP for {}, falling back to system DNS",
