@@ -1821,11 +1821,17 @@ impl Selector {
         }
         set.abort_all();
 
-        // 先按配置的地址族偏好，再按延迟：赢家族与 ech.rs 的地址族亲和保持一致
+        // 先按地址族，再按延迟。地址族优先沿用连接层当前的亲和（已经用它铸过 cf_clearance），
+        // 没有亲和才看配置偏好：重新优选不能把整个 App 翻到另一个出口 IP 上
+        let prefer_ipv6 = self
+            .resolver
+            .as_ref()
+            .and_then(|resolver| resolver.family_affinity())
+            .unwrap_or(self.prefer_ipv6);
         let Some((best, outcome)) = passes
             .iter()
             .min_by_key(|(candidate, outcome)| {
-                (candidate.ip.is_ipv6() != self.prefer_ipv6, outcome.latency)
+                (candidate.ip.is_ipv6() != prefer_ipv6, outcome.latency)
             })
             .cloned()
         else {
@@ -2191,6 +2197,15 @@ mod tests {
 
     /// 用假探测构造一个 selector；`f(ip, key_bytes)` 决定结果
     fn fake_selector(mode: SelectMode, state: SelectState, f: ProbeFn) -> Arc<Selector> {
+        fake_selector_with(mode, state, f, None)
+    }
+
+    fn fake_selector_with(
+        mode: SelectMode,
+        state: SelectState,
+        f: ProbeFn,
+        resolver: Option<Arc<DnsResolver>>,
+    ) -> Arc<Selector> {
         let roots = RootCertStore::empty();
         let provider = Arc::new(crate::tls_crypto::build_provider());
         Selector::build(
@@ -2207,7 +2222,7 @@ mod tests {
                 path: "/api/v1/probe/report".to_string(),
                 version: "cfluxdo/test".to_string(),
             }),
-            None,
+            resolver,
             Prober::Fake(f),
         )
     }
@@ -2289,6 +2304,58 @@ mod tests {
         // 状态已推给 App
         let update = DnsResolver::take_accel_update();
         assert!(update.is_some_and(|u| u.select_state.is_some()));
+    }
+
+    #[tokio::test]
+    async fn winner_follows_connection_family_affinity() {
+        // 连接层已把亲和定在 IPv6：即使 v4 候选更快，赢家也要选 v6，否则整个 App 会翻到另一个出口 IP
+        let resolver = Arc::new(
+            DnsResolver::with_resolver_config(
+                hickory_resolver::config::ResolverConfig::new(),
+                false,
+            )
+            .await
+            .unwrap(),
+        );
+        resolver.record_family_affinity(ip("2606:4700::1"), true);
+        let selector = fake_selector_with(
+            SelectMode::LocalAtlas,
+            state_with_key(1),
+            Arc::new(|ip, _| {
+                if ip.is_ipv4() {
+                    outcome(ip, true, 10, None)
+                } else {
+                    outcome(ip, true, 60, None)
+                }
+            }),
+            Some(resolver),
+        );
+        selector
+            .race_candidates(
+                candidates(&["104.21.0.1", "2606:4700::6810:1", "104.21.0.2"]),
+                selector.key_pool(),
+            )
+            .await;
+        assert_eq!(selector.winner_ip(), Some(ip("2606:4700::6810:1")));
+        // 没有亲和时按配置偏好（这里是 v4）
+        let selector = fake_selector(
+            SelectMode::LocalAtlas,
+            state_with_key(1),
+            Arc::new(|ip, _| {
+                if ip.is_ipv4() {
+                    outcome(ip, true, 60, None)
+                } else {
+                    outcome(ip, true, 10, None)
+                }
+            }),
+        );
+        selector
+            .race_candidates(
+                candidates(&["104.21.0.1", "2606:4700::6810:1"]),
+                selector.key_pool(),
+            )
+            .await;
+        assert_eq!(selector.winner_ip(), Some(ip("104.21.0.1")));
     }
 
     #[tokio::test]

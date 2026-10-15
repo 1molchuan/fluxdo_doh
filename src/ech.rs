@@ -363,10 +363,13 @@ impl DohTlsConnector {
         //    preferred_host_ip 已按地址族亲和过滤：亲和切换前记下的另一族粘性 IP 不会再用
         let selector = Self::selector_for_host(host);
         let winner_ip = selector.as_ref().and_then(|s| s.winner_ip());
-        // 优选有赢家时粘性 IP 必须就是赢家，否则走地址列表（lookup 已把赢家放在首位）
-        let sticky = dns_resolver
-            .preferred_host_ip(host)
-            .filter(|ip| winner_ip.is_none_or(|winner| winner == *ip));
+        // 优选有赢家：所有覆盖域名一律先连赢家，不看各自的粘性 IP 和当前地址族亲和。
+        // cf_clearance 绑定出口 IP，双栈下 v4/v6 出口是两个地址，linux.do 与其子域
+        // 必须是同一个边缘 IP、同一个地址族，否则必撞盾
+        let sticky = match winner_ip {
+            Some(winner) => Some(winner),
+            None => dns_resolver.preferred_host_ip(host),
+        };
         #[allow(unused_mut)]
         let mut connector = connector;
         if let Some(cached_addr) = sticky {
@@ -394,7 +397,8 @@ impl DohTlsConnector {
                     }
                     dns_resolver.record_host_success(host, socket_addr.ip());
                     dns_resolver.record_ip_rtt(socket_addr.ip(), start.elapsed());
-                    dns_resolver.record_family_affinity(socket_addr.ip(), false);
+                    // 赢家连通即把亲和强制定到赢家的地址族，后续所有域名跟着走
+                    dns_resolver.record_family_affinity(socket_addr.ip(), winner_ip.is_some());
                     #[cfg(feature = "ech")]
                     {
                         let (_, conn) = stream.get_ref();
