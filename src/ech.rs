@@ -120,7 +120,7 @@ impl DohTlsConnector {
             return Ok(Box::new(stream));
         }
 
-        // 优先 DoH 解析（不走系统 DNS），按 RTT 排序后逐个尝试
+        // 优先 DoH 解析（不走系统 DNS），按 EdgePin 的计划逐个尝试
         if let Some(resolver) = self.dns_resolver.as_ref() {
             match resolver.lookup_ip(host).await {
                 Ok(addrs) if !addrs.is_empty() => {
