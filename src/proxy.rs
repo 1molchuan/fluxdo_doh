@@ -162,6 +162,11 @@ impl DohProxyServer {
         })
     }
 
+    /// MITM 证书管理器（DoH 关闭时为 None）。Linux 的 WebView 要按主机预先放行它签发的叶子证书
+    pub fn cert_manager(&self) -> Option<&Arc<CertManager>> {
+        self.cert_manager.as_ref()
+    }
+
     /// Get the local address the server is bound to
     pub fn local_addr(&self) -> Option<SocketAddr> {
         *self.local_addr.read()
@@ -207,6 +212,7 @@ impl DohProxyServer {
         info!("Local proxy server listening on {}", local_addr);
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let mitm_scope: Arc<[String]> = self.config.mitm_hosts.clone().into();
 
         loop {
             tokio::select! {
@@ -219,6 +225,7 @@ impl DohProxyServer {
                             let gateway_mode = self.config.gateway_mode;
                             let mitm_connect = self.config.mitm_connect;
                             let h2_mitm = self.config.h2_mitm;
+                            let mitm_scope = mitm_scope.clone();
                             let doh_tls_connector = self.doh_tls_connector.clone();
                             let cert_manager = self.cert_manager.clone();
 
@@ -233,6 +240,7 @@ impl DohProxyServer {
                                         cert_manager,
                                         mitm_connect,
                                         h2_mitm,
+                                        mitm_scope,
                                     ).await {
                                         debug!("Gateway connection error from {}: {}", peer_addr, e);
                                     }
@@ -242,6 +250,7 @@ impl DohProxyServer {
                                     doh_tls_connector,
                                     cert_manager,
                                     h2_mitm,
+                                    mitm_scope,
                                 ).await {
                                     warn!("Connection error from {}: {}", peer_addr, e);
                                 }
@@ -276,6 +285,7 @@ async fn handle_connection(
     doh_tls_connector: Arc<DohTlsConnector>,
     cert_manager: Option<Arc<CertManager>>,
     h2_mitm: bool,
+    mitm_scope: Arc<[String]>,
 ) -> Result<()> {
     let (read_half, write_half) = client.into_split();
     let mut reader = BufReader::new(read_half);
@@ -296,7 +306,9 @@ async fn handle_connection(
         // CF 验证域名（challenges.cloudflare.com）不做 MITM：改走隧道让 WebView
         // 与真 CF 端到端 TLS，否则 Turnstile 会识破中间人而拒绝人机验证。
         let (connect_host, _) = parse_host_port(&target).unwrap_or_default();
-        let use_mitm = enable_doh && !is_cf_challenge_host(&connect_host);
+        let use_mitm = enable_doh
+            && !is_cf_challenge_host(&connect_host)
+            && in_mitm_scope(&mitm_scope, &connect_host);
         if use_mitm {
             let cert_manager = cert_manager.ok_or_else(|| {
                 DohProxyError::Proxy("MITM mode requires certificate manager".to_string())
@@ -504,6 +516,7 @@ async fn handle_gateway_connection(
     cert_manager: Option<Arc<CertManager>>,
     mitm_connect: bool,
     h2_mitm: bool,
+    mitm_scope: Arc<[String]>,
 ) -> Result<()> {
     let io = TokioIo::new(stream);
     let pool: GatewayPool = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
@@ -512,15 +525,17 @@ async fn handle_gateway_connection(
         let connector = connector.clone();
         let cert_manager = cert_manager.clone();
         let pool = pool.clone();
+        let mitm_scope = mitm_scope.clone();
         async move {
             if req.method() == hyper::Method::CONNECT {
-                // CF 验证域名强制走隧道（端到端真 TLS），其余按 mitm_connect 配置。
-                let is_cf = req
+                // CF 验证域名强制走隧道（端到端真 TLS），MITM 范围外的主机也走隧道，
+                // 其余按 mitm_connect 配置。
+                let use_mitm = req
                     .uri()
                     .authority()
-                    .map(|a| is_cf_challenge_host(a.host()))
+                    .map(|a| !is_cf_challenge_host(a.host()) && in_mitm_scope(&mitm_scope, a.host()))
                     .unwrap_or(false);
-                if mitm_connect && !is_cf {
+                if mitm_connect && use_mitm {
                     gateway_handle_connect(req, connector, cert_manager, h2_mitm).await
                 } else {
                     gateway_handle_connect_tunnel(req, connector).await
@@ -928,6 +943,21 @@ fn gateway_parse_host(host_header: &str) -> Option<(String, u16)> {
 /// 网络下代理这边直接报 `No addresses` 把连接掐断，WebView 记到
 /// `ERR_CONNECTION_RESET`。所以整个 `*.challenges.cloudflare.com` 都走隧道，
 /// 让浏览器自己和真 CF 握手，成功与否交给挑战平台按正常浏览器的行为判定。
+/// 主机是否在 MITM 范围内：范围为空表示不限；否则按后缀匹配（`linux.do` 覆盖 `a.linux.do`）
+fn in_mitm_scope(scope: &[String], host: &str) -> bool {
+    if scope.is_empty() {
+        return true;
+    }
+    let host = host.trim_end_matches('.');
+    scope.iter().any(|suffix| {
+        let suffix = suffix.trim_start_matches('.');
+        host.eq_ignore_ascii_case(suffix)
+            || (host.len() > suffix.len() + 1
+                && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+                && host[host.len() - suffix.len()..].eq_ignore_ascii_case(suffix))
+    })
+}
+
 fn is_cf_challenge_host(host: &str) -> bool {
     const CF_CHALLENGE_DOMAIN: &str = "challenges.cloudflare.com";
     let host = host.trim_end_matches('.');
@@ -1018,7 +1048,24 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_cf_challenge_host;
+    use super::{in_mitm_scope, is_cf_challenge_host};
+
+    /// MITM 范围为空 = 不限；有值时按后缀匹配，同名前缀的伪装域不算
+    #[test]
+    fn mitm_scope_matches_suffix_only() {
+        assert!(in_mitm_scope(&[], "example.com"));
+        let scope = vec!["linux.do".to_string()];
+        assert!(in_mitm_scope(&scope, "linux.do"));
+        assert!(in_mitm_scope(&scope, "LINUX.DO."));
+        assert!(in_mitm_scope(&scope, "cdn.linux.do"));
+        assert!(in_mitm_scope(&scope, "x.cdn.linux.do"));
+        assert!(!in_mitm_scope(&scope, "notlinux.do"));
+        assert!(!in_mitm_scope(&scope, "linux.do.evil.test"));
+        assert!(!in_mitm_scope(&scope, "github.com"));
+        assert!(!in_mitm_scope(&scope, ""));
+        let dotted = vec![".linux.do".to_string()];
+        assert!(in_mitm_scope(&dotted, "linux.do"));
+    }
 
     /// 挑战平台的主域和所有子域都必须走隧道，其余域名（含同名前缀的伪装域）不算
     #[test]

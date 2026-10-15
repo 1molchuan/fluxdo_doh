@@ -732,6 +732,33 @@ pub extern "C" fn doh_proxy_dns_cache_stats() -> *mut c_char {
     }
 }
 
+/// 当前代理为 `host` 签发（或将要签发）的 MITM 叶子证书 PEM。
+/// 返回 JSON：{"ok":true,"pem":"..."} 或 {"ok":false,"error":"..."}；
+/// Linux 的 WPE WebView 用它逐主机精确放行，代理重启后叶子会变，要重新取。
+/// The caller must free the returned string with doh_proxy_free_string.
+#[no_mangle]
+pub extern "C" fn doh_proxy_mitm_leaf_pem(host: *const c_char) -> *mut c_char {
+    if host.is_null() {
+        return error_json("host is null");
+    }
+    let host = match unsafe { CStr::from_ptr(host) }.to_str() {
+        Ok(h) if !h.trim().is_empty() => h.trim().to_ascii_lowercase(),
+        _ => return error_json("invalid host"),
+    };
+    let rt = get_runtime();
+    let cert_manager = rt.block_on(async {
+        let guard = get_server_holder().read().await;
+        guard.as_ref().and_then(|server| server.cert_manager().cloned())
+    });
+    let Some(cert_manager) = cert_manager else {
+        return error_json("proxy not running or MITM disabled");
+    };
+    match cert_manager.leaf_cert_pem(&host) {
+        Ok(pem) => json_to_c_string(serde_json::json!({ "ok": true, "pem": pem })),
+        Err(e) => error_json(&format!("{}", e)),
+    }
+}
+
 /// Return shared DNS resolver cache records.
 /// The caller must free the returned string with doh_proxy_free_string.
 #[no_mangle]

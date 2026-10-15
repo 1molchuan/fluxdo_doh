@@ -189,6 +189,11 @@ pub struct ProxyConfig {
     /// 关闭则保持裸字节拷贝（锁 http/1.1）。默认关闭，需实测 CF 指纹后再开。
     #[serde(default)]
     pub h2_mitm: bool,
+    /// WebView 的 CONNECT 里哪些主机做 MITM（后缀匹配：`linux.do` 同时覆盖 `*.linux.do`）。
+    /// 空 = 除 CF 验证域名外全部 MITM（Android 现状）。Linux 的 WPE 只能逐主机放行代理签发的
+    /// 叶子证书，所以只把必须走 ECH 的主机纳入 MITM，其余走隧道、由系统证书库端到端校验
+    #[serde(default)]
+    pub mitm_hosts: Vec<String>,
     /// Optional runtime CA certificate PEM (per-device CA for iOS)
     #[serde(default)]
     pub ca_cert_pem: Option<String>,
@@ -256,6 +261,7 @@ impl Default for ProxyConfig {
             gateway_mode: false,
             mitm_connect: true,
             h2_mitm: false,
+            mitm_hosts: Vec::new(),
             ca_cert_pem: None,
             ca_key_pem: None,
             doh_routes_url: None,

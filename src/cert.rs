@@ -35,8 +35,8 @@ pub struct CertManager {
     leaf_key_der: Vec<u8>,
     /// 是否在叶子证书 ALPN 中提供 h2（启用 h2 MITM 时为 true）
     h2_mitm: bool,
-    /// Cache of generated certificates
-    cert_cache: RwLock<HashMap<String, Arc<ServerConfig>>>,
+    /// Cache of generated certificates（连同叶子证书 DER：同一主机在本实例内永远是同一张叶子）
+    cert_cache: RwLock<HashMap<String, (Arc<ServerConfig>, CertificateDer<'static>)>>,
     /// Crypto provider for rustls
     crypto_provider: Arc<rustls::crypto::CryptoProvider>,
 }
@@ -83,31 +83,43 @@ impl CertManager {
 
     /// Get or create a server config for the given hostname
     pub fn get_server_config(&self, hostname: &str) -> Result<Arc<ServerConfig>> {
+        Ok(self.get_or_issue(hostname)?.0)
+    }
+
+    /// 本实例给 `hostname` 签发（或将要签发）的叶子证书 PEM。WebView 拿它逐主机精确放行，
+    /// 不是信任整个 CA
+    pub fn leaf_cert_pem(&self, hostname: &str) -> Result<String> {
+        let (_, leaf) = self.get_or_issue(hostname)?;
+        Ok(pem::encode(&pem::Pem::new("CERTIFICATE", leaf.to_vec())))
+    }
+
+    fn get_or_issue(&self, hostname: &str) -> Result<(Arc<ServerConfig>, CertificateDer<'static>)> {
         // Check cache first
         {
             let cache = self.cert_cache.read();
-            if let Some(config) = cache.get(hostname) {
+            if let Some(entry) = cache.get(hostname) {
                 debug!("Using cached certificate for {}", hostname);
-                return Ok(config.clone());
+                return Ok(entry.clone());
             }
         }
 
-        // Generate new certificate
-        debug!("Generating certificate for {}", hostname);
-        let config = self.generate_cert_config(hostname)?;
-        let config = Arc::new(config);
-
-        // Cache it
-        {
-            let mut cache = self.cert_cache.write();
-            cache.insert(hostname.to_string(), config.clone());
+        // 写锁内再查一次再签：并发首次握手时两边各签一张会让先拿到的那张作废
+        let mut cache = self.cert_cache.write();
+        if let Some(entry) = cache.get(hostname) {
+            return Ok(entry.clone());
         }
-
-        Ok(config)
+        debug!("Generating certificate for {}", hostname);
+        let (config, leaf) = self.generate_cert_config(hostname)?;
+        let entry = (Arc::new(config), leaf);
+        cache.insert(hostname.to_string(), entry.clone());
+        Ok(entry)
     }
 
     /// Generate a certificate for the given hostname
-    fn generate_cert_config(&self, hostname: &str) -> Result<ServerConfig> {
+    fn generate_cert_config(
+        &self,
+        hostname: &str,
+    ) -> Result<(ServerConfig, CertificateDer<'static>)> {
         // Create certificate parameters
         let mut params = CertificateParams::default();
 
@@ -146,7 +158,7 @@ impl CertManager {
             .with_safe_default_protocol_versions()
             .map_err(DohProxyError::Tls)?
             .with_no_client_auth()
-            .with_single_cert(vec![cert_der, self.ca_cert_der.clone()], key_der)
+            .with_single_cert(vec![cert_der.clone(), self.ca_cert_der.clone()], key_der)
             .map_err(|e| DohProxyError::Certificate(format!("Failed to build config: {}", e)))?;
 
         // ALPN：h2 MITM 开启时提供 h2，让 client 可协商 HTTP/2 多路复用；
@@ -157,7 +169,7 @@ impl CertManager {
             vec![b"http/1.1".to_vec()]
         };
 
-        Ok(config)
+        Ok((config, cert_der))
     }
 
     /// 从运行时 PEM 创建 CertManager（用于 per-device CA）
@@ -240,5 +252,32 @@ impl CertManager {
     /// 获取编译时嵌入的 CA 证书 PEM（静态方法，无需实例）
     pub fn get_embedded_ca_pem() -> &'static str {
         CA_CERT_PEM
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CertManager;
+
+    /// 同一实例对同一主机永远给同一张叶子（WebView 精确放行依赖这一点），不同主机各不相同，
+    /// 且导出的叶子就是握手时实际下发的那张
+    #[test]
+    fn leaf_is_stable_per_host_and_matches_server_config() {
+        let (cert, key) = CertManager::generate_ca_pem().unwrap();
+        let cm = CertManager::from_pem(&cert, &key, false).unwrap();
+        let a1 = cm.leaf_cert_pem("linux.do").unwrap();
+        let a2 = cm.leaf_cert_pem("linux.do").unwrap();
+        let b = cm.leaf_cert_pem("cdn.linux.do").unwrap();
+        assert_eq!(a1, a2);
+        assert_ne!(a1, b);
+        assert!(a1.starts_with("-----BEGIN CERTIFICATE-----"));
+        // 先取 ServerConfig 再导出，也必须是同一张
+        let _ = cm.get_server_config("connect.linux.do").unwrap();
+        let c1 = cm.leaf_cert_pem("connect.linux.do").unwrap();
+        let c2 = cm.leaf_cert_pem("connect.linux.do").unwrap();
+        assert_eq!(c1, c2);
+        // 另一个实例（代理重启）会换叶子
+        let cm2 = CertManager::from_pem(&cert, &key, false).unwrap();
+        assert_ne!(cm2.leaf_cert_pem("linux.do").unwrap(), a1);
     }
 }
