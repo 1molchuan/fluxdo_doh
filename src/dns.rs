@@ -1061,6 +1061,21 @@ impl DnsResolver {
         )
     }
 
+    /// 不含上游代理的 DoH 配置 key（ECH 服务器与 DNS 相同时视为未指定，与 [`Self::shared`] 一致）。
+    /// FFI 拿不到上游代理配置，只能用它判断参数是不是运行中代理那套 DoH 配置
+    pub(crate) fn doh_config_key(
+        doh_url: &str,
+        doh_url_ech: Option<&str>,
+        prefer_ipv6: bool,
+    ) -> String {
+        Self::shared_cache_key(
+            doh_url,
+            doh_url_ech.filter(|value| *value != doh_url),
+            prefer_ipv6,
+            None,
+        )
+    }
+
     fn bootstrap_registry() -> &'static RwLock<HashMap<String, Vec<IpAddr>>> {
         DOH_BOOTSTRAP_IPS.get_or_init(|| RwLock::new(HashMap::new()))
     }

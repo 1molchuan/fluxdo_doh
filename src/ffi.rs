@@ -40,6 +40,24 @@ fn parse_required_string(
     }
 }
 
+/// FFI 用的 resolver：代理在跑且参数就是它那套 DoH 配置时，用代理建连的那个（带上游代理、
+/// 同一份 EdgePin）；否则按参数取共享 resolver（不带上游代理）
+async fn ffi_resolver(
+    doh_url: &str,
+    doh_url_ech: Option<&str>,
+    prefer_ipv6: bool,
+) -> crate::error::Result<Arc<crate::dns::DnsResolver>> {
+    let running = get_server_holder()
+        .read()
+        .await
+        .as_ref()
+        .and_then(|server| server.resolver_for(doh_url, doh_url_ech, prefer_ipv6));
+    match running {
+        Some(resolver) => Ok(resolver),
+        None => crate::dns::DnsResolver::shared(doh_url, doh_url_ech, prefer_ipv6, None).await,
+    }
+}
+
 fn parse_optional_string(ptr: *const c_char) -> Option<String> {
     if ptr.is_null() {
         return None;
@@ -240,8 +258,7 @@ pub extern "C" fn doh_proxy_lookup_ech_config(
 
     let rt = get_runtime();
     let result = rt.block_on(async {
-        let resolver =
-            crate::dns::DnsResolver::shared(&doh_url, Some(&doh_url), false, None).await?;
+        let resolver = ffi_resolver(&doh_url, Some(&doh_url), false).await?;
         resolver.lookup_ech_config(&host_str).await
     });
 
@@ -280,9 +297,7 @@ pub extern "C" fn doh_proxy_lookup_ip(
 
     let rt = get_runtime();
     let result = rt.block_on(async {
-        let resolver =
-            crate::dns::DnsResolver::shared(&doh_url, Some(&doh_url), prefer_ipv6 != 0, None)
-                .await?;
+        let resolver = ffi_resolver(&doh_url, Some(&doh_url), prefer_ipv6 != 0).await?;
         let addrs = resolver.lookup_ip(&host_str).await?;
         Ok::<_, crate::error::DohProxyError>(
             resolver.edge_pin().route(&host_str, addrs).app_addrs(),
@@ -337,13 +352,8 @@ pub extern "C" fn doh_proxy_lookup_host(
     let rt = get_runtime();
     let result = rt.block_on(async {
         let effective_doh_url_ech = doh_url_ech.as_deref().unwrap_or(doh_url.as_str());
-        let resolver = crate::dns::DnsResolver::shared(
-            &doh_url,
-            Some(effective_doh_url_ech),
-            prefer_ipv6 != 0,
-            None,
-        )
-        .await?;
+        let resolver =
+            ffi_resolver(&doh_url, Some(effective_doh_url_ech), prefer_ipv6 != 0).await?;
         resolver.lookup_host(&host_str, force_refresh != 0).await
     });
 
@@ -417,13 +427,8 @@ pub extern "C" fn doh_proxy_record_host_success(
     let rt = get_runtime();
     let result = rt.block_on(async {
         let effective_doh_url_ech = doh_url_ech.as_deref().unwrap_or(doh_url.as_str());
-        let resolver = crate::dns::DnsResolver::shared(
-            &doh_url,
-            Some(effective_doh_url_ech),
-            prefer_ipv6 != 0,
-            None,
-        )
-        .await?;
+        let resolver =
+            ffi_resolver(&doh_url, Some(effective_doh_url_ech), prefer_ipv6 != 0).await?;
         resolver.edge_pin().report(
             &host_str,
             ip_addr,
@@ -484,13 +489,8 @@ pub extern "C" fn doh_proxy_report_host_failure(
     let rt = get_runtime();
     let result = rt.block_on(async {
         let effective_doh_url_ech = doh_url_ech.as_deref().unwrap_or(doh_url.as_str());
-        let resolver = crate::dns::DnsResolver::shared(
-            &doh_url,
-            Some(effective_doh_url_ech),
-            prefer_ipv6 != 0,
-            None,
-        )
-        .await?;
+        let resolver =
+            ffi_resolver(&doh_url, Some(effective_doh_url_ech), prefer_ipv6 != 0).await?;
         resolver
             .edge_pin()
             .report(&host_str, ip_addr, crate::edge_pin::Outcome::Failed);
@@ -530,13 +530,8 @@ pub extern "C" fn doh_proxy_clear_preferred_host_ip(
     let rt = get_runtime();
     let result = rt.block_on(async {
         let effective_doh_url_ech = doh_url_ech.as_deref().unwrap_or(doh_url.as_str());
-        let resolver = crate::dns::DnsResolver::shared(
-            &doh_url,
-            Some(effective_doh_url_ech),
-            prefer_ipv6 != 0,
-            None,
-        )
-        .await?;
+        let resolver =
+            ffi_resolver(&doh_url, Some(effective_doh_url_ech), prefer_ipv6 != 0).await?;
         resolver.edge_pin().forget_host(&host_str);
         Ok::<(), crate::error::DohProxyError>(())
     });
@@ -869,5 +864,87 @@ pub extern "C" fn doh_proxy_init_logging() {
                     .add_directive("doh_proxy=info".parse().unwrap_or_default()),
             )
             .try_init();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    /// 配了上游代理时，代理的 resolver key 带上游代理，FFI 按参数重建的 key 不带：以前 App 回报的
+    /// 成功 / 失败记到了另一个 resolver 上，代理看不到。现在要落到运行中代理建连用的那份 EdgePin
+    #[test]
+    fn ffi_reports_reach_running_proxy_state_with_upstream() {
+        // DoH 地址用 IP 字面量（不查系统 DNS），主机名别和其他测试的 127.0.0.1 撞上
+        let doh = "https://127.0.0.2:9/dns-query";
+        let config = CString::new(
+            serde_json::json!({
+                "bind_addr": "127.0.0.1",
+                "bind_port": 0,
+                "doh_server": doh,
+                "prefer_ipv6": false,
+                "timeout_secs": 5,
+                "upstream_proxy": {"protocol": "http", "host": "127.0.0.1", "port": 9},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(doh_proxy_start_with_config_json(config.as_ptr()) > 0);
+        let running = get_runtime()
+            .block_on(async {
+                get_server_holder()
+                    .read()
+                    .await
+                    .as_ref()
+                    .and_then(|server| server.resolver_for(doh, None, false))
+            })
+            .expect("running proxy resolver");
+
+        // 参数和 Dart 一样：ECH 服务器没单独设时传 DNS 服务器本身
+        let host = CString::new("cdk.linux.do").unwrap();
+        let doh_c = CString::new(doh).unwrap();
+        let ip = CString::new("104.21.0.5").unwrap();
+        let record = doh_proxy_record_host_success(
+            host.as_ptr(),
+            doh_c.as_ptr(),
+            doh_c.as_ptr(),
+            0,
+            ip.as_ptr(),
+        );
+        assert_eq!(record, 1);
+        let edge = running.edge_pin();
+        assert_eq!(edge.sticky("cdk.linux.do"), "104.21.0.5".parse().ok());
+        assert_eq!(edge.affinity(), Some(false));
+
+        // 按参数重建的那个（不带上游代理）是另一个 resolver，什么也没收到
+        let keyed = get_runtime()
+            .block_on(crate::dns::DnsResolver::shared(doh, Some(doh), false, None))
+            .unwrap();
+        assert!(!Arc::ptr_eq(&keyed, &running));
+        assert_eq!(keyed.edge_pin().sticky("cdk.linux.do"), None);
+
+        let failure = doh_proxy_report_host_failure(
+            host.as_ptr(),
+            doh_c.as_ptr(),
+            doh_c.as_ptr(),
+            0,
+            ip.as_ptr(),
+        );
+        assert_eq!(failure, 1);
+        assert_eq!(edge.sticky("cdk.linux.do"), None);
+
+        // 地址族偏好不一致不是同一套配置：不碰运行中代理的状态
+        let other = doh_proxy_record_host_success(
+            host.as_ptr(),
+            doh_c.as_ptr(),
+            doh_c.as_ptr(),
+            1,
+            ip.as_ptr(),
+        );
+        assert_eq!(other, 1);
+        assert_eq!(edge.sticky("cdk.linux.do"), None);
+
+        doh_proxy_stop();
     }
 }

@@ -34,6 +34,8 @@ use tracing::{debug, error, info, warn};
 pub struct DohProxyServer {
     #[allow(dead_code)]
     config: ProxyConfig,
+    /// 本代理 DoH 配置的 key（不含上游代理），DoH 关闭时为 None
+    doh_config_key: Option<String>,
     doh_tls_connector: Arc<DohTlsConnector>,
     cert_manager: Option<Arc<CertManager>>,
     local_addr: Arc<RwLock<Option<SocketAddr>>>,
@@ -142,9 +144,17 @@ impl DohProxyServer {
             None
         };
         let (shutdown_tx, _) = broadcast::channel(1);
+        let doh_config_key = config.enable_doh.then(|| {
+            DnsResolver::doh_config_key(
+                &config.doh_server,
+                config.doh_server_ech.as_deref(),
+                config.prefer_ipv6,
+            )
+        });
 
         Ok(Self {
             config,
+            doh_config_key,
             doh_tls_connector,
             cert_manager,
             local_addr: Arc::new(RwLock::new(None)),
@@ -160,6 +170,22 @@ impl DohProxyServer {
     /// Get the local port
     pub fn port(&self) -> Option<u16> {
         self.local_addr().map(|a| a.port())
+    }
+
+    /// 参数与本代理的 DoH 配置一致时返回代理建连用的 resolver（连同它的 EdgePin）。
+    /// FFI 要用它而不是按参数重建 key：key 里含上游代理，FFI 拿不到，重建出来的是另一个
+    /// resolver，App 回报的粘性 IP / 亲和代理看不到，App 查到的也不是代理钉住的赢家
+    pub fn resolver_for(
+        &self,
+        doh_url: &str,
+        doh_url_ech: Option<&str>,
+        prefer_ipv6: bool,
+    ) -> Option<Arc<DnsResolver>> {
+        let key = self.doh_config_key.as_ref()?;
+        if *key != DnsResolver::doh_config_key(doh_url, doh_url_ech, prefer_ipv6) {
+            return None;
+        }
+        self.doh_tls_connector.dns_resolver().cloned()
     }
 
     pub fn dns_cache_stats(&self) -> crate::dns::DnsCacheStats {

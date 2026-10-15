@@ -75,6 +75,11 @@ impl DohTlsConnector {
         }
     }
 
+    /// 建连用的 resolver（DoH 关闭时为 None）
+    pub fn dns_resolver(&self) -> Option<&Arc<DnsResolver>> {
+        self.dns_resolver.as_ref()
+    }
+
     pub fn dns_cache_stats(&self) -> DnsCacheStats {
         self.dns_resolver
             .as_ref()
