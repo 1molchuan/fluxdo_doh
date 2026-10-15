@@ -246,7 +246,7 @@ impl DohUpstream {
         }
     }
 
-    fn host(&self) -> &str {
+    pub(crate) fn host(&self) -> &str {
         self.uri.host().unwrap_or_default()
     }
 
@@ -2995,7 +2995,7 @@ impl DnsResolver {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use hickory_resolver::config::ResolverConfig;
     use hickory_resolver::proto::op::{Message, MessageType};
@@ -3127,8 +3127,9 @@ mod tests {
         (port, seen)
     }
 
-    /// 按 `answers` 作答的假 DoH 服务器（A 回其中的 IPv4、AAAA 回 IPv6）；返回端口和收到的每个请求头部
-    async fn spawn_fake_doh_answering(
+    /// 按 `answers` 作答的假 DoH 服务器（A 回其中的 IPv4、AAAA 回 IPv6），查询路径 `/v1/lookup`；
+    /// 返回端口和收到的每个请求头部
+    pub(crate) async fn spawn_fake_doh_answering(
         answers: Vec<IpAddr>,
     ) -> (u16, Arc<parking_lot::Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -275,10 +275,58 @@ pub struct Candidate {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Verdict {
     Accept,
-    /// 投毒或错误响应
+    /// 投毒：有地址但不全在 Cloudflare 网段
+    Poisoned,
+    /// 错误响应（SERVFAIL / REFUSED 等）
     Reject,
     /// 正常响应但没有要的记录
     Negative,
+}
+
+/// 单个公共 DoH 端点的答案计数（Selector 建起来之后累计，只增不减）。
+/// 诊断国内解析器投毒用：只有厂商名、端点地址和次数，不含查询的域名或任何用户数据。
+/// 首个可用答案胜出后其余查询即被取消，没来得及回的端点不计
+struct PublicDohStats {
+    vendor: String,
+    host: String,
+    /// 通过检查、胜出被采用的答案
+    accepted: AtomicU64,
+    /// 投毒答案（A/AAAA 不全在 CF 网段）
+    rejected: AtomicU64,
+    /// 正常响应但没有要的记录
+    negative: AtomicU64,
+}
+
+impl PublicDohStats {
+    fn new(vendor: &str, host: &str) -> Self {
+        Self {
+            vendor: vendor.to_string(),
+            host: host.to_string(),
+            accepted: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+            negative: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, verdict: Verdict) {
+        let counter = match verdict {
+            Verdict::Accept => &self.accepted,
+            Verdict::Poisoned => &self.rejected,
+            Verdict::Negative => &self.negative,
+            Verdict::Reject => return,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "vendor": self.vendor,
+            "host": self.host,
+            "accepted": self.accepted.load(Ordering::Relaxed),
+            "rejected": self.rejected.load(Ordering::Relaxed),
+            "negative": self.negative.load(Ordering::Relaxed),
+        })
+    }
 }
 
 /// 发车原因，决定预算规则
@@ -338,6 +386,8 @@ pub struct Selector {
     provider: Arc<CryptoProvider>,
     /// (厂商, 上游)，查询时全部并发竞速
     public_doh: Vec<(String, DohUpstream)>,
+    /// 与 `public_doh` 按下标一一对应的答案计数
+    public_doh_stats: Vec<PublicDohStats>,
     atlas: Option<AtlasEndpoint>,
     report: Option<ReportEndpoint>,
     report_bearer: Mutex<Option<Secret>>,
@@ -530,6 +580,10 @@ impl Selector {
         edge: Arc<EdgePin>,
         prober: Prober,
     ) -> Arc<Self> {
+        let public_doh_stats = public_doh
+            .iter()
+            .map(|(vendor, upstream)| PublicDohStats::new(vendor, upstream.host()))
+            .collect();
         let selector = Arc::new(Self {
             mode,
             inner: Mutex::new(Inner {
@@ -550,6 +604,7 @@ impl Selector {
             roots,
             provider,
             public_doh,
+            public_doh_stats,
             atlas,
             report,
             report_bearer: Mutex::new(None),
@@ -794,6 +849,11 @@ impl Selector {
             "share": self.share.load(Ordering::Relaxed),
             "keys": inner.state.ech_keys.len(),
             "network_sig": inner.current_sig,
+            "public_doh": self
+                .public_doh_stats
+                .iter()
+                .map(PublicDohStats::to_json)
+                .collect::<Vec<_>>(),
         })
     }
 
@@ -1190,7 +1250,11 @@ impl Selector {
                 .await
         {
             if let Ok(Some((index, message))) = result {
-                match accept(&message) {
+                let verdict = accept(&message);
+                if let Some(stats) = self.public_doh_stats.get(index) {
+                    stats.record(verdict);
+                }
+                match verdict {
                     Verdict::Accept => {
                         debug!(
                             "select: {} {} answered by {} in {} ms",
@@ -1202,7 +1266,7 @@ impl Selector {
                         set.abort_all();
                         return Some(message);
                     }
-                    Verdict::Reject => rejected += 1,
+                    Verdict::Poisoned | Verdict::Reject => rejected += 1,
                     Verdict::Negative => negatives += 1,
                 }
                 // 多家都说没有这种记录：不用等到超时
@@ -1247,7 +1311,7 @@ impl Selector {
         if cfnet::all_cloudflare(&answers) {
             Verdict::Accept
         } else {
-            Verdict::Reject
+            Verdict::Poisoned
         }
     }
 
@@ -2237,6 +2301,81 @@ mod tests {
             edge,
             Prober::Fake(f),
         )
+    }
+
+    /// 只带公共 DoH 列表的 selector（探测不会被调用）
+    fn selector_with_public_doh(public_doh: Vec<(String, DohUpstream)>) -> Arc<Selector> {
+        Selector::build(
+            SelectMode::LocalAtlas,
+            SelectState::default(),
+            Some("wifi".to_string()),
+            RootCertStore::empty(),
+            Arc::new(crate::tls_crypto::build_provider()),
+            public_doh,
+            None,
+            None,
+            None,
+            Arc::new(EdgePin::new(false)),
+            Prober::Fake(Arc::new(|ip, _| outcome(ip, false, 1, None))),
+        )
+    }
+
+    /// 指向本机假 DoH 的上游（IP 字面量，不经任何 DNS）
+    async fn fake_public_doh(vendor: &str, answers: &[&str]) -> (String, DohUpstream) {
+        let (port, _) = crate::dns::tests::spawn_fake_doh_answering(
+            answers.iter().map(|text| ip(text)).collect(),
+        )
+        .await;
+        let uri: http::Uri = format!("http://127.0.0.1:{}/v1/lookup", port).parse().unwrap();
+        let upstream =
+            DnsResolver::build_doh_upstream(uri, &[], Duration::from_secs(3), None).unwrap();
+        (vendor.to_string(), upstream)
+    }
+
+    fn doh_counts(selector: &Arc<Selector>, vendor: &str) -> (u64, u64, u64) {
+        let status = selector.status_json();
+        let entry = status["public_doh"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["vendor"] == vendor)
+            .unwrap_or_else(|| panic!("no counters for {}", vendor))
+            .clone();
+        assert_eq!(entry["host"], "127.0.0.1");
+        (
+            entry["accepted"].as_u64().unwrap(),
+            entry["rejected"].as_u64().unwrap(),
+            entry["negative"].as_u64().unwrap(),
+        )
+    }
+
+    /// 公共 DoH 计数：投毒答案记 rejected、空应答记 negative、通过检查的记 accepted，
+    /// 按端点（厂商 + 地址）分开累计；状态 JSON 里带出来
+    #[tokio::test]
+    async fn public_doh_counters_track_verdicts_per_endpoint() {
+        let selector = selector_with_public_doh(vec![
+            fake_public_doh("Poisoner", &["31.13.94.36"]).await,
+            fake_public_doh("Empty", &[]).await,
+        ]);
+        assert!(selector
+            .public_query("www.visa.com.hk", RecordType::A, Selector::accept_cf_answer)
+            .await
+            .is_none());
+        assert!(selector
+            .public_query("openai.com", RecordType::A, Selector::accept_cf_answer)
+            .await
+            .is_none());
+        assert_eq!(doh_counts(&selector, "Poisoner"), (0, 2, 0));
+        assert_eq!(doh_counts(&selector, "Empty"), (0, 0, 2));
+
+        let selector = selector_with_public_doh(vec![
+            fake_public_doh("Clean", &["104.21.0.30"]).await,
+        ]);
+        assert!(selector
+            .public_query("www.visa.com.hk", RecordType::A, Selector::accept_cf_answer)
+            .await
+            .is_some());
+        assert_eq!(doh_counts(&selector, "Clean"), (1, 0, 0));
     }
 
     fn state_with_key(byte: u8) -> SelectState {
