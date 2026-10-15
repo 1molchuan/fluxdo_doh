@@ -1395,7 +1395,7 @@ impl DnsResolver {
                     .https_via_winner(host, method.as_str(), path, &header_refs, body.map(<[u8]>::to_vec))
                     .await
                 {
-                    debug!(
+                    info!(
                         "Accel {} {}{} -> {} via selector winner",
                         method, host, path, reply.status
                     );
@@ -1416,7 +1416,7 @@ impl DnsResolver {
             .text()
             .await
             .map_err(|e| DohProxyError::Dns(format!("Accel response read failed: {}", e)))?;
-        debug!(
+        info!(
             "Accel {} {}{} -> {} in {} ms",
             method,
             uri.host().unwrap_or(""),

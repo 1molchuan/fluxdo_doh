@@ -415,9 +415,16 @@ pub async fn https_request(
     t: &ProbeTimeouts,
     max_body: usize,
 ) -> Result<HttpsReply> {
-    let (stream, _) = tls_connect(ip, host, tls, t)
-        .await
-        .map_err(|failure| DohProxyError::Proxy(format!("{} via {}: {}", host, ip, failure)))?;
+    let (stream, _) = tls_connect(ip, host, tls, t).await.map_err(|failure| match failure {
+        // 带 retry_configs 的 ECH 被拒单独成错误，调用方可以换钥匙重试
+        ProbeFailure::EchRejected {
+            retry_configs: Some(configs),
+        } => DohProxyError::EchRetry {
+            addr: SocketAddr::new(ip, 443),
+            configs,
+        },
+        other => DohProxyError::Proxy(format!("{} via {}: {}", host, ip, other)),
+    })?;
     let (reply, latency) = h1_request(stream, host, method, path, headers, body, t, max_body)
         .await
         .map_err(|failure| DohProxyError::Proxy(format!("{} via {}: {}", host, ip, failure)))?;

@@ -8,7 +8,7 @@
 
 use crate::cfnet;
 use crate::dns::{DnsResolver, DohUpstream};
-use crate::error::Result;
+use crate::error::{DohProxyError, Result};
 use crate::probe::{self, HttpsReply, ProbeFailure, ProbeOutcome, ProbeTarget, ProbeTimeouts};
 use crate::{ProxyConfig, Secret};
 use base64::engine::general_purpose::STANDARD;
@@ -1966,8 +1966,24 @@ impl Selector {
             let Some(body) = build_report_body(family, &report.version, outcomes) else {
                 continue;
             };
+            // hub 按连接的地址判断网段和运营商：family 6 的上报必须走 IPv6 连接、family 4 走 IPv4。
+            // 赢家同族就用赢家，否则用本轮该族里延迟最低的通过者；该族没有通过者就不报
+            let is_family = |ip: IpAddr| (family == 4 && ip.is_ipv4()) || (family == 6 && ip.is_ipv6());
+            let report_ip = if is_family(winner.ip) {
+                Some(winner.ip)
+            } else {
+                outcomes
+                    .iter()
+                    .filter(|o| o.ok && is_family(o.ip))
+                    .min_by_key(|o| o.latency)
+                    .map(|o| o.ip)
+            };
+            let Some(report_ip) = report_ip else {
+                debug!("select: report v{} skipped, no passing IP of that family", family);
+                continue;
+            };
             let result = probe::https_request(
-                winner.ip,
+                report_ip,
                 &report.host,
                 "POST",
                 &report.path,
@@ -2018,12 +2034,40 @@ impl Selector {
             tls: Duration::from_millis(3000),
             http: Duration::from_millis(8000),
         };
-        match probe::https_request(ip, host, method, path, headers, body, tls, &timeouts, ATLAS_MAX_BODY)
-            .await
-        {
-            Ok(reply) => Some(reply),
+        let first = probe::https_request(
+            ip,
+            host,
+            method,
+            path,
+            headers,
+            body.clone(),
+            tls,
+            &timeouts,
+            ATLAS_MAX_BODY,
+        )
+        .await;
+        let result = match first {
+            // 钥匙过期被拒且服务端给了新钥匙：采纳后同地址重试一次（和 ech.rs 主路径一致）
+            Err(DohProxyError::EchRetry { configs, .. }) => {
+                let key = EchConfigListBytes::from(configs);
+                self.adopt_ech_key(&key, EchKeySource::RetryConfigs);
+                match self.tls_for_key(&key) {
+                    Ok(tls) => {
+                        probe::https_request(ip, host, method, path, headers, body, tls, &timeouts, ATLAS_MAX_BODY)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            other => other,
+        };
+        match result {
+            Ok(reply) => {
+                info!("select: {} {}{} via winner {} -> {}", method, host, path, ip, reply.status);
+                Some(reply)
+            }
             Err(error) => {
-                debug!("select: {} via winner {} failed: {}", host, ip, error);
+                info!("select: {} via winner {} failed: {}", host, ip, error);
                 None
             }
         }
