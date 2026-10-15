@@ -549,9 +549,13 @@ pub struct DnsResolver {
 }
 
 pub struct LookupHostResult {
+    /// 按 EdgePin 排好的地址（见 `Route::app_addrs`）
     pub addrs: Vec<IpAddr>,
     pub ech_config: Option<EchConfigListBytes<'static>>,
+    /// 钉住时是赢家，否则是验证过的粘性 IP
     pub preferred_ip: Option<IpAddr>,
+    /// 覆盖域名钉在优选赢家上：App 应原样使用 `addrs`，不要自己再换 IP
+    pub pinned: bool,
     pub ttl: Duration,
 }
 
@@ -2241,8 +2245,8 @@ impl DnsResolver {
         }
 
         let (ech_config, ip_result) = self.lookup_ech_and_ip(domain).await;
-        let addrs = match ip_result {
-            Ok(addrs) => self.edge_pin.route(domain, addrs).addrs,
+        let resolved = match ip_result {
+            Ok(addrs) => addrs,
             Err(error) => {
                 if ech_config.is_none() {
                     return Err(error);
@@ -2254,18 +2258,21 @@ impl DnsResolver {
                 Vec::new()
             }
         };
-        // 只返回已经“实际连通验证过”的 sticky IP。
+        // 和网关建连同一套钉选：覆盖域名有赢家时给赢家（及同族兜底），否则亲和族在前。
+        // preferred_ip 只给钉住的赢家或已经“实际连通验证过”的 sticky IP。
         // 冷启动时不要把排序后的首个地址直接提升为 preferred_ip，
         // 否则 query 模式会把一个未验证的单 IP 提前钉死给 rhttp，
         // 一旦这个边缘节点不稳定，就会持续触发连接重置/超时。
-        let preferred_ip = match self.edge_pin.sticky(domain) {
-            Some(ip) if addrs.contains(&ip) => Some(ip),
+        let route = self.edge_pin.route(domain, resolved);
+        let preferred_ip = match route.first {
+            Some(ip) if route.pinned || route.addrs.contains(&ip) => Some(ip),
             Some(_) => {
                 self.edge_pin.forget_host(domain);
                 None
             }
             None => None,
         };
+        let addrs = route.app_addrs();
         // 表命中的域名不进 ip_cache，缓存时长按表的新鲜期给
         let table_ttl = match self.active_route_table().await {
             Some(table) if table.lookup(domain).is_some_and(|e| !e.addrs.is_empty()) => {
@@ -2281,6 +2288,7 @@ impl DnsResolver {
             addrs,
             ech_config,
             preferred_ip,
+            pinned: route.pinned,
             ttl,
         })
     }

@@ -96,6 +96,23 @@ impl Route {
             .iter()
             .partition(|addr| addr.is_ipv6() == self.primary_is_v6)
     }
+
+    /// 交给 App 引擎（rhttp）的地址表，按尝试顺序：`first` 在前（粘性 IP 须仍在解析结果里）。
+    /// 钉住赢家时只给赢家同族的地址：rhttp 的 Happy Eyeballs 在首选族 300 ms 没连上时
+    /// 会起跑另一族，给了就可能换出口
+    pub fn app_addrs(&self) -> Vec<IpAddr> {
+        let first = self
+            .first
+            .filter(|ip| self.pinned || self.addrs.contains(ip));
+        let mut out: Vec<IpAddr> = first.into_iter().collect();
+        for addr in &self.addrs {
+            let family_ok = !self.pinned || addr.is_ipv6() == self.primary_is_v6;
+            if family_ok && !out.contains(addr) {
+                out.push(*addr);
+            }
+        }
+        out
+    }
 }
 
 struct Expiring<T> {
@@ -319,12 +336,6 @@ impl EdgePin {
         }
     }
 
-    /// App 引擎回报的成功：只记粘性 IP（见 FFI `doh_proxy_record_host_success`）
-    pub(crate) fn remember_sticky(&self, host: &str, ip: IpAddr) {
-        let mut state = self.state.write();
-        Self::put_sticky(&mut state, host, ip, Instant::now());
-    }
-
     /// 忘掉该域名的粘性 IP
     pub fn forget_host(&self, host: &str) {
         self.state.write().sticky.remove(host);
@@ -493,7 +504,8 @@ mod tests {
         assert_eq!(edge.sticky("linux.do"), Some(v6));
 
         // 另一域名早先记下的 v4 粘性 IP 与亲和不一致：读取时作废
-        edge.remember_sticky("credit.linux.do", v4);
+        edge.report("credit.linux.do", v4, connected());
+        assert_eq!(edge.affinity(), Some(true));
         assert_eq!(edge.sticky("credit.linux.do"), None);
         assert_eq!(edge.sticky("credit.linux.do"), None);
 
@@ -548,6 +560,8 @@ mod tests {
             assert!(!route.primary_is_v6, "{} 的首选族要跟赢家", host);
             assert!(route.family_decided);
             assert_eq!(route.addrs, vec![winner, table_v4, table_v6]);
+            // 交给 rhttp 的地址表只有赢家同族，避免 Happy Eyeballs 换出口
+            assert_eq!(route.app_addrs(), vec![winner, table_v4]);
         }
 
         for host in COVERED {
@@ -605,9 +619,16 @@ mod tests {
         assert_eq!(edge.sticky("cdk.linux.do"), None);
 
         // 非覆盖域名：粘性 IP 先试，候选族内按 RTT
-        let route = edge.route("example.com", resolved);
+        let route = edge.route("example.com", resolved.clone());
         assert_eq!(route.first, Some(v6_fast));
         assert_eq!(route.addrs, vec![v6_fast, v6_slow, v4_fast, v4_slow]);
+        // 没钉住时两族都给 rhttp（亲和族在前）；粘性 IP 不在这次解析结果里就不往前放
+        let route = edge.route("linux.do", resolved);
+        assert_eq!(route.app_addrs(), vec![v6_slow, v6_fast, v4_fast, v4_slow]);
+        assert_eq!(
+            edge.route("linux.do", vec![v6_fast]).app_addrs(),
+            vec![v6_fast]
+        );
 
         // 没有亲和时按配置偏好排，两族赛跑
         edge.clear();

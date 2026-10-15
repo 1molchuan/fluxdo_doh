@@ -283,7 +283,10 @@ pub extern "C" fn doh_proxy_lookup_ip(
         let resolver =
             crate::dns::DnsResolver::shared(&doh_url, Some(&doh_url), prefer_ipv6 != 0, None)
                 .await?;
-        resolver.lookup_ip(&host_str).await
+        let addrs = resolver.lookup_ip(&host_str).await?;
+        Ok::<_, crate::error::DohProxyError>(
+            resolver.edge_pin().route(&host_str, addrs).app_addrs(),
+        )
     });
 
     match result {
@@ -307,7 +310,10 @@ pub extern "C" fn doh_proxy_lookup_ip(
 
 /// Lookup a host in one round-trip and return IPs, ECH config and TTL.
 /// Returns:
-/// {"ok":true,"ips":["1.1.1.1"],"ech":"<base64|null>","ttl_secs":300}
+/// {"ok":true,"ips":["1.1.1.1"],"ech":"<base64|null>","preferred_ip":"<ip|null>","pinned":false,"ttl_secs":300}
+///
+/// `pinned` 为 true 表示覆盖域名钉在优选赢家上：`ips` 是赢家及同族兜底，App 应原样使用，
+/// 连接失败用 doh_proxy_report_host_failure 报回来，不要自己换 IP
 #[no_mangle]
 pub extern "C" fn doh_proxy_lookup_host(
     host: *const c_char,
@@ -356,6 +362,7 @@ pub extern "C" fn doh_proxy_lookup_host(
                     .collect::<Vec<_>>(),
                 "ech": ech,
                 "preferred_ip": lookup.preferred_ip.map(|addr| addr.to_string()),
+                "pinned": lookup.pinned,
                 "ttl_secs": lookup.ttl.as_secs(),
             })
             .to_string();
@@ -368,7 +375,8 @@ pub extern "C" fn doh_proxy_lookup_host(
     }
 }
 
-/// Record a successful host -> IP preference in the shared resolver.
+/// Record a successful host -> IP connection in the shared resolver's EdgePin
+/// (sticky IP and address-family affinity; a pinned winner forces the affinity).
 /// Returns 1 on success, 0 on failure.
 #[no_mangle]
 pub extern "C" fn doh_proxy_record_host_success(
@@ -416,7 +424,14 @@ pub extern "C" fn doh_proxy_record_host_success(
             None,
         )
         .await?;
-        resolver.edge_pin().remember_sticky(&host_str, ip_addr);
+        resolver.edge_pin().report(
+            &host_str,
+            ip_addr,
+            crate::edge_pin::Outcome::Connected {
+                rtt: None,
+                took_over: false,
+            },
+        );
         Ok::<(), crate::error::DohProxyError>(())
     });
 
@@ -427,6 +442,63 @@ pub extern "C" fn doh_proxy_record_host_success(
             ip_str,
             error
         );
+        0
+    } else {
+        1
+    }
+}
+
+/// 报告 App 引擎连 host -> ip 失败：作废该域名的粘性 IP；ip 是钉住的赢家时计入它的连败
+/// （60 s 内 3 次即解除钉住、重新优选）。参数同 doh_proxy_record_host_success。
+/// Returns 1 on success, 0 on failure.
+#[no_mangle]
+pub extern "C" fn doh_proxy_report_host_failure(
+    host: *const c_char,
+    doh_server: *const c_char,
+    doh_server_ech: *const c_char,
+    prefer_ipv6: c_int,
+    ip: *const c_char,
+) -> c_int {
+    doh_proxy_init_logging();
+
+    let host_str = match parse_required_string(host, "host") {
+        Ok(value) => value,
+        Err(message) => {
+            tracing::warn!("report_host_failure: {}", message);
+            return 0;
+        }
+    };
+    let ip_addr = match parse_required_string(ip, "ip")
+        .and_then(|value| value.parse::<std::net::IpAddr>().map_err(|e| e.to_string()))
+    {
+        Ok(value) => value,
+        Err(message) => {
+            tracing::warn!("report_host_failure: invalid ip: {}", message);
+            return 0;
+        }
+    };
+    let doh_url = parse_optional_string(doh_server)
+        .unwrap_or_else(|| "https://cloudflare-dns.com/dns-query".to_string());
+    let doh_url_ech = parse_optional_string(doh_server_ech);
+
+    let rt = get_runtime();
+    let result = rt.block_on(async {
+        let effective_doh_url_ech = doh_url_ech.as_deref().unwrap_or(doh_url.as_str());
+        let resolver = crate::dns::DnsResolver::shared(
+            &doh_url,
+            Some(effective_doh_url_ech),
+            prefer_ipv6 != 0,
+            None,
+        )
+        .await?;
+        resolver
+            .edge_pin()
+            .report(&host_str, ip_addr, crate::edge_pin::Outcome::Failed);
+        Ok::<(), crate::error::DohProxyError>(())
+    });
+
+    if let Err(error) = result {
+        tracing::warn!("report_host_failure failed for {}: {}", host_str, error);
         0
     } else {
         1
