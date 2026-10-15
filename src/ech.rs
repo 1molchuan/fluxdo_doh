@@ -4,7 +4,7 @@
 //! and enables true ECH encryption of the SNI field.
 
 use crate::dns::{DnsCacheRecord, DnsCacheStats, DnsResolver};
-use crate::edge_pin::Outcome;
+use crate::edge_pin::{EdgePin, Outcome, Route};
 use crate::error::{DohProxyError, Result};
 use crate::upstream::connect_tunnel;
 use crate::{BoxStream, UpstreamProxyConfig};
@@ -91,7 +91,8 @@ impl DohTlsConnector {
 
     /// Establish raw TCP tunnel to target host
     ///
-    /// 无上游代理时优先用 DoH 解析目标 IP（不经系统 DNS），逐个尝试连接；
+    /// 无上游代理时优先用 DoH 解析目标 IP（不经系统 DNS），按 EdgePin 排好的顺序逐个连接，
+    /// 和 TLS 主路径同一套钉选：覆盖域名有赢家时先连赢家，其余先亲和族；结果回报给 EdgePin。
     /// 无 DoH resolver（enable_doh=false）或解析失败时回退系统 DNS。
     /// CF 验证域名（challenges.cloudflare.com）以隧道方式直连时走此路径：
     /// 既保证与真 CF 端到端 TLS，又不把域名泄漏给系统 DNS。
@@ -118,20 +119,9 @@ impl DohTlsConnector {
         if let Some(resolver) = self.dns_resolver.as_ref() {
             match resolver.lookup_ip(host).await {
                 Ok(addrs) if !addrs.is_empty() => {
-                    let ordered = resolver.edge_pin().route(host, addrs).addrs;
-                    let mut last_err: Option<DohProxyError> = None;
-                    for ip in ordered {
-                        match self.tcp_connect_addr(SocketAddr::new(ip, port)).await {
-                            Ok(stream) => return Ok(Box::new(stream)),
-                            Err(e) => {
-                                warn!("Tunnel TCP connect to {} failed: {}", ip, e);
-                                last_err = Some(e);
-                            }
-                        }
-                    }
-                    return Err(last_err.unwrap_or_else(|| {
-                        DohProxyError::Dns(format!("No reachable IP for {}", host))
-                    }));
+                    let edge = resolver.edge_pin();
+                    let route = edge.route(host, addrs);
+                    return self.connect_tcp_route(host, port, edge, &route).await;
                 }
                 Ok(_) => warn!(
                     "DoH returned no IP for {}, falling back to system DNS",
@@ -150,6 +140,70 @@ impl DohTlsConnector {
             .map_err(|_| DohProxyError::Timeout)?
             .map_err(DohProxyError::Io)?;
         Ok(Box::new(stream))
+    }
+
+    /// 按 EdgePin 的计划逐个连 TCP：先 `first`（赢家 / 粘性 IP），再首选族，
+    /// 首选族整族连不上才轮到另一族（这时算接管，亲和跟着切换）
+    async fn connect_tcp_route(
+        &self,
+        host: &str,
+        port: u16,
+        edge: &EdgePin,
+        route: &Route,
+    ) -> Result<BoxStream> {
+        let mut last_err: Option<DohProxyError> = None;
+        if let Some(ip) = route.first {
+            match self.tcp_connect_addr(SocketAddr::new(ip, port)).await {
+                Ok(stream) => {
+                    // 只到 TCP，没有可比的 RTT
+                    edge.report(
+                        host,
+                        ip,
+                        Outcome::Connected {
+                            rtt: None,
+                            took_over: false,
+                        },
+                    );
+                    return Ok(Box::new(stream));
+                }
+                Err(e) => {
+                    warn!("Tunnel TCP connect to {} failed: {}", ip, e);
+                    edge.report(host, ip, Outcome::Failed);
+                    last_err = Some(e);
+                }
+            }
+        }
+        let (primary, secondary) = route.split();
+        let primary_tried = !primary.is_empty()
+            || route
+                .first
+                .is_some_and(|ip| ip.is_ipv6() == route.primary_is_v6);
+        for ip in primary.iter().chain(secondary.iter()) {
+            if Some(*ip) == route.first {
+                continue;
+            }
+            match self.tcp_connect_addr(SocketAddr::new(*ip, port)).await {
+                Ok(stream) => {
+                    let took_over = route.family_decided
+                        && primary_tried
+                        && ip.is_ipv6() != route.primary_is_v6;
+                    edge.report(
+                        host,
+                        *ip,
+                        Outcome::Connected {
+                            rtt: None,
+                            took_over,
+                        },
+                    );
+                    return Ok(Box::new(stream));
+                }
+                Err(e) => {
+                    warn!("Tunnel TCP connect to {} failed: {}", ip, e);
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| DohProxyError::Dns(format!("No reachable IP for {}", host))))
     }
 
     /// 系统 DNS 解析（DoH 不可用时的回退）
@@ -904,5 +958,56 @@ impl DohTlsConnector {
         );
 
         Ok(tls_stream)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::edge_pin::Pin;
+    use tokio::net::TcpListener;
+
+    async fn connector() -> (DohTlsConnector, Arc<EdgePin>) {
+        let resolver = Arc::new(
+            DnsResolver::with_resolver_config(
+                hickory_resolver::config::ResolverConfig::new(),
+                false,
+            )
+            .await
+            .unwrap(),
+        );
+        let edge = resolver.edge_pin().clone();
+        let connector =
+            DohTlsConnector::new(Some(resolver), true, Duration::from_secs(2), None, None);
+        (connector, edge)
+    }
+
+    /// 隧道（connect_tcp）与 TLS 主路径同一套钉选：覆盖域名有赢家就连赢家，连通回报给 EdgePin
+    /// （粘性 IP、亲和）；赢家连不上计入它的连败
+    #[tokio::test]
+    async fn tunnel_to_covered_host_goes_through_edge_pin() {
+        let winner: IpAddr = "127.0.0.1".parse().unwrap();
+        let listener = TcpListener::bind((winner, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+        let (connector, edge) = connector().await;
+        edge.set_pin(Pin::Winner(winner));
+
+        connector
+            .connect_tcp("connect.linux.do", port)
+            .await
+            .unwrap();
+        assert_eq!(edge.sticky("connect.linux.do"), Some(winner));
+        assert_eq!(edge.affinity(), Some(false));
+
+        // 换一个没人监听的端口：赢家连不上，计一次连败
+        let closed = TcpListener::bind((winner, 0)).await.unwrap();
+        let closed_port = closed.local_addr().unwrap().port();
+        drop(closed);
+        assert!(connector
+            .connect_tcp("cdk.linux.do", closed_port)
+            .await
+            .is_err());
+        assert_eq!(edge.winner_fail_streak(), 1);
     }
 }

@@ -40,6 +40,13 @@ pub enum DohProxyError {
         addr: std::net::SocketAddr,
         configs: Vec<u8>,
     },
+
+    /// 指定地址 TCP 就连不上（拒绝 / 超时），可以算到这个地址头上
+    #[error("TCP connect to {addr} failed: {reason}")]
+    Unreachable {
+        addr: std::net::SocketAddr,
+        reason: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, DohProxyError>;

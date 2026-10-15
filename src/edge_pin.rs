@@ -9,8 +9,10 @@
 //!    经赢家连通即把亲和强制定到赢家的地址族。
 //! 2. 没有赢家时按地址族亲和：首次成功建连定下地址族，所有域名共用；只有亲和族整族
 //!    连不上、由另一族接管时才切换。清缓存（网络切换）时重置。
-//! 3. 粘性 IP 只记实际连通过的地址；与亲和族不一致的读取时作废。
-//! 4. 赢家在 60 s 内连败 3 次即解除钉住，交 Selector 降级重赛。
+//! 3. 候选一律先排首选族（钉住时是赢家的族，否则是亲和族，再否则配置偏好），族内按 RTT。
+//! 4. 粘性 IP 只记实际连通过的地址；与亲和族不一致的读取时作废。
+//! 5. 赢家在 60 s 内连败 3 次即解除钉住：所有覆盖域名一起离开它（指向它的粘性 IP 一并作废），
+//!    交 Selector 降级重赛。
 //!
 //! 读写是单向的：Selector 只经 [`EdgePin::set_pin`] 交出赢家、经
 //! [`EdgePin::effective_prefer_ipv6`] 读地址族；建连路径只问 [`EdgePin::route`]、
@@ -79,11 +81,11 @@ pub struct Route {
     pub first: Option<IpAddr>,
     /// `first` 是优选赢家
     pub pinned: bool,
-    /// 其余候选（解析结果），按尝试顺序排好
+    /// 其余候选（解析结果）：首选族在前，族内按 RTT
     pub addrs: Vec<IpAddr>,
-    /// 首选地址族是不是 IPv6
+    /// 首选地址族是不是 IPv6：钉住时跟赢家，否则跟亲和，再否则按配置偏好
     pub primary_is_v6: bool,
-    /// 地址族已定（有亲和）：首选族整族连不上才用另一族；未定时两族赛跑，赢家定亲和
+    /// 地址族已定（钉住或有亲和）：首选族整族连不上才用另一族；未定时两族赛跑，赢家定亲和
     pub family_decided: bool,
 }
 
@@ -205,6 +207,11 @@ impl EdgePin {
         let first = winner.or_else(|| self.sticky(host));
         let state = self.state.read();
         let affinity = state.affinity;
+        // 钉住时首选族跟赢家走（经赢家连通后亲和也会被强制成这一族），兜底候选不换出口
+        let primary_is_v6 = match winner {
+            Some(ip) => ip.is_ipv6(),
+            None => affinity.unwrap_or(self.prefer_ipv6),
+        };
         let mut addrs = resolved;
         let now = Instant::now();
         addrs.sort_by_key(|addr| {
@@ -214,19 +221,14 @@ impl EdgePin {
                 .filter(|entry| entry.expires_at > now)
                 .map(|entry| entry.value)
                 .unwrap_or(u128::MAX);
-            let family_bias = if addr.is_ipv6() == self.prefer_ipv6 {
-                0
-            } else {
-                1
-            };
-            (rtt, family_bias)
+            (addr.is_ipv6() != primary_is_v6, rtt)
         });
         Route {
             first,
             pinned: winner.is_some(),
             addrs,
-            primary_is_v6: affinity.unwrap_or(self.prefer_ipv6),
-            family_decided: affinity.is_some(),
+            primary_is_v6,
+            family_decided: winner.is_some() || affinity.is_some(),
         }
     }
 
@@ -301,6 +303,8 @@ impl EdgePin {
                             );
                             state.pin = Pin::None;
                             state.winner_fails.clear();
+                            // 所有覆盖域名一起离开它：降级到重赛出结果之间不能各自回到旧赢家
+                            state.sticky.retain(|_, entry| entry.value != ip);
                             demoted = Some(ip);
                         }
                     }
@@ -512,5 +516,146 @@ mod tests {
         // 网络切换清缓存：亲和重置
         edge.clear();
         assert_eq!(edge.affinity(), None);
+    }
+
+    const COVERED: [&str; 3] = ["linux.do", "connect.linux.do", "cdk.linux.do"];
+
+    fn connected_in(ms: u64) -> Outcome {
+        Outcome::Connected {
+            rtt: Some(Duration::from_millis(ms)),
+            took_over: false,
+        }
+    }
+
+    /// 赢家是 v4，而表地址、各自的粘性 IP 和当前亲和都是 v6：linux.do、connect.linux.do、
+    /// cdk.linux.do 一律先连赢家，兜底候选也先排赢家的族；经赢家连通把亲和强制改一次，之后不再变
+    #[test]
+    fn covered_hosts_pin_to_winner_and_its_family() {
+        let edge = EdgePin::new(true);
+        let winner = ip("104.21.0.1");
+        let table_v4 = ip("172.67.0.1");
+        let table_v6 = ip("2606:4700::6810:1");
+        // 优选出结果前，cdk.linux.do 经 v6 表地址连通过：亲和 v6、粘性 v6
+        edge.report("cdk.linux.do", table_v6, connected_in(30));
+        assert_eq!(edge.affinity(), Some(true));
+        assert_eq!(edge.state.read().affinity_changes, 1);
+
+        edge.set_pin(Pin::Winner(winner));
+        for host in COVERED {
+            let route = edge.route(host, vec![table_v6, winner, table_v4]);
+            assert_eq!(route.first, Some(winner), "{}", host);
+            assert!(route.pinned);
+            assert!(!route.primary_is_v6, "{} 的首选族要跟赢家", host);
+            assert!(route.family_decided);
+            assert_eq!(route.addrs, vec![winner, table_v4, table_v6]);
+        }
+
+        for host in COVERED {
+            edge.report(host, winner, connected_in(50));
+        }
+        assert_eq!(edge.affinity(), Some(false));
+        assert_eq!(edge.state.read().affinity_changes, 2, "只强制切换一次");
+        assert_eq!(edge.sticky("cdk.linux.do"), Some(winner));
+
+        // 非覆盖域名不钉赢家，按（已切到 v4 的）亲和排
+        let route = edge.route("example.com", vec![table_v6, table_v4]);
+        assert_eq!(route.first, None);
+        assert!(!route.pinned);
+        assert_eq!(route.addrs, vec![table_v4, table_v6]);
+        // 只有 AAAA 的非覆盖域名连通，不是接管：亲和不动
+        edge.report("v6-only.example", table_v6, connected_in(10));
+        assert_eq!(edge.affinity(), Some(false));
+        assert_eq!(edge.state.read().affinity_changes, 2);
+    }
+
+    /// 没有赢家：覆盖域名跟亲和族走（亲和族在前，另一族的粘性 IP 作废）；
+    /// 非覆盖域名照旧先粘性 IP、族内按 RTT
+    #[test]
+    fn without_winner_covered_hosts_follow_affinity_others_keep_sticky_and_rtt() {
+        let edge = EdgePin::new(false);
+        let v4_fast = ip("198.51.100.1");
+        let v4_slow = ip("198.51.100.2");
+        let v6_fast = ip("2001:db8::1");
+        let v6_slow = ip("2001:db8::2");
+        // 首次建连走了 v6：亲和 v6（配置偏好是 v4）
+        edge.report("linux.do", v6_slow, connected_in(80));
+        edge.report("example.com", v6_fast, connected_in(20));
+        edge.report("probe.example", v4_fast, connected_in(5));
+        edge.report("cdk.linux.do", v4_slow, connected_in(90));
+        assert_eq!(edge.affinity(), Some(true));
+        // 等待中也不钉
+        edge.set_pin(Pin::Pending);
+
+        let resolved = vec![v4_fast, v6_slow, v4_slow, v6_fast];
+        let route = edge.route("connect.linux.do", resolved.clone());
+        assert_eq!(route.first, None);
+        assert!(!route.pinned);
+        assert!(route.primary_is_v6);
+        assert!(route.family_decided);
+        // v4_fast 最快也排在亲和族之后
+        assert_eq!(route.addrs, vec![v6_fast, v6_slow, v4_fast, v4_slow]);
+        assert_eq!(route.split().0, vec![v6_fast, v6_slow]);
+
+        assert_eq!(
+            edge.route("linux.do", resolved.clone()).first,
+            Some(v6_slow)
+        );
+        // cdk.linux.do 的 v4 粘性 IP 与亲和不一致：作废
+        assert_eq!(edge.route("cdk.linux.do", resolved.clone()).first, None);
+        assert_eq!(edge.sticky("cdk.linux.do"), None);
+
+        // 非覆盖域名：粘性 IP 先试，候选族内按 RTT
+        let route = edge.route("example.com", resolved);
+        assert_eq!(route.first, Some(v6_fast));
+        assert_eq!(route.addrs, vec![v6_fast, v6_slow, v4_fast, v4_slow]);
+
+        // 没有亲和时按配置偏好排，两族赛跑
+        edge.clear();
+        let route = edge.route("connect.linux.do", vec![v6_fast, v4_slow, v4_fast]);
+        assert!(!route.family_decided);
+        assert!(!route.primary_is_v6);
+        assert_eq!(route.addrs, vec![v4_slow, v4_fast, v6_fast]);
+    }
+
+    /// 赢家连败：非覆盖域名、非赢家 IP 不计；窗口内第 3 次解除钉住，指向它的粘性 IP 一并作废，
+    /// 冷启动等赢家的解析随之返回
+    #[tokio::test]
+    async fn pending_pin_wakes_waiters_and_fail_streak_unpins() {
+        let edge = Arc::new(EdgePin::new(false));
+        let winner = ip("104.21.0.1");
+        edge.set_pin(Pin::Pending);
+        let waiter = {
+            let edge = edge.clone();
+            tokio::spawn(async move {
+                edge.settled_winner("linux.do", Instant::now() + Duration::from_secs(5))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        edge.set_pin(Pin::Winner(winner));
+        assert_eq!(waiter.await.unwrap(), Some(winner));
+        assert_eq!(
+            edge.settled_winner("example.com", Instant::now()).await,
+            None
+        );
+
+        edge.report("cdn.linux.do", winner, connected());
+        edge.report("example.com", winner, Outcome::Failed);
+        edge.report("linux.do", ip("104.21.0.9"), Outcome::Failed);
+        edge.report("linux.do", winner, Outcome::Failed);
+        edge.report("connect.linux.do", winner, Outcome::Failed);
+        assert_eq!(edge.winner_fail_streak(), 2);
+        edge.report("cdk.linux.do", winner, Outcome::Failed);
+        assert_eq!(edge.winner_fail_streak(), 0);
+        for host in [
+            "linux.do",
+            "connect.linux.do",
+            "cdk.linux.do",
+            "cdn.linux.do",
+        ] {
+            let route = edge.route(host, Vec::new());
+            assert_eq!(route.first, None, "{} 不能再回到旧赢家", host);
+        }
+        assert_eq!(edge.settled_winner("linux.do", Instant::now()).await, None);
     }
 }

@@ -8,7 +8,9 @@
 
 use crate::cfnet;
 use crate::dns::{DnsResolver, DohUpstream};
-use crate::edge_pin::{EdgePin, Pin, PinListener, WINNER_FAIL_THRESHOLD, WINNER_FAIL_WINDOW_SECS};
+use crate::edge_pin::{
+    EdgePin, Outcome, Pin, PinListener, WINNER_FAIL_THRESHOLD, WINNER_FAIL_WINDOW_SECS,
+};
 use crate::error::{DohProxyError, Result};
 use crate::probe::{self, HttpsReply, ProbeFailure, ProbeOutcome, ProbeTarget, ProbeTimeouts};
 use crate::{ProxyConfig, Secret};
@@ -1961,7 +1963,9 @@ impl Selector {
 
     // ---------- 经赢家的小请求 ----------
 
-    /// 经赢家 IP + 当前钥匙向 `host` 发请求（内层 SNI 为 host）；无赢家 / 无钥匙 / 失败返回 None
+    /// 经赢家 IP + 当前钥匙向 `host` 发请求（内层 SNI 为 host）；无赢家 / 无钥匙 / 失败返回 None。
+    /// 和网关建连同一套钉选：只有 EdgePin 把 `host` 钉在赢家上才走，结果回报给 EdgePin
+    /// （连通强制亲和到赢家的族；TCP 连不上计入赢家连败）
     pub async fn https_via_winner(
         &self,
         host: &str,
@@ -1970,7 +1974,8 @@ impl Selector {
         headers: &[(&str, &str)],
         body: Option<Vec<u8>>,
     ) -> Option<HttpsReply> {
-        let ip = self.winner_ip()?;
+        let route = self.edge.route(host, Vec::new());
+        let ip = route.first.filter(|_| route.pinned)?;
         let key = self.current_ech_key()?;
         let tls = self.tls_for_key(&key).ok()?;
         let timeouts = ProbeTimeouts {
@@ -2005,6 +2010,19 @@ impl Selector {
             }
             other => other,
         };
+        match &result {
+            Ok(_) => self.edge.report(
+                host,
+                ip,
+                Outcome::Connected {
+                    rtt: None,
+                    took_over: false,
+                },
+            ),
+            // 只算 TCP 层：TLS 失败可能只是别的 zone（atlas / cfhub6）在这个 IP 上不服务
+            Err(DohProxyError::Unreachable { .. }) => self.edge.report(host, ip, Outcome::Failed),
+            Err(_) => {}
+        }
         match result {
             Ok(reply) => {
                 info!("select: {} {}{} via winner {} -> {}", method, host, path, ip, reply.status);
@@ -2350,6 +2368,98 @@ mod tests {
             )
             .await;
         assert_eq!(selector.winner_ip(), Some(ip("104.21.0.1")));
+        // 没有亲和、配置偏好 v6：v4 更快也选 v6
+        let selector = fake_selector_with(
+            SelectMode::LocalAtlas,
+            state_with_key(1),
+            Arc::new(|ip, _| {
+                if ip.is_ipv4() {
+                    outcome(ip, true, 10, None)
+                } else {
+                    outcome(ip, true, 60, None)
+                }
+            }),
+            Arc::new(EdgePin::new(true)),
+        );
+        selector
+            .race_candidates(
+                candidates(&["104.21.0.1", "2606:4700::6810:1"]),
+                selector.key_pool(),
+            )
+            .await;
+        assert_eq!(selector.winner_ip(), Some(ip("2606:4700::6810:1")));
+        // 赢家交给了 EdgePin：覆盖域名钉到它
+        assert_eq!(
+            selector.edge.route("linux.do", Vec::new()).first,
+            Some(ip("2606:4700::6810:1"))
+        );
+    }
+
+    /// 赢家死了：三个覆盖域名在 60 s 内各失败一次 → EdgePin 解除钉住、Selector 降级重赛；
+    /// 降级到重赛出结果之间没有覆盖域名回到旧赢家，重赛出的新赢家所有覆盖域名一起换过去
+    #[tokio::test]
+    async fn winner_failures_move_all_covered_hosts_together() {
+        let old = ip("104.21.0.1");
+        let new = ip("104.21.0.2");
+        let alive = Arc::new(Mutex::new(old));
+        let alive_in = alive.clone();
+        let mut state = state_with_key(1);
+        // 重赛的候选从 atlas 缓存里来
+        state.atlas = Some(AtlasCache {
+            fetched_at: now_unix(),
+            ttl: 3600,
+            candidates: vec![new],
+        });
+        let edge = Arc::new(EdgePin::new(false));
+        let selector = fake_selector_with(
+            SelectMode::LocalAtlas,
+            state,
+            Arc::new(move |ip, _| {
+                if ip == *alive_in.lock() {
+                    outcome(ip, true, 20, None)
+                } else {
+                    outcome(ip, false, 5, Some(ProbeFailure::TcpConnect))
+                }
+            }),
+            edge.clone(),
+        );
+        selector
+            .race_candidates(candidates(&["104.21.0.1"]), selector.key_pool())
+            .await;
+        let hosts = [
+            "linux.do",
+            "connect.linux.do",
+            "cdk.linux.do",
+            "cdn.linux.do",
+        ];
+        for host in hosts {
+            assert_eq!(edge.route(host, Vec::new()).first, Some(old));
+            edge.report(
+                host,
+                old,
+                Outcome::Connected {
+                    rtt: None,
+                    took_over: false,
+                },
+            );
+        }
+        selector.inner.lock().state.last_race_at = 0;
+
+        *alive.lock() = new;
+        for host in &hosts[..3] {
+            edge.report(host, old, Outcome::Failed);
+        }
+        // 降级即解除：cdn.linux.do 没失败过，粘性 IP 也不能再把它带回旧赢家
+        for host in hosts {
+            assert_ne!(edge.route(host, Vec::new()).first, Some(old), "{}", host);
+        }
+        wait_phase(&selector, Phase::Ready).await;
+        assert_eq!(selector.winner_ip(), Some(new));
+        for host in hosts {
+            let route = edge.route(host, Vec::new());
+            assert_eq!(route.first, Some(new), "{}", host);
+            assert!(route.pinned);
+        }
     }
 
     #[tokio::test]

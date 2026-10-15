@@ -423,6 +423,11 @@ pub async fn https_request(
             addr: SocketAddr::new(ip, 443),
             configs,
         },
+        // TCP 就连不上单独成错误：调用方可以把它算到这个地址头上
+        ProbeFailure::TcpConnect | ProbeFailure::TcpTimeout => DohProxyError::Unreachable {
+            addr: SocketAddr::new(ip, 443),
+            reason: failure.to_string(),
+        },
         other => DohProxyError::Proxy(format!("{} via {}: {}", host, ip, other)),
     })?;
     let (reply, latency) = h1_request(stream, host, method, path, headers, body, t, max_body)
