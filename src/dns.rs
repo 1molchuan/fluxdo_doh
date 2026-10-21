@@ -31,6 +31,9 @@ use tracing::{debug, info, warn};
 const MAX_CACHE_SIZE: usize = 1000;
 /// TTL 下限（秒）
 const MIN_TTL_SECS: u64 = 60;
+/// Cloudflare 的公共 ECH 入口：解析到 CF 共享网段，开了 ECH 的 CF 站点都能经这些
+/// 地址连（内层 SNI 仍是原域名，2026-10-21 实测 linux.do ECH Accepted）
+const CLOUDFLARE_ECH_ENTRY: &str = "cloudflare-ech.com";
 /// TTL 上限（秒）
 const MAX_TTL_SECS: u64 = 1800;
 /// 默认 TTL（秒），无法获取时使用
@@ -2252,6 +2255,25 @@ impl DnsResolver {
             }
         }
 
+        // 覆盖域名最后一级：DoH 和系统 DNS 都给不出 CF 地址（比如全被投毒、优选又没有
+        // 赢家）时，改查公共 ECH 入口拿 CF 共享地址。只有 2+2 个地址，所以只兜底不优先。
+        // 思路取自上游 fluxdo_doh 660a19b（上游是把论坛域名整体改查它）。
+        if screen.covered && !domain.eq_ignore_ascii_case(CLOUDFLARE_ECH_ENTRY) {
+            match self.doh_lookup_ip(CLOUDFLARE_ECH_ENTRY).await {
+                Ok((addrs, _)) => {
+                    if let Some(addrs) = screen.pass("public ECH entry", addrs) {
+                        info!(
+                            "No usable answer for {}, falling back to {} addresses {:?}",
+                            domain, CLOUDFLARE_ECH_ENTRY, addrs
+                        );
+                        self.put_ip_cache(domain, addrs.clone(), Duration::from_secs(MIN_TTL_SECS));
+                        return Ok(addrs);
+                    }
+                }
+                Err(error) => debug!("Public ECH entry lookup failed for {}: {}", domain, error),
+            }
+        }
+
         Err(screen.into_error(last_error))
     }
 
@@ -3217,6 +3239,66 @@ pub(crate) mod tests {
         stub_system_dns(host, &[]);
         let error = resolver.lookup_ip(host).await.unwrap_err();
         assert!(error.to_string().contains("poisoned"), "{}", error);
+    }
+
+    /// 按查询名作答的假 DoH 服务器：表里没有的名字回 `fallback`
+    async fn spawn_fake_doh_by_name(
+        table: Vec<(&'static str, Vec<IpAddr>)>,
+        fallback: Vec<IpAddr>,
+    ) -> (u16, Arc<parking_lot::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen_by_server = seen.clone();
+        let table = Arc::new(table);
+        let fallback = Arc::new(fallback);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let seen = seen_by_server.clone();
+                let table = table.clone();
+                let fallback = fallback.clone();
+                tokio::spawn(async move {
+                    let (head, body) = read_request(&mut stream).await;
+                    if !is_doh_request(&mut stream, &head).await {
+                        return;
+                    }
+                    let query = query_message(&head, &body);
+                    let name = query.queries()[0].name().to_ascii();
+                    let name = name.trim_end_matches('.').to_string();
+                    seen.lock().push(name.clone());
+                    let answers = table
+                        .iter()
+                        .find(|(host, _)| *host == name)
+                        .map(|(_, ips)| ips.clone())
+                        .unwrap_or_else(|| (*fallback).clone());
+                    write_dns_answers(&mut stream, &query, &answers).await;
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    /// 覆盖域名：DoH、系统 DNS 都只给出投毒地址时，改查公共 ECH 入口拿 CF 共享地址
+    #[tokio::test]
+    async fn covered_host_all_poisoned_falls_back_to_public_ech_entry() {
+        let host = "poisoned-ech-entry.linux.do";
+        let (port, seen) = spawn_fake_doh_by_name(
+            vec![(CLOUDFLARE_ECH_ENTRY, ips(&["104.18.10.118", "2606:4700::6812:a76"]))],
+            ips(&["31.13.94.36"]),
+        )
+        .await;
+        stub_system_dns(host, &["108.160.166.9"]);
+        let resolver = resolver_with(unresolvable_upstream(port)).await;
+
+        let addrs = resolver.lookup_ip(host).await.unwrap();
+        assert_eq!(addrs, ips(&["104.18.10.118", "2606:4700::6812:a76"]));
+        let names = seen.lock().clone();
+        assert!(names.iter().any(|n| n == host), "先问原域名: {:?}", names);
+        assert!(
+            names.iter().any(|n| n == CLOUDFLARE_ECH_ENTRY),
+            "再问公共 ECH 入口: {:?}",
+            names
+        );
     }
 
     /// 非覆盖域名不做 CF 网段检查：DoH 给什么用什么，也不追加系统 DNS
