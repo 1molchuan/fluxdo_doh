@@ -56,8 +56,11 @@ const MAX_KEYS: usize = 64;
 /// h2 保活
 const H2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
-/// h2 连接级接收窗口（默认 5 MiB 量级，大图 / 长帖多给点）
-const H2_CONN_WINDOW: u32 = 16 * 1024 * 1024;
+/// h2 连接级接收窗口（hyper 默认 5 MiB）。所有回环连接共用一条上游连接后，读得慢的流
+/// 各占一个流窗口（默认 2 MiB），连接窗口给大些，免得几个慢流就把同连接的其他流卡住
+const H2_CONN_WINDOW: u32 = 32 * 1024 * 1024;
+/// 单飞建连最多重来几轮（建连任务异常、结果在新代数下不能用时）
+const DIAL_ATTEMPTS: usize = 3;
 
 /// 连接分道
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -117,6 +120,8 @@ struct H1Idle {
     epoch: u64,
     peer: Option<SocketAddr>,
     since: Instant,
+    /// 刚建好、还没用过：连接任务可能还没被调度，`is_ready()` 暂时为 false，但第一个请求照样能发
+    fresh: bool,
 }
 
 #[derive(Clone)]
@@ -127,12 +132,28 @@ enum Dialed {
     Failed(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reuse {
+    Ok,
+    /// 代数变了（换网 / 亲和切换 / 离开赢家）
+    Stale,
+    /// 覆盖域名的对端地址族与亲和 / 赢家不符
+    WrongFamily,
+}
+
+/// 进行中的单飞建连
+struct Dialing {
+    /// 起跑时的网络代数：之后换过网就不再跟这一轮，另起一轮
+    net_epoch: u64,
+    rx: watch::Receiver<Option<Dialed>>,
+}
+
 #[derive(Default)]
 struct Entry {
     h2: Vec<Arc<H2Conn>>,
     h1: Vec<H1Idle>,
     /// 正在建的 h2 连接（单飞）
-    dialing: Option<watch::Receiver<Option<Dialed>>>,
+    dialing: Option<Dialing>,
     /// 对端只会 h1：不再单飞，并发请求各建各的
     h1_only: bool,
     last_used: Option<Instant>,
@@ -156,9 +177,13 @@ struct SendFailure {
 pub struct UpstreamPool {
     dialer: Arc<dyn Dialer>,
     entries: Mutex<HashMap<Key, Entry>>,
-    /// 池自己的代数：没有 EdgePin（或 FFI 换网通知时没有优选）也能整体作废
+    /// 池自己的代数（都算换网）：没有优选时的换网通知、进程冻结
     local_epoch: AtomicU64,
     last_tick_wall: Mutex<SystemTime>,
+    /// 没有优选时 FFI 换网通知的上一个网络签名（首个签名只是登记，不算换网）
+    last_network_sig: Mutex<Option<String>>,
+    /// 代理已停：不再往池里放连接
+    closed: AtomicBool,
     h2_builder: http2::Builder<TokioExecutor>,
     me: Weak<UpstreamPool>,
 }
@@ -177,6 +202,8 @@ impl UpstreamPool {
             entries: Mutex::new(HashMap::new()),
             local_epoch: AtomicU64::new(0),
             last_tick_wall: Mutex::new(SystemTime::now()),
+            last_network_sig: Mutex::new(None),
+            closed: AtomicBool::new(false),
             h2_builder,
             me: me.clone(),
         })
@@ -187,32 +214,61 @@ impl UpstreamPool {
         self.dialer.edge().map(EdgePin::epoch).unwrap_or(0) + self.local_epoch.load(Ordering::Acquire)
     }
 
+    /// 只算换网的代数（EdgePin 的换网 / 清缓存，加上池自己的）
+    fn net_epoch(&self) -> u64 {
+        self.dialer.edge().map(EdgePin::net_epoch).unwrap_or(0)
+            + self.local_epoch.load(Ordering::Acquire)
+    }
+
     /// 让现有连接全部不再复用（在途请求照常读完）
     pub fn bump_epoch(&self, reason: &str) {
         self.local_epoch.fetch_add(1, Ordering::AcqRel);
         info!("pool: epoch bumped ({})", reason);
     }
 
-    /// 连接还能不能复用：代数没变；有地址族亲和时对端同族；覆盖域名钉住赢家时与赢家同族
+    /// 记下启动时的网络签名
+    pub fn seed_network_signature(&self, sig: Option<&str>) {
+        *self.last_network_sig.lock() = sig.map(str::to_string);
+    }
+
+    /// 没有优选时的换网通知：签名真变了才作废旧连接，首个签名只登记
+    pub fn note_network_signature(&self, sig: &str) {
+        let previous = self.last_network_sig.lock().replace(sig.to_string());
+        if previous.as_deref().is_some_and(|previous| previous != sig) {
+            self.bump_epoch("network changed");
+        }
+    }
+
+    /// 连接还能不能复用
     fn usable(&self, host: &str, epoch: u64, peer: Option<SocketAddr>) -> bool {
+        self.reuse_check(host, epoch, peer) == Reuse::Ok
+    }
+
+    /// 代数没变才能复用；覆盖域名（linux.do 各子域，cf_clearance 绑出口）还要求对端与
+    /// 地址族亲和同族、钉住赢家时与赢家同族。其他主机只看代数：只有 A 记录的主机在 v6 亲和下
+    /// 本来就走 v4，按族拦掉会让它每个请求都重新握手
+    fn reuse_check(&self, host: &str, epoch: u64, peer: Option<SocketAddr>) -> Reuse {
         if epoch != self.epoch() {
             STATS.pool_stale_dropped.inc();
-            return false;
+            return Reuse::Stale;
         }
         let (Some(peer), Some(edge)) = (peer, self.dialer.edge()) else {
-            return true;
+            return Reuse::Ok;
         };
-        if edge.affinity().is_some_and(|v6| v6 != peer.is_ipv6()) {
+        if !EdgePin::is_covered(host) {
+            return Reuse::Ok;
+        }
+        let affinity_ok = edge.affinity().is_none_or(|v6| v6 == peer.is_ipv6());
+        let winner_ok = match edge.pin() {
+            Pin::Winner(winner) => winner.is_ipv6() == peer.is_ipv6(),
+            _ => true,
+        };
+        if affinity_ok && winner_ok {
+            Reuse::Ok
+        } else {
             STATS.pool_stale_dropped.inc();
-            return false;
+            Reuse::WrongFamily
         }
-        if let Pin::Winner(winner) = edge.pin() {
-            if EdgePin::is_covered(host) && winner.is_ipv6() != peer.is_ipv6() {
-                STATS.pool_stale_dropped.inc();
-                return false;
-            }
-        }
-        true
     }
 
     /// 进程冻结过（墙钟跳了一大截）就让现有连接全部作废：休眠期间 NAT 映射多半已过期，
@@ -221,12 +277,12 @@ impl UpstreamPool {
         let now = SystemTime::now();
         let mut last = self.last_tick_wall.lock();
         let gap = now.duration_since(*last).unwrap_or_default();
-        *last = now;
+        // 先作废再放行：持锁期间递增，并发进来的请求要么等锁、要么已看到新代数
         if gap > SUSPEND_GAP {
-            drop(last);
             STATS.pool_suspend_flush.inc();
             self.bump_epoch(&format!("process was frozen for {} s", gap.as_secs()));
         }
+        *last = now;
     }
 
     /// 转发一个请求。`replay` 有值表示请求可以安全重发（幂等且无请求体），给出重建的办法
@@ -256,11 +312,11 @@ impl UpstreamPool {
             };
             match self.send(&key, lease, req).await {
                 Ok(response) => return Ok(response),
-                // 复用的连接刚关、请求没发出去：原样换新连接再发
+                // 连接刚关、请求没发出去（复用的，或单飞拿到时已收到 GOAWAY）：原样换新连接再发
                 Err(SendFailure {
                     unsent: Some(unsent),
                     error,
-                }) if reused => {
+                }) if !fresh_only => {
                     STATS.pool_retry_unsent.inc();
                     debug!("pool: request to {} not sent ({}), retrying on a new connection", host, error);
                     req = unsent;
@@ -293,7 +349,9 @@ impl UpstreamPool {
                 debug!("pool: preconnected {}:{}", host, port);
             }
             // h1 预连没意义：放回空闲列表即可
-            Ok(Lease::H1 { sender, epoch, peer }) => self.put_idle_h1(&key, sender, epoch, peer),
+            Ok(Lease::H1 { sender, epoch, peer }) => {
+                self.put_idle_h1(&key, sender, epoch, peer, true)
+            }
             Err(message) => debug!("pool: preconnect {}:{} failed: {}", host, port, message),
         }
     }
@@ -301,42 +359,56 @@ impl UpstreamPool {
     // ---------- 取连接 ----------
 
     fn checkout(&self, key: &Key) -> Option<Lease> {
-        self.checkout_h2(key, true).or_else(|| self.checkout_h1(key))
+        self.checkout_h2(key, true).or_else(|| self.checkout_h1(key, true))
     }
 
-    /// 在途最少的可用 h2 连接。都满了（超软上限）且还能再开时返回 None，让调用方去建
+    /// 在途最少的可用 h2 连接。都满了（超软上限）且还能再开时照样给它，另在后台扩容一条：
+    /// 不让请求去等扩容握手，扩容失败也不连累已有的连接
     fn checkout_h2(&self, key: &Key, count: bool) -> Option<Lease> {
-        let mut entries = self.entries.lock();
-        let entry = entries.get_mut(key)?;
-        entry.h2.retain(|conn| {
-            conn.alive() && self.usable(&key.host, conn.epoch, conn.peer)
-        });
-        let best = entry
-            .h2
-            .iter()
-            .min_by_key(|conn| conn.in_flight.load(Ordering::Acquire))?
-            .clone();
-        let saturated = best.in_flight.load(Ordering::Acquire) >= H2_SOFT_STREAM_CAP;
-        if saturated && entry.h2.len() < H2_MAX_CONNS_PER_KEY {
-            return None;
+        let (best, expand) = {
+            let mut entries = self.entries.lock();
+            let entry = entries.get_mut(key)?;
+            entry.h2.retain(|conn| {
+                conn.alive() && self.usable(&key.host, conn.epoch, conn.peer)
+            });
+            let best = entry
+                .h2
+                .iter()
+                .min_by_key(|conn| conn.in_flight.load(Ordering::Acquire))?
+                .clone();
+            let saturated = best.in_flight.load(Ordering::Acquire) >= H2_SOFT_STREAM_CAP;
+            let expand = saturated
+                && entry.h2.len() < H2_MAX_CONNS_PER_KEY
+                && entry.dialing.is_none();
+            entry.last_used = Some(Instant::now());
+            (best, expand)
+        };
+        if expand {
+            if let Some(pool) = self.me.upgrade() {
+                let key = key.clone();
+                tokio::spawn(async move {
+                    let _ = pool.dial_lease(&key).await;
+                });
+            }
         }
-        entry.last_used = Some(Instant::now());
         if count {
             STATS.gw_h2_reuse.inc();
         }
         Some(Lease::H2(best))
     }
 
-    fn checkout_h1(&self, key: &Key) -> Option<Lease> {
+    fn checkout_h1(&self, key: &Key, count: bool) -> Option<Lease> {
         let mut entries = self.entries.lock();
         let entry = entries.get_mut(key)?;
         while let Some(idle) = entry.h1.pop() {
             if !idle.sender.is_closed()
-                && idle.sender.is_ready()
+                && (idle.fresh || idle.sender.is_ready())
                 && self.usable(&key.host, idle.epoch, idle.peer)
             {
                 entry.last_used = Some(Instant::now());
-                STATS.gw_h1_reuse.inc();
+                if count {
+                    STATS.gw_h1_reuse.inc();
+                }
                 return Some(Lease::H1 {
                     sender: idle.sender,
                     epoch: idle.epoch,
@@ -347,29 +419,74 @@ impl UpstreamPool {
         None
     }
 
-    /// 新建连接拿来用。h2 单飞：同 key 正在建就等它；建连在独立任务里跑，请求取消不打断
+    /// 新建连接拿来用。h2 单飞：同 key 正在建（且是在当前网络上起跑的）就等它；
+    /// 建连在独立任务里跑，请求取消不打断。拿到的连接在当前代数 / 地址族下不能用就另起一轮
     async fn dial_lease(&self, key: &Key) -> Result<Lease, String> {
+        let mut last: Option<Arc<H2Conn>> = None;
+        let mut wrong_family = false;
+        for _ in 0..DIAL_ATTEMPTS {
+            match self.dial_round(key).await? {
+                Some(Dialed::H2(conn)) => match self.reuse_check(&key.host, conn.epoch, conn.peer) {
+                    Reuse::Ok => return Ok(Lease::H2(conn)),
+                    // 连续两次都是另一族：建连方只给得出这一族（如该族没有地址），用这一次
+                    Reuse::WrongFamily if wrong_family => return Ok(Lease::H2(conn)),
+                    Reuse::WrongFamily => {
+                        wrong_family = true;
+                        last = Some(conn);
+                    }
+                    Reuse::Stale => last = Some(conn),
+                },
+                Some(Dialed::H1) => {
+                    return match self.checkout_h1(key, false) {
+                        Some(lease) => Ok(lease),
+                        None => self.dial_direct(key).await,
+                    };
+                }
+                Some(Dialed::Failed(message)) => return Err(message),
+                // 建连任务异常结束（没给结果）：它的守卫已撤销登记，重新排队
+                None => {}
+            }
+        }
+        // 几轮都没拿到当前可用的：用最后那条应付这一次（与按请求建连时一样）
+        last.map(Lease::H2)
+            .ok_or_else(|| "connect task ended without result".to_string())
+    }
+
+    /// 单飞的一轮：领头或跟随，等到结果。h1 对端直接建（返回 Err 以外的结果都经 `Ok(Some)`）
+    async fn dial_round(&self, key: &Key) -> Result<Option<Dialed>, String> {
         enum Role {
             Lead(watch::Sender<Option<Dialed>>, watch::Receiver<Option<Dialed>>),
             Follow(watch::Receiver<Option<Dialed>>),
             Direct,
         }
+        let net_epoch = self.net_epoch();
         let role = {
             let mut entries = self.entries.lock();
             let entry = entries.entry(key.clone()).or_default();
             entry.last_used = Some(Instant::now());
-            if entry.h1_only {
-                Role::Direct
-            } else if let Some(rx) = &entry.dialing {
-                Role::Follow(rx.clone())
-            } else {
-                let (tx, rx) = watch::channel(None);
-                entry.dialing = Some(rx.clone());
-                Role::Lead(tx, rx)
+            match &entry.dialing {
+                _ if entry.h1_only => Role::Direct,
+                Some(dialing) if dialing.net_epoch == net_epoch => Role::Follow(dialing.rx.clone()),
+                _ => {
+                    let (tx, rx) = watch::channel(None);
+                    entry.dialing = Some(Dialing {
+                        net_epoch,
+                        rx: rx.clone(),
+                    });
+                    Role::Lead(tx, rx)
+                }
             }
         };
         let mut rx = match role {
-            Role::Direct => return self.dial_direct(key).await,
+            Role::Direct => {
+                return match self.dial_direct(key).await? {
+                    Lease::H2(conn) => Ok(Some(Dialed::H2(conn))),
+                    Lease::H1 { sender, epoch, peer } => {
+                        self.put_idle_h1(key, sender, epoch, peer, true);
+                        Ok(Some(Dialed::H1))
+                    }
+                };
+            }
             Role::Follow(rx) => {
                 STATS.pool_dial_joined.inc();
                 rx
@@ -379,24 +496,24 @@ impl UpstreamPool {
                     return Err("pool is gone".to_string());
                 };
                 let key = key.clone();
+                let mine = rx.clone();
                 tokio::spawn(async move {
+                    // 无论正常结束还是 panic，都撤销自己这一轮的登记（只撤自己的，不碰后来的）
+                    let _registration = DialRegistration {
+                        pool: pool.clone(),
+                        key: key.clone(),
+                        rx: mine,
+                    };
                     let dialed = match pool.dial(&key).await {
                         Ok(Lease::H2(conn)) => Dialed::H2(conn),
                         Ok(Lease::H1 { sender, epoch, peer }) => {
-                            pool.put_idle_h1(&key, sender, epoch, peer);
+                            pool.put_idle_h1(&key, sender, epoch, peer, true);
+                            pool.mark_h1_only(&key);
                             Dialed::H1
                         }
                         Err(message) => Dialed::Failed(message),
                     };
-                    {
-                        let mut entries = pool.entries.lock();
-                        if let Some(entry) = entries.get_mut(&key) {
-                            entry.dialing = None;
-                            if matches!(dialed, Dialed::H1) {
-                                entry.h1_only = true;
-                            }
-                        }
-                    }
+                    drop(_registration);
                     let _ = tx.send(Some(dialed));
                 });
                 rx
@@ -406,14 +523,12 @@ impl UpstreamPool {
             Ok(dialed) => dialed.clone(),
             Err(_) => None,
         };
-        match dialed {
-            Some(Dialed::H2(conn)) => Ok(Lease::H2(conn)),
-            Some(Dialed::H1) => match self.checkout_h1(key) {
-                Some(lease) => Ok(lease),
-                None => self.dial_direct(key).await,
-            },
-            Some(Dialed::Failed(message)) => Err(message),
-            None => Err("connect task ended without result".to_string()),
+        Ok(dialed)
+    }
+
+    fn mark_h1_only(&self, key: &Key) {
+        if let Some(entry) = self.entries.lock().get_mut(key) {
+            entry.h1_only = true;
         }
     }
 
@@ -423,7 +538,8 @@ impl UpstreamPool {
     }
 
     async fn dial(&self, key: &Key) -> Result<Lease, String> {
-        let epoch = self.epoch();
+        let epoch_before = self.epoch();
+        let net_before = self.net_epoch();
         let DialedIo { io, h2, peer } = self
             .dialer
             .dial(&key.host, key.port)
@@ -443,6 +559,7 @@ impl UpstreamPool {
                 }
             });
             STATS.gw_h2_new.inc();
+            let epoch = self.epoch_after_dial(epoch_before, net_before);
             let conn = Arc::new(H2Conn {
                 sender,
                 epoch,
@@ -451,8 +568,8 @@ impl UpstreamPool {
                 last_used: Mutex::new(Instant::now()),
                 dead: AtomicBool::new(false),
             });
-            // 建连期间代数变了（换网等）就只给这一次用，不入池
-            if epoch == self.epoch() {
+            // 建连期间换过网（或连接对当前地址族不合格）就只给这一次用，不入池
+            if !self.closed.load(Ordering::Acquire) && self.usable(&key.host, epoch, peer) {
                 let mut entries = self.entries.lock();
                 let entry = entries.entry(key.clone()).or_default();
                 entry.h2.push(conn.clone());
@@ -486,9 +603,19 @@ impl UpstreamPool {
             debug!("pool: new h1 connection to {}:{} via {:?}", key.host, key.port, peer);
             Ok(Lease::H1 {
                 sender,
-                epoch,
+                epoch: self.epoch_after_dial(epoch_before, net_before),
                 peer,
             })
+        }
+    }
+
+    /// 建连期间代数的变化只来自非换网事件（多半就是这次建连触发的亲和切换）时，
+    /// 按当前代数算这条连接，地址族另由 [`Self::usable`] 核对；换过网就仍按旧代数（不复用）
+    fn epoch_after_dial(&self, epoch_before: u64, net_before: u64) -> u64 {
+        if self.net_epoch() == net_before {
+            self.epoch()
+        } else {
+            epoch_before
         }
     }
 
@@ -498,8 +625,9 @@ impl UpstreamPool {
         sender: http1::SendRequest<PoolBody>,
         epoch: u64,
         peer: Option<SocketAddr>,
+        fresh: bool,
     ) {
-        if sender.is_closed() || epoch != self.epoch() {
+        if self.closed.load(Ordering::Acquire) || sender.is_closed() || epoch != self.epoch() {
             return;
         }
         let mut entries = self.entries.lock();
@@ -512,6 +640,7 @@ impl UpstreamPool {
             epoch,
             peer,
             since: Instant::now(),
+            fresh,
         });
     }
 
@@ -532,12 +661,17 @@ impl UpstreamPool {
                 match sender.try_send_request(req).await {
                     Ok(response) => Ok(response.map(|body| PooledBody::wrap(body, guard))),
                     Err(mut error) => {
-                        conn.dead.store(true, Ordering::Release);
                         let unsent = error.take_message();
-                        Err(SendFailure {
-                            error: error.into_error(),
-                            unsent,
-                        })
+                        let error = error.into_error();
+                        // 单个流的错误（被重置、请求体出错）不连累共享连接；连接级的才判死
+                        if unsent.is_some()
+                            || error.is_closed()
+                            || error.is_canceled()
+                            || conn.sender.is_closed()
+                        {
+                            conn.dead.store(true, Ordering::Release);
+                        }
+                        Err(SendFailure { error, unsent })
                     }
                 }
             }
@@ -617,8 +751,9 @@ impl UpstreamPool {
         }
     }
 
-    /// 清空（代理停止时）
+    /// 清空并停止接收新连接（代理停止时）
     pub fn clear(&self) {
+        self.closed.store(true, Ordering::Release);
         self.entries.lock().clear();
     }
 
@@ -706,6 +841,28 @@ impl std::fmt::Display for PoolError {
     }
 }
 
+/// 单飞建连任务的登记：任务结束（含 panic）时撤销，只撤自己那一轮
+struct DialRegistration {
+    pool: Arc<UpstreamPool>,
+    key: Key,
+    rx: watch::Receiver<Option<Dialed>>,
+}
+
+impl Drop for DialRegistration {
+    fn drop(&mut self) {
+        let mut entries = self.pool.entries.lock();
+        if let Some(entry) = entries.get_mut(&self.key) {
+            if entry
+                .dialing
+                .as_ref()
+                .is_some_and(|dialing| dialing.rx.same_channel(&self.rx))
+            {
+                entry.dialing = None;
+            }
+        }
+    }
+}
+
 /// 在途流守卫：响应体读完、被丢弃或发送失败时生效
 enum StreamGuard {
     H2(Arc<H2Conn>),
@@ -738,7 +895,7 @@ impl Drop for StreamGuard {
                         .await
                         .is_ok_and(|ready| ready.is_ok())
                     {
-                        pool.put_idle_h1(&key, sender, epoch, peer);
+                        pool.put_idle_h1(&key, sender, epoch, peer, false);
                     }
                 });
             }
@@ -866,9 +1023,19 @@ mod tests {
                     let served_by = served_by.clone();
                     let hung = hung.clone();
                     let service = service_fn(move |req: Request<Incoming>| {
-                        // 只记自己发的请求（别的进程探测端口时 Host 不是这个）
-                        let ours = req.uri().host() == Some("example.test")
-                            || req.headers().get(hyper::header::HOST).is_some_and(|h| h == "example.test");
+                        // 只记自己发的请求（别的进程探测端口时 Host 是本机地址）
+                        let host = req
+                            .uri()
+                            .host()
+                            .map(str::to_string)
+                            .or_else(|| {
+                                req.headers()
+                                    .get(hyper::header::HOST)
+                                    .and_then(|h| h.to_str().ok())
+                                    .map(str::to_string)
+                            })
+                            .unwrap_or_default();
+                        let ours = !host.starts_with("127.") && !host.starts_with("localhost");
                         if ours {
                             served_by.lock().push(index);
                         }
@@ -915,12 +1082,24 @@ mod tests {
         h2: bool,
         dials: AtomicUsize,
         edge: Option<EdgePin>,
+        /// 第几次建连（从 0 数）panic
+        panic_on: Option<usize>,
+        /// 前几次之后的建连都失败
+        succeed_first: Option<usize>,
+        delay: Duration,
     }
 
     impl Dialer for TestDialer {
         fn dial<'a>(&'a self, _host: &'a str, _port: u16) -> DialFuture<'a> {
             Box::pin(async move {
-                self.dials.fetch_add(1, Ordering::SeqCst);
+                let n = self.dials.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(self.delay).await;
+                if self.panic_on == Some(n) {
+                    panic!("dial {} panics", n);
+                }
+                if self.succeed_first.is_some_and(|limit| n >= limit) {
+                    return Err(crate::error::DohProxyError::Timeout);
+                }
                 let tcp = TcpStream::connect(self.addr).await?;
                 Ok(DialedIo {
                     io: Box::new(tcp),
@@ -936,13 +1115,32 @@ mod tests {
     }
 
     fn pool_for(server: &TestServer, h2: bool, edge: Option<EdgePin>) -> (Arc<UpstreamPool>, Arc<TestDialer>) {
-        let dialer = Arc::new(TestDialer {
+        pool_with(TestDialer {
             addr: server.addr,
             h2,
             dials: AtomicUsize::new(0),
             edge,
-        });
+            panic_on: None,
+            succeed_first: None,
+            delay: Duration::ZERO,
+        })
+    }
+
+    fn pool_with(dialer: TestDialer) -> (Arc<UpstreamPool>, Arc<TestDialer>) {
+        let dialer = Arc::new(dialer);
         (UpstreamPool::new(dialer.clone()), dialer)
+    }
+
+    fn dialer_for(server: &TestServer) -> TestDialer {
+        TestDialer {
+            addr: server.addr,
+            h2: true,
+            dials: AtomicUsize::new(0),
+            edge: None,
+            panic_on: None,
+            succeed_first: None,
+            delay: Duration::ZERO,
+        }
     }
 
     fn request(method: hyper::Method, path: &str, body: &'static [u8]) -> Request<PoolBody> {
@@ -962,11 +1160,13 @@ mod tests {
     }
 
     async fn get(pool: &UpstreamPool, path: &str) -> Result<u16, PoolError> {
+        get_from(pool, "example.test", path).await
+    }
+
+    async fn get_from(pool: &UpstreamPool, host: &str, path: &str) -> Result<u16, PoolError> {
         let req = request(hyper::Method::GET, path, b"");
         let replay = Replay::capture(&req);
-        let response = pool
-            .forward(Lane::Gateway, "example.test", 443, req, replay)
-            .await?;
+        let response = pool.forward(Lane::Gateway, host, 443, req, replay).await?;
         let status = response.status().as_u16();
         let _ = response.into_body().collect().await;
         Ok(status)
@@ -1069,23 +1269,125 @@ mod tests {
         assert_eq!(server.serving_conns(), 1);
     }
 
-    /// 地址族亲和定下后，对端与亲和族不同的旧连接不再复用（cf_clearance 绑出口）
+    /// 覆盖域名：地址族亲和定下后，对端与亲和族不同的连接不再复用（cf_clearance 绑出口）；
+    /// 建连方连续两次都只给得出另一族时用这一次，不无限重建
     #[tokio::test]
-    async fn connection_outside_the_affinity_family_is_not_reused() {
+    async fn covered_connection_outside_the_affinity_family_is_not_reused() {
         let server = spawn_server(true).await;
         let (pool, dialer) = pool_for(&server, true, Some(EdgePin::new(false)));
-        assert_eq!(get(&pool, "/ok").await.unwrap(), 200);
-        assert_eq!(get(&pool, "/ok").await.unwrap(), 200);
+        let host = "connect.linux.do";
+        assert_eq!(get_from(&pool, host, "/ok").await.unwrap(), 200);
+        assert_eq!(get_from(&pool, host, "/ok").await.unwrap(), 200);
         assert_eq!(dialer.dials.load(Ordering::SeqCst), 1);
         // 亲和首次定为 IPv6（首次定下不递增代数），而现有连接的对端是 IPv4
         dialer.edge.as_ref().unwrap().report(
-            "example.test",
+            host,
             "::1".parse().unwrap(),
             Outcome::Connected {
                 rtt: None,
                 took_over: false,
             },
         );
+        assert_eq!(get_from(&pool, host, "/ok").await.unwrap(), 200);
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 3);
+    }
+
+    /// 非覆盖域名不按地址族拦：v6 亲和下只有 A 记录的主机照样复用 v4 连接
+    #[tokio::test]
+    async fn other_hosts_reuse_connections_regardless_of_family() {
+        let server = spawn_server(true).await;
+        let (pool, dialer) = pool_for(&server, true, Some(EdgePin::new(false)));
+        dialer.edge.as_ref().unwrap().report(
+            "linux.do",
+            "::1".parse().unwrap(),
+            Outcome::Connected {
+                rtt: None,
+                took_over: false,
+            },
+        );
+        assert_eq!(get(&pool, "/ok").await.unwrap(), 200);
+        assert_eq!(get(&pool, "/ok").await.unwrap(), 200);
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 1);
+    }
+
+    /// 建连任务 panic：这一 key 不会永久坏掉，下一个请求重新建连
+    #[tokio::test]
+    async fn panicking_dial_does_not_poison_the_key() {
+        let server = spawn_server(true).await;
+        let (pool, dialer) = pool_with(TestDialer {
+            panic_on: Some(0),
+            ..dialer_for(&server)
+        });
+        assert!(get(&pool, "/ok").await.is_ok());
+        assert_eq!(get(&pool, "/ok").await.unwrap(), 200);
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 2);
+    }
+
+    /// 建连途中换网：之后到的请求不跟旧网络上的那一轮，旧连接不入池
+    #[tokio::test]
+    async fn requests_after_a_network_change_do_not_follow_the_old_dial() {
+        let server = spawn_server(true).await;
+        let (pool, dialer) = pool_with(TestDialer {
+            delay: Duration::from_millis(200),
+            ..dialer_for(&server)
+        });
+        let early = {
+            let pool = pool.clone();
+            tokio::spawn(async move { get(&pool, "/ok").await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        pool.bump_epoch("test network change");
+        assert_eq!(get(&pool, "/ok").await.unwrap(), 200);
+        assert_eq!(early.await.unwrap().unwrap(), 200);
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 2);
+        assert_eq!(pool.h2_count(Lane::Gateway, "example.test", 443), 1);
+    }
+
+    /// 多线程运行时下 h1 新连接不会因为连接任务还没调度到（暂未就绪）被丢掉重建
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fresh_h1_connection_is_used_even_before_it_reports_ready() {
+        let server = spawn_server(false).await;
+        for _ in 0..20 {
+            let (pool, dialer) = pool_with(TestDialer {
+                h2: false,
+                ..dialer_for(&server)
+            });
+            assert_eq!(get(&pool, "/ok").await.unwrap(), 200);
+            assert_eq!(dialer.dials.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    /// 单连接在途超软上限时照样复用它，后台扩容失败也不连累请求
+    #[tokio::test]
+    async fn saturated_connection_keeps_serving_when_expansion_fails() {
+        let server = spawn_server(true).await;
+        let (pool, _dialer) = pool_with(TestDialer {
+            succeed_first: Some(1),
+            ..dialer_for(&server)
+        });
+        assert_eq!(get(&pool, "/ok").await.unwrap(), 200);
+        let tasks: Vec<_> = (0..H2_SOFT_STREAM_CAP + 6)
+            .map(|_| {
+                let pool = pool.clone();
+                tokio::spawn(async move { get(&pool, "/slow").await })
+            })
+            .collect();
+        for task in tasks {
+            assert_eq!(task.await.unwrap().unwrap(), 200);
+        }
+    }
+
+    /// 没有优选时的换网通知：首个签名只登记，签名真变了才作废
+    #[tokio::test]
+    async fn first_network_signature_only_registers() {
+        let server = spawn_server(true).await;
+        let (pool, dialer) = pool_for(&server, true, None);
+        assert_eq!(get(&pool, "/ok").await.unwrap(), 200);
+        pool.note_network_signature("wifi");
+        pool.note_network_signature("wifi");
+        assert_eq!(get(&pool, "/ok").await.unwrap(), 200);
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 1);
+        pool.note_network_signature("mobile");
         assert_eq!(get(&pool, "/ok").await.unwrap(), 200);
         assert_eq!(dialer.dials.load(Ordering::SeqCst), 2);
     }

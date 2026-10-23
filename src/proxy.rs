@@ -157,6 +157,7 @@ impl DohProxyServer {
         });
 
         let pool = UpstreamPool::new(doh_tls_connector.clone());
+        pool.seed_network_signature(config.network_sig.as_deref());
         Ok(Self {
             config,
             doh_config_key,

@@ -593,11 +593,11 @@ pub extern "C" fn doh_proxy_network_changed(sig: *const c_char) -> c_int {
             selector.on_network_changed(&sig);
             1
         }
-        // 没有优选：连接池自己作废旧连接，换网后它们多半已经死了
+        // 没有优选：签名真变了就由连接池自己作废旧连接（换网后它们多半已经死了），首个签名只登记
         None => {
             let server = get_runtime().block_on(async { get_server_holder().read().await.clone() });
             if let Some(server) = server {
-                server.pool().bump_epoch("network changed");
+                server.pool().note_network_signature(&sig);
             }
             0
         }

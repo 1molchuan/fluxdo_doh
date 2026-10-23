@@ -144,6 +144,8 @@ pub struct EdgePin {
     /// 出站条件的代数：换网、亲和切换、离开赢家（换赢家 / 降级 / 转待定）、清缓存时递增。
     /// 上游连接池据此判断旧连接还能不能复用（见 upstream_pool.rs）
     epoch: AtomicU64,
+    /// 其中只算换网 / 清缓存的部分：建连期间只有别的变化时，新连接仍可按新代数复用
+    net_epoch: AtomicU64,
     /// 钉住状态变化时唤醒 [`EdgePin::settled_winner`]
     pin_changed: Notify,
     listener: RwLock<Option<Weak<dyn PinListener>>>,
@@ -155,6 +157,7 @@ impl EdgePin {
             prefer_ipv6,
             state: RwLock::new(State::default()),
             epoch: AtomicU64::new(0),
+            net_epoch: AtomicU64::new(0),
             pin_changed: Notify::new(),
             listener: RwLock::new(None),
         }
@@ -423,8 +426,18 @@ impl EdgePin {
         self.epoch.load(Ordering::Acquire)
     }
 
+    /// 换网 / 清缓存部分的代数
+    pub fn net_epoch(&self) -> u64 {
+        self.net_epoch.load(Ordering::Acquire)
+    }
+
     fn bump_epoch(&self) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn bump_net_epoch(&self) {
+        self.net_epoch.fetch_add(1, Ordering::AcqRel);
+        self.bump_epoch();
     }
 
     /// 等钉住状态不再是待定（竞速 / 校验出结果）或到 `deadline`，返回那时的状态。
@@ -492,7 +505,7 @@ impl EdgePin {
     /// 网络变了：旧网络上的失败不再算到赢家头上，旧连接不再复用
     pub fn network_changed(&self) {
         self.state.write().winner_fails.clear();
-        self.bump_epoch();
+        self.bump_net_epoch();
     }
 
     // ---------- 缓存 ----------
@@ -505,7 +518,7 @@ impl EdgePin {
         state.rtt.clear();
         state.affinity = None;
         drop(state);
-        self.bump_epoch();
+        self.bump_net_epoch();
     }
 
     /// 清过期条目
