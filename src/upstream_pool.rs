@@ -822,31 +822,68 @@ mod tests {
     use tokio::task::JoinHandle;
 
     /// 本地 h2c / h1 服务端：`/ok` 立即 200；`/slow` 300 ms 后 200；
-    /// `/hang-first` 在第一条连接上永不响应、其余连接 200
+    /// `/hang-first` 第一次永不响应、之后 200。
+    /// 本机可能有别的进程探测新端口，所以只按「哪条连接处理了请求」认连接，不按 accept 顺序
     struct TestServer {
         addr: SocketAddr,
-        accepts: Arc<AtomicUsize>,
-        conns: Arc<Mutex<Vec<JoinHandle<()>>>>,
+        conns: Arc<Mutex<HashMap<usize, JoinHandle<()>>>>,
+        /// 处理过请求的连接序号（按请求顺序）
+        served_by: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl TestServer {
+        /// 处理过请求的不同连接数
+        fn serving_conns(&self) -> usize {
+            let mut seen = self.served_by.lock().clone();
+            seen.sort_unstable();
+            seen.dedup();
+            seen.len()
+        }
+
+        /// 掐断处理第 `n` 个请求的那条连接
+        fn abort_conn_of_request(&self, n: usize) {
+            let index = self.served_by.lock()[n];
+            if let Some(task) = self.conns.lock().get(&index) {
+                task.abort();
+            }
+        }
     }
 
     async fn spawn_server(h2: bool) -> TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let accepts = Arc::new(AtomicUsize::new(0));
-        let conns: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::default();
+        let conns: Arc<Mutex<HashMap<usize, JoinHandle<()>>>> = Arc::default();
+        let served_by: Arc<Mutex<Vec<usize>>> = Arc::default();
+        let hung = Arc::new(AtomicBool::new(false));
         {
-            let accepts = accepts.clone();
             let conns = conns.clone();
+            let served_by = served_by.clone();
             tokio::spawn(async move {
+                let mut next_index = 0usize;
                 while let Ok((stream, _)) = listener.accept().await {
-                    let index = accepts.fetch_add(1, Ordering::SeqCst);
-                    let service = service_fn(move |req: Request<Incoming>| async move {
-                        match req.uri().path() {
-                            "/slow" => tokio::time::sleep(Duration::from_millis(300)).await,
-                            "/hang-first" if index == 0 => std::future::pending::<()>().await,
-                            _ => {}
+                    let index = next_index;
+                    next_index += 1;
+                    let served_by = served_by.clone();
+                    let hung = hung.clone();
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        // 只记自己发的请求（别的进程探测端口时 Host 不是这个）
+                        let ours = req.uri().host() == Some("example.test")
+                            || req.headers().get(hyper::header::HOST).is_some_and(|h| h == "example.test");
+                        if ours {
+                            served_by.lock().push(index);
                         }
-                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                        let hang = req.uri().path() == "/hang-first"
+                            && !hung.swap(true, Ordering::SeqCst);
+                        let slow = req.uri().path() == "/slow";
+                        async move {
+                            if hang {
+                                std::future::pending::<()>().await;
+                            }
+                            if slow {
+                                tokio::time::sleep(Duration::from_millis(300)).await;
+                            }
+                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                        }
                     });
                     let io = TokioIo::new(stream);
                     let task = if h2 {
@@ -862,14 +899,14 @@ mod tests {
                                 .await;
                         })
                     };
-                    conns.lock().push(task);
+                    conns.lock().insert(index, task);
                 }
             });
         }
         TestServer {
             addr,
-            accepts,
             conns,
+            served_by,
         }
     }
 
@@ -949,7 +986,7 @@ mod tests {
             assert_eq!(task.await.unwrap().unwrap(), 200);
         }
         assert_eq!(dialer.dials.load(Ordering::SeqCst), 1);
-        assert_eq!(server.accepts.load(Ordering::SeqCst), 1);
+        assert_eq!(server.serving_conns(), 1);
         // 之后的请求继续复用
         assert_eq!(get(&pool, "/ok").await.unwrap(), 200);
         assert_eq!(dialer.dials.load(Ordering::SeqCst), 1);
@@ -984,7 +1021,7 @@ mod tests {
             tokio::spawn(async move { get(&pool, "/hang-first").await })
         };
         tokio::time::sleep(Duration::from_millis(100)).await;
-        server.conns.lock()[0].abort();
+        server.abort_conn_of_request(1);
         let status = tokio::time::timeout(Duration::from_secs(5), hanging)
             .await
             .expect("retry should not hang")
@@ -1011,7 +1048,7 @@ mod tests {
             })
         };
         tokio::time::sleep(Duration::from_millis(100)).await;
-        server.conns.lock()[0].abort();
+        server.abort_conn_of_request(1);
         let result = tokio::time::timeout(Duration::from_secs(5), posting)
             .await
             .unwrap()
@@ -1029,7 +1066,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(get(&pool, "/ok").await.unwrap(), 200);
         assert_eq!(dialer.dials.load(Ordering::SeqCst), 1);
-        assert_eq!(server.accepts.load(Ordering::SeqCst), 1);
+        assert_eq!(server.serving_conns(), 1);
     }
 
     /// 地址族亲和定下后，对端与亲和族不同的旧连接不再复用（cf_clearance 绑出口）
@@ -1060,7 +1097,7 @@ mod tests {
         let (pool, _dialer) = pool_for(&server, true, None);
         assert_eq!(get(&pool, "/ok").await.unwrap(), 200);
         assert_eq!(pool.h2_count(Lane::Gateway, "example.test", 443), 1);
-        server.conns.lock()[0].abort();
+        server.abort_conn_of_request(0);
         tokio::time::sleep(Duration::from_millis(100)).await;
         pool.reap();
         assert_eq!(pool.h2_count(Lane::Gateway, "example.test", 443), 0);
