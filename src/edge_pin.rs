@@ -141,7 +141,7 @@ pub struct EdgePin {
     /// 配置的地址族偏好，亲和未定时用
     prefer_ipv6: bool,
     state: RwLock<State>,
-    /// 出站条件的代数：换网、亲和切换、钉住状态变化、清缓存时递增。
+    /// 出站条件的代数：换网、亲和切换、离开赢家（换赢家 / 降级 / 转待定）、清缓存时递增。
     /// 上游连接池据此判断旧连接还能不能复用（见 upstream_pool.rs）
     epoch: AtomicU64,
     /// 钉住状态变化时唤醒 [`EdgePin::settled_winner`]
@@ -390,21 +390,25 @@ impl EdgePin {
 
     // ---------- Selector ----------
 
-    /// Selector 交出当前赢家状态。状态变了就清零赢家的失败窗口、唤醒等赢家的解析
+    /// Selector 交出当前赢家状态。状态变了就清零赢家的失败窗口、唤醒等赢家的解析；
+    /// 离开原赢家（换赢家 / 待定 / 没有）时代数递增，定下赢家不算（旧连接按地址族核对）
     pub fn set_pin(&self, pin: Pin) {
-        let changed = {
+        let (changed, left_winner) = {
             let mut state = self.state.write();
             if state.pin == pin {
-                false
+                (false, false)
             } else {
+                let left_winner = matches!(state.pin, Pin::Winner(_));
                 state.pin = pin;
                 state.winner_fails.clear();
-                true
+                (true, left_winner)
             }
         };
         if changed {
             debug!("edge: pin -> {:?}", pin);
-            self.bump_epoch();
+            if left_winner {
+                self.bump_epoch();
+            }
             self.pin_changed.notify_waiters();
         }
     }
@@ -613,12 +617,15 @@ mod tests {
         assert!(bumped(&edge), "affinity switch");
 
         edge.set_pin(Pin::Winner(v6));
-        assert!(bumped(&edge), "pin change");
+        assert!(!bumped(&edge), "settling on a winner keeps same-family connections");
         edge.set_pin(Pin::Winner(v6));
         assert!(!bumped(&edge), "same pin again");
+        let other_v6 = ip("2001:db8::20");
+        edge.set_pin(Pin::Winner(other_v6));
+        assert!(bumped(&edge), "winner changed");
 
         for _ in 0..WINNER_FAIL_THRESHOLD {
-            edge.report("linux.do", v6, Outcome::Failed);
+            edge.report("linux.do", other_v6, Outcome::Failed);
         }
         assert_eq!(edge.pin(), Pin::None);
         assert!(bumped(&edge), "winner demoted");
