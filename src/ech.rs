@@ -180,59 +180,67 @@ impl DohTlsConnector {
         edge: &EdgePin,
         route: &Route,
     ) -> Result<BoxStream> {
-        let mut last_err: Option<DohProxyError> = None;
-        if let Some(ip) = route.first {
-            match self.tcp_connect_addr(SocketAddr::new(ip, port)).await {
-                Ok(stream) => {
-                    // 只到 TCP，没有可比的 RTT
-                    edge.report(
-                        host,
-                        ip,
-                        Outcome::Connected {
-                            rtt: None,
-                            took_over: false,
-                        },
-                    );
-                    return Ok(Box::new(stream));
-                }
-                Err(e) => {
-                    warn!("Tunnel TCP connect to {} failed: {}", ip, e);
-                    edge.report(host, ip, Outcome::Failed);
-                    last_err = Some(e);
-                }
-            }
-        }
+        let first = route.first;
         let (primary, secondary) = route.split();
-        let primary_tried = !primary.is_empty()
-            || route
-                .first
-                .is_some_and(|ip| ip.is_ipv6() == route.primary_is_v6);
-        for ip in primary.iter().chain(secondary.iter()) {
-            if Some(*ip) == route.first {
-                continue;
-            }
-            match self.tcp_connect_addr(SocketAddr::new(*ip, port)).await {
-                Ok(stream) => {
-                    let took_over = route.family_decided
-                        && primary_tried
-                        && ip.is_ipv6() != route.primary_is_v6;
-                    edge.report(
-                        host,
-                        *ip,
-                        Outcome::Connected {
-                            rtt: None,
-                            took_over,
-                        },
-                    );
-                    return Ok(Box::new(stream));
-                }
-                Err(e) => {
-                    warn!("Tunnel TCP connect to {} failed: {}", ip, e);
-                    last_err = Some(e);
-                }
+        let mut primary_plan: Vec<IpAddr> = first.into_iter().collect();
+        for ip in primary {
+            if !primary_plan.contains(&ip) {
+                primary_plan.push(ip);
             }
         }
-        Err(last_err.unwrap_or_else(|| DohProxyError::Dns(format!("No reachable IP for {}", host))))
+        let secondary_plan: Vec<IpAddr> = secondary
+            .into_iter()
+            .filter(|ip| Some(*ip) != first)
+            .collect();
+        let head_start = first
+            .map(|ip| race_head_start(edge.rtt(ip)))
+            .unwrap_or(RACE_STAGGER);
+        let tcp_race = |plan: Vec<IpAddr>, head_start: Duration| {
+            race_staggered(
+                plan.into_iter().map(|ip| SocketAddr::new(ip, port)).collect(),
+                head_start,
+                RACE_STAGGER,
+                |addr| async move {
+                    timed_tcp_connect(addr, ATTEMPT_TCP_TIMEOUT)
+                        .await
+                        .inspect_err(|e| warn!("Tunnel TCP connect to {} failed: {}", addr, e))
+                },
+            )
+        };
+
+        let mut failed = Vec::new();
+        let mut result = Err(DohProxyError::Dns(format!("No reachable IP for {}", host)));
+        let mut took_over = false;
+        if !primary_plan.is_empty() {
+            let outcome = tcp_race(primary_plan, head_start).await;
+            failed.extend(outcome.failed);
+            result = outcome.result;
+        }
+        if result.is_err() && !secondary_plan.is_empty() {
+            let primary_tried = !failed.is_empty();
+            let outcome = tcp_race(secondary_plan, RACE_STAGGER).await;
+            failed.extend(outcome.failed);
+            took_over = route.family_decided && primary_tried;
+            if outcome.result.is_ok() || !primary_tried {
+                result = outcome.result;
+            }
+        }
+        if let Some(first) = first {
+            if failed.iter().any(|addr| addr.ip() == first) {
+                edge.report(host, first, Outcome::Failed);
+            }
+        }
+        let (stream, addr, _) = result?;
+        // 只到 TCP，没有可比的 RTT
+        edge.report(
+            host,
+            addr.ip(),
+            Outcome::Connected {
+                rtt: None,
+                took_over,
+            },
+        );
+        Ok(Box::new(stream))
     }
 
     /// 系统 DNS 解析（DoH 不可用时的回退）
@@ -303,25 +311,6 @@ impl DohTlsConnector {
 
     pub fn crypto_provider(&self) -> Arc<rustls::crypto::CryptoProvider> {
         self.crypto_provider.clone()
-    }
-
-    /// 从建连错误里取 ECH retry_configs：(地址, ECHConfigList 字节)
-    #[cfg(feature = "ech")]
-    fn ech_retry_from_err(error: &DohProxyError) -> Option<(Option<SocketAddr>, Vec<u8>)> {
-        match error {
-            DohProxyError::EchRetry { addr, configs } => Some((Some(*addr), configs.clone())),
-            DohProxyError::Io(e) => crate::probe::ech_retry_configs(e)
-                .filter(|configs| !configs.is_empty())
-                .map(|configs| {
-                    (
-                        None,
-                        crate::probe::encode_ech_config_list(&configs)
-                            .as_ref()
-                            .to_vec(),
-                    )
-                }),
-            _ => None,
-        }
     }
 
     /// 采纳服务端给的新钥匙：写进 resolver 覆盖（6 h）并交给 Selector，返回钥匙
@@ -458,63 +447,55 @@ impl DohTlsConnector {
             return Ok((tls_stream, None));
         }
 
-        // 2. 先单独试 EdgePin 给的首选地址：覆盖域名有赢家时是赢家（不看各自的粘性 IP
-        //    和当前地址族亲和），否则是该域名验证过、与亲和族一致的粘性 IP
+        // 2. 赛跑建连：EdgePin 给的首选地址（覆盖域名的赢家 / 粘性 IP）先跑、领先一段时间，
+        //    之后同族候选每 250 ms 起跑一个；任一失败立即放行下一个，任一成功立即中止其余。
+        //    亲和已定时首选族整族失败才由另一族接管；未定时两族赛跑，赢家定亲和。
+        //    ECH 被拒且带 retry_configs：中止整轮、采纳新钥匙后整轮重跑一次
         let edge = dns_resolver.edge_pin();
-        let doh_addrs = match &ip_result {
-            Ok(addrs) => addrs.clone(),
-            Err(_) => Vec::new(),
+        let (resolved, mut resolve_error) = match ip_result {
+            Ok(addrs) => (addrs, None),
+            Err(e) => (Vec::new(), Some(e)),
         };
-        let route = edge.route(host, doh_addrs);
-        let pinned_winner = route.first.filter(|_| route.pinned);
         #[allow(unused_mut)]
         let mut connector = connector;
-        if let Some(cached_addr) = route.first {
-            let socket_addr = SocketAddr::new(cached_addr, port);
-            debug!("Trying sticky IP for {}:{} via {}", host, port, socket_addr);
-            #[allow(unused_mut)]
-            let mut attempt = self
-                .try_connect(&connector, socket_addr, host, server_name.clone())
+        #[cfg(feature = "ech")]
+        let mut ech_retried = false;
+        loop {
+            let result = self
+                .race_route(
+                    &connector,
+                    &server_name,
+                    host,
+                    port,
+                    edge,
+                    &resolved,
+                    &mut resolve_error,
+                )
                 .await;
-            // ECH 被拒且带 retry_configs：换钥匙后同地址重试一次
-            #[cfg(feature = "ech")]
-            if let Some((_, configs)) = attempt.as_ref().err().and_then(Self::ech_retry_from_err) {
-                let key = self.adopt_retry_key(host, configs);
-                if let Ok(tls_config) = self.get_or_build_tls_config(Some(&key)).await {
-                    connector = TlsConnector::from(Self::apply_alpn(tls_config, h2_alpn));
-                    attempt = self
-                        .try_connect(&connector, socket_addr, host, server_name.clone())
-                        .await;
-                }
-            }
-            if attempt.is_ok() {
-                STATS.first_ok.inc();
-            } else {
-                STATS.first_fail.inc();
-            }
-            match attempt {
-                Ok(stream) => {
-                    // 经赢家连通时 EdgePin 把亲和强制定到赢家的地址族，后续所有域名跟着走
+            match result {
+                Ok(won) => {
                     edge.report(
                         host,
-                        socket_addr.ip(),
+                        won.addr.ip(),
                         Outcome::Connected {
-                            rtt: Some(start.elapsed()),
-                            took_over: false,
+                            rtt: Some(won.rtt),
+                            took_over: won.took_over,
                         },
                     );
                     #[cfg(feature = "ech")]
                     {
-                        let (_, conn) = stream.get_ref();
-                        let ech_status = conn.ech_status();
+                        let (_, conn) = won.stream.get_ref();
                         info!(
                             "Connected to {}:{} via {} (ECH status: {:?})",
-                            host, port, socket_addr, ech_status
+                            host,
+                            port,
+                            won.addr,
+                            conn.ech_status()
                         );
                     }
                     #[cfg(not(feature = "ech"))]
                     {
-                        info!("Connected to {}:{} via {}", host, port, socket_addr);
+                        info!("Connected to {}:{} via {}", host, port, won.addr);
                     }
                     debug!(
                         "TLS connect to {}:{} completed in {} ms",
@@ -522,86 +503,119 @@ impl DohTlsConnector {
                         port,
                         start.elapsed().as_millis()
                     );
-                    return Ok((stream, Some(socket_addr)));
+                    return Ok((won.stream, Some(won.addr)));
                 }
-                Err(e) => {
-                    warn!(
-                        "Sticky IP failed for {}:{} via {}: {}",
-                        host, port, socket_addr, e
-                    );
-                    edge.report(host, socket_addr.ip(), Outcome::Failed);
+                #[cfg(feature = "ech")]
+                Err(DohProxyError::EchRetry { configs, .. }) if !ech_retried => {
+                    ech_retried = true;
+                    let key = self.adopt_retry_key(host, configs);
+                    let tls_config = self.get_or_build_tls_config(Some(&key)).await?;
+                    connector = TlsConnector::from(Self::apply_alpn(tls_config, h2_alpn));
                 }
+                Err(e) => return Err(e),
             }
         }
+    }
 
-        // 3. 使用 IP 列表连接；DoH 查不到时回退系统 DNS，不让请求直接失败。
-        //    覆盖域名的系统 DNS 兜底和 CF 网段检查已在 lookup_ip 里做完，这里再查只会拿回假地址
-        let addrs = match ip_result {
-            Ok(addrs) if !addrs.is_empty() => addrs,
-            Ok(_) if EdgePin::is_covered(host) => {
-                return Err(DohProxyError::Dns(format!("No IP found for {}", host)));
-            }
-            Err(e) if EdgePin::is_covered(host) => return Err(e),
-            Ok(_) => {
-                warn!(
-                    "DoH returned no IP for {}, falling back to system DNS",
-                    host
-                );
-                self.system_lookup_ip(host, port).await?
-            }
-            Err(e) => {
-                warn!(
+    /// 一次建连的赛跑计划与执行（见 [`Self::connect_inner`] 第 2 步）。首选地址失败回报 EdgePin
+    /// 一次（被别人赢下而中止的不算），成功由调用方回报
+    #[allow(clippy::too_many_arguments)]
+    async fn race_route(
+        &self,
+        connector: &TlsConnector,
+        server_name: &ServerName<'static>,
+        host: &str,
+        port: u16,
+        edge: &EdgePin,
+        resolved: &[IpAddr],
+        resolve_error: &mut Option<DohProxyError>,
+    ) -> Result<Won> {
+        let mut addrs = resolved.to_vec();
+        // DoH 查不到时回退系统 DNS，不让请求直接失败。覆盖域名的系统 DNS 兜底和 CF 网段检查
+        // 已在 lookup_ip 里做完，这里再查只会拿回假地址
+        if addrs.is_empty() && !EdgePin::is_covered(host) {
+            match resolve_error.as_ref() {
+                Some(e) => warn!(
                     "DoH lookup failed for {} ({}), falling back to system DNS",
                     host, e
-                );
-                self.system_lookup_ip(host, port).await?
+                ),
+                None => warn!(
+                    "DoH returned no IP for {}, falling back to system DNS",
+                    host
+                ),
             }
-        };
-        // 失败回报后重新问一次：亲和可能刚被别的连接改过。
+            match self.system_lookup_ip(host, port).await {
+                Ok(system) => addrs = system,
+                Err(e) if edge.route(host, Vec::new()).first.is_none() => return Err(e),
+                Err(_) => {}
+            }
+        }
         // 地址族亲和：首次建连后固定出站地址族，所有域名共用，保证 cf_clearance
         // 绑定的出口 IP 在 linux.do 与其子域之间一致（见 edge_pin.rs）
         let route = edge.route(host, addrs);
+        let first = route.first;
         let (primary, secondary) = route.split();
-        let prefer_ipv6 = route.primary_is_v6;
+        let mut primary_plan: Vec<IpAddr> = first.into_iter().collect();
+        for ip in primary {
+            if !primary_plan.contains(&ip) {
+                primary_plan.push(ip);
+            }
+        }
+        let secondary_plan: Vec<IpAddr> = secondary
+            .into_iter()
+            .filter(|ip| Some(*ip) != first)
+            .collect();
+        if primary_plan.is_empty() && secondary_plan.is_empty() {
+            return Err(resolve_error
+                .take()
+                .unwrap_or_else(|| DohProxyError::Dns(format!("No IP found for {}", host))));
+        }
+        let head_start = first
+            .map(|ip| race_head_start(edge.rtt(ip)))
+            .unwrap_or(RACE_STAGGER);
         let family_name = |is_ipv6: bool| if is_ipv6 { "IPv6" } else { "IPv4" };
+        let tls_race = |plan: Vec<IpAddr>, head_start: Duration| {
+            let connector = connector.clone();
+            let server_name = server_name.clone();
+            race_staggered(
+                plan.into_iter().map(|ip| SocketAddr::new(ip, port)).collect(),
+                head_start,
+                RACE_STAGGER,
+                move |addr| attempt_tls(connector.clone(), addr, server_name.clone()),
+            )
+        };
 
-        // 某一族没有地址（如只有 AAAA 的域名）：直接连另一族，不做空赛跑——否则
-        // 空族立刻报 "No addresses" 并盖掉另一族的真实错误。这不算亲和族失败。
-        // 亲和已定：只连亲和族，整族失败才由另一族接管并切换亲和。
-        // 亲和未定（首次建连）：Happy Eyeballs 两族赛跑，赢家确定亲和。
-        // 结果里的 bool 表示「是在亲和族整族失败后由另一族接管」。
-        let result = if primary.is_empty() {
-            self.connect_to_addrs(&connector, server_name.clone(), host, port, secondary)
-                .await
-                .map(|ok| (ok, false))
-        } else if secondary.is_empty() {
-            self.connect_to_addrs(&connector, server_name.clone(), host, port, primary)
-                .await
-                .map(|ok| (ok, false))
-        } else if route.family_decided {
-            match self
-                .connect_to_addrs(&connector, server_name.clone(), host, port, primary)
-                .await
-            {
-                Ok(ok) => Ok((ok, false)),
-                Err(primary_err) => {
+        let mut failed = Vec::new();
+        let result = if primary_plan.is_empty() {
+            // 某一族没有地址（如只有 AAAA 的域名）：直接连另一族，这不算亲和族失败
+            let outcome = tls_race(secondary_plan, RACE_STAGGER).await;
+            failed.extend(outcome.failed);
+            outcome.result.map(|won| (won, false))
+        } else if secondary_plan.is_empty() || route.family_decided {
+            let outcome = tls_race(primary_plan, head_start).await;
+            failed.extend(outcome.failed);
+            match outcome.result {
+                Ok(won) => Ok((won, false)),
+                Err(e @ DohProxyError::EchRetry { .. }) => Err(e),
+                Err(primary_err) if !secondary_plan.is_empty() => {
                     warn!(
                         "All {} addresses failed for {}:{} ({}), trying {}",
-                        family_name(prefer_ipv6),
+                        family_name(route.primary_is_v6),
                         host,
                         port,
                         primary_err,
-                        family_name(!prefer_ipv6)
+                        family_name(!route.primary_is_v6)
                     );
-                    match self
-                        .connect_to_addrs(&connector, server_name.clone(), host, port, secondary)
-                        .await
-                    {
-                        Ok(ok) => Ok((ok, true)),
+                    let outcome = tls_race(secondary_plan, RACE_STAGGER).await;
+                    failed.extend(outcome.failed);
+                    match outcome.result {
+                        // 亲和族整族连不上、由另一族接管：亲和跟着切换
+                        Ok(won) => Ok((won, true)),
+                        Err(e @ DohProxyError::EchRetry { .. }) => Err(e),
                         Err(secondary_err) => {
                             warn!(
                                 "{} fallback also failed for {}:{}: {}",
-                                family_name(!prefer_ipv6),
+                                family_name(!route.primary_is_v6),
                                 host,
                                 port,
                                 secondary_err
@@ -610,115 +624,58 @@ impl DohTlsConnector {
                         }
                     }
                 }
+                Err(e) => Err(e),
             }
         } else {
-            let mut primary_fut = Box::pin(self.connect_to_addrs(
-                &connector,
-                server_name.clone(),
-                host,
-                port,
-                primary,
-            ));
-
-            let mut secondary_fut = Box::pin(async {
+            // 亲和未定（首次建连）：Happy Eyeballs，另一族晚 50 ms 起跑，先连上的定亲和
+            let primary_race = tls_race(primary_plan, head_start);
+            let secondary_race = async {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                self.connect_to_addrs(&connector, server_name.clone(), host, port, secondary)
-                    .await
-            });
-
-            let mut primary_done = false;
-            let mut secondary_done = false;
-            let mut primary_err: Option<DohProxyError> = None;
-            let mut secondary_err: Option<DohProxyError> = None;
-
+                tls_race(secondary_plan, RACE_STAGGER).await
+            };
+            tokio::pin!(primary_race, secondary_race);
+            let mut primary_done: Option<DohProxyError> = None;
+            let mut secondary_done: Option<DohProxyError> = None;
             loop {
                 tokio::select! {
-                    res = &mut primary_fut, if !primary_done => {
-                        primary_done = true;
-                        match res {
-                            Ok(ok) => break Ok((ok, false)),
-                            Err(e) => {
-                                primary_err = Some(e);
-                                if secondary_done {
-                                    break Err(primary_err.or(secondary_err).unwrap_or_else(|| {
-                                        DohProxyError::Proxy(format!("Failed to connect to {}:{}", host, port))
-                                    }));
-                                }
-                            }
+                    outcome = &mut primary_race, if primary_done.is_none() => {
+                        failed.extend(outcome.failed);
+                        match outcome.result {
+                            Ok(won) => break Ok((won, false)),
+                            Err(e @ DohProxyError::EchRetry { .. }) => break Err(e),
+                            Err(e) => primary_done = Some(e),
                         }
                     }
-                    res = &mut secondary_fut, if !secondary_done => {
-                        secondary_done = true;
-                        match res {
-                            Ok(ok) => break Ok((ok, false)),
-                            Err(e) => {
-                                secondary_err = Some(e);
-                                if primary_done {
-                                    break Err(primary_err.or(secondary_err).unwrap_or_else(|| {
-                                        DohProxyError::Proxy(format!("Failed to connect to {}:{}", host, port))
-                                    }));
-                                }
-                            }
+                    outcome = &mut secondary_race, if secondary_done.is_none() => {
+                        failed.extend(outcome.failed);
+                        match outcome.result {
+                            Ok(won) => break Ok((won, false)),
+                            Err(e @ DohProxyError::EchRetry { .. }) => break Err(e),
+                            Err(e) => secondary_done = Some(e),
                         }
                     }
+                }
+                if let (Some(_), Some(_)) = (&primary_done, &secondary_done) {
+                    break Err(primary_done
+                        .take()
+                        .unwrap_or_else(|| DohProxyError::Proxy(format!("Failed to connect to {}:{}", host, port))));
                 }
             }
         };
 
-        // 赛跑里有节点拒绝 ECH 并给了 retry_configs：采纳新钥匙后对该地址单次重试
-        #[cfg(feature = "ech")]
-        let result = match result {
-            Err(DohProxyError::EchRetry { addr, configs }) => {
-                let key = self.adopt_retry_key(host, configs);
-                let tls_config = self.get_or_build_tls_config(Some(&key)).await?;
-                let retry_connector = TlsConnector::from(Self::apply_alpn(tls_config, h2_alpn));
-                let retry_start = std::time::Instant::now();
-                self.try_connect(&retry_connector, addr, host, server_name.clone())
-                    .await
-                    .map(|stream| ((stream, addr, retry_start.elapsed()), false))
-            }
-            other => other,
-        };
-
-        match result {
-            Ok(((stream, socket_addr, rtt), switched_family)) => {
-                edge.report(
-                    host,
-                    socket_addr.ip(),
-                    Outcome::Connected {
-                        rtt: Some(rtt),
-                        took_over: switched_family,
-                    },
-                );
-                #[cfg(feature = "ech")]
-                {
-                    let (_, conn) = stream.get_ref();
-                    let ech_status = conn.ech_status();
-                    info!(
-                        "Connected to {}:{} via {} (ECH status: {:?})",
-                        host, port, socket_addr, ech_status
-                    );
-                }
-                #[cfg(not(feature = "ech"))]
-                {
-                    info!("Connected to {}:{} via {}", host, port, socket_addr);
-                }
-                debug!(
-                    "TLS connect to {}:{} completed in {} ms",
-                    host,
-                    port,
-                    start.elapsed().as_millis()
-                );
-                Ok((stream, Some(socket_addr)))
-            }
-            Err(e) => {
-                // 赢家在列表首位先试过，整体失败就记它一次
-                if let Some(winner_ip) = pinned_winner {
-                    edge.report(host, winner_ip, Outcome::Failed);
-                }
-                Err(e)
+        // 首选地址（赢家 / 粘性 IP）这次确实失败了才记它一次；被别的候选赢下而中止的不算
+        if let Some(first) = first {
+            if failed.iter().any(|addr| addr.ip() == first) {
+                warn!("First choice {} failed for {}:{}", first, host, port);
+                edge.report(host, first, Outcome::Failed);
             }
         }
+        result.map(|((stream, addr, rtt), took_over)| Won {
+            stream,
+            addr,
+            rtt,
+            took_over,
+        })
     }
 
     /// Build TLS config with optional ECH
@@ -830,180 +787,6 @@ impl DohTlsConnector {
         Ok(config)
     }
 
-    /// Try to establish a TLS connection with separate TCP/TLS timeouts
-    async fn try_connect(
-        &self,
-        connector: &TlsConnector,
-        addr: SocketAddr,
-        tunnel_host: &str,
-        server_name: ServerName<'static>,
-    ) -> Result<TlsStream<BoxStream>> {
-        // TCP 连接阶段：5s 超时
-        let tcp_stream = timed_tcp_connect(addr, Duration::from_secs(5)).await?;
-
-        // TLS 握手阶段：10s 超时
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            self.finish_tls(
-                connector,
-                server_name,
-                Box::new(tcp_stream),
-                tunnel_host,
-                addr.port(),
-            ),
-        )
-        .await
-        .map_err(|_| {
-            STATS.tls_fail.inc();
-            DohProxyError::Timeout
-        })?
-    }
-
-    /// 交错并行连接多个地址，每个地址间 250ms 延迟启动，先成功者胜出
-    async fn connect_to_addrs(
-        &self,
-        connector: &TlsConnector,
-        server_name: ServerName<'static>,
-        host: &str,
-        port: u16,
-        addrs: Vec<std::net::IpAddr>,
-    ) -> Result<(TlsStream<BoxStream>, SocketAddr, Duration)> {
-        if addrs.is_empty() {
-            return Err(DohProxyError::Proxy(format!(
-                "No addresses for {}:{}",
-                host, port
-            )));
-        }
-
-        // 只有一个地址时直接连接
-        if addrs.len() == 1 {
-            let socket_addr = SocketAddr::new(addrs[0], port);
-            debug!("Trying to connect to {}:{} via {}", host, port, socket_addr);
-            let attempt_start = std::time::Instant::now();
-            let stream = self
-                .try_connect(connector, socket_addr, host, server_name)
-                .await?;
-            return Ok((stream, socket_addr, attempt_start.elapsed()));
-        }
-
-        // 多地址交错并行：每个地址延迟 250ms 启动
-        use tokio::sync::mpsc;
-        let (tx, mut rx) = mpsc::channel(1);
-        let attempt_start = std::time::Instant::now();
-
-        for (i, addr) in addrs.iter().enumerate() {
-            STATS.race_spawned.inc();
-            let socket_addr = SocketAddr::new(*addr, port);
-            let connector = connector.clone();
-            let server_name = server_name.clone();
-            let host = host.to_string();
-            let tx = tx.clone();
-
-            tokio::spawn(async move {
-                if i > 0 {
-                    tokio::time::sleep(Duration::from_millis(250 * i as u64)).await;
-                }
-                debug!("Trying to connect to {}:{} via {}", host, port, socket_addr);
-                let start = std::time::Instant::now();
-                // TCP 连接：5s 超时
-                let tcp_stream = match timed_tcp_connect(socket_addr, Duration::from_secs(5)).await
-                {
-                    Ok(s) => s,
-                    Err(DohProxyError::Timeout) => {
-                        warn!("TCP connect timed out to {}", socket_addr);
-                        let _ = tx.send(Err(DohProxyError::Timeout)).await;
-                        return;
-                    }
-                    Err(e) => {
-                        warn!("TCP connect failed to {}: {}", socket_addr, e);
-                        let _ = tx.send(Err(e)).await;
-                        return;
-                    }
-                };
-                // TLS 握手：10s 超时
-                let tls_start = std::time::Instant::now();
-                let tls_result = tokio::time::timeout(
-                    Duration::from_secs(10),
-                    connector.connect(server_name, Box::new(tcp_stream) as BoxStream),
-                )
-                .await;
-                if !matches!(tls_result, Ok(Ok(_))) {
-                    STATS.tls_fail.inc();
-                }
-                match tls_result {
-                    Ok(Ok(stream)) => {
-                        let rtt = start.elapsed();
-                        crate::stats::record_handshake(stream.get_ref().1, tls_start.elapsed());
-                        STATS.race_handshake_ok.inc();
-                        let _ = tx.send(Ok((stream, socket_addr, rtt))).await;
-                    }
-                    Ok(Err(e)) => {
-                        match crate::probe::ech_retry_configs(&e).filter(|c| !c.is_empty()) {
-                            Some(configs) => {
-                                warn!(
-                                    "ECH rejected by {} with retry_configs (public_name {:?})",
-                                    socket_addr,
-                                    crate::probe::ech_public_names(&configs)
-                                );
-                                let configs = crate::probe::encode_ech_config_list(&configs)
-                                    .as_ref()
-                                    .to_vec();
-                                let _ = tx
-                                    .send(Err(DohProxyError::EchRetry {
-                                        addr: socket_addr,
-                                        configs,
-                                    }))
-                                    .await;
-                            }
-                            None => {
-                                warn!("TLS handshake failed to {}: {}", socket_addr, e);
-                                let _ = tx.send(Err(DohProxyError::Io(e))).await;
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        warn!("TLS handshake timed out to {}", socket_addr);
-                        let _ = tx.send(Err(DohProxyError::Timeout)).await;
-                    }
-                }
-            });
-        }
-        drop(tx);
-
-        let mut last_error = None;
-        let total = addrs.len();
-        let mut received = 0;
-        while let Some(result) = rx.recv().await {
-            received += 1;
-            match result {
-                Ok((stream, socket_addr, rtt)) => {
-                    STATS.race_won.inc();
-                    debug!(
-                        "Connected to {}:{} via {} in {} ms",
-                        host,
-                        port,
-                        socket_addr,
-                        attempt_start.elapsed().as_millis()
-                    );
-                    return Ok((stream, socket_addr, rtt));
-                }
-                Err(e) => {
-                    // ECH 被拒（带 retry_configs）优先保留，调用方据此换钥匙重试
-                    if !matches!(last_error, Some(DohProxyError::EchRetry { .. })) {
-                        last_error = Some(e);
-                    }
-                    if received >= total {
-                        break;
-                    }
-                }
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| {
-            DohProxyError::Proxy(format!("Failed to connect to {}:{}", host, port))
-        }))
-    }
-
     async fn finish_tls(
         &self,
         connector: &TlsConnector,
@@ -1030,6 +813,182 @@ impl DohTlsConnector {
         );
 
         Ok(tls_stream)
+    }
+}
+
+/// 同族候选之间的起跑间隔
+const RACE_STAGGER: Duration = Duration::from_millis(250);
+/// 单个地址的 TCP / TLS 超时
+const ATTEMPT_TCP_TIMEOUT: Duration = Duration::from_secs(5);
+const ATTEMPT_TLS_TIMEOUT: Duration = Duration::from_secs(10);
+/// 首选地址的领先时间：它历史握手耗时的两倍，限制在 300 ms～1.5 s；没有记录时 600 ms
+const HEAD_START_MIN: Duration = Duration::from_millis(300);
+const HEAD_START_MAX: Duration = Duration::from_millis(1500);
+const HEAD_START_DEFAULT: Duration = Duration::from_millis(600);
+
+fn race_head_start(rtt: Option<Duration>) -> Duration {
+    rtt.map(|rtt| (rtt * 2).clamp(HEAD_START_MIN, HEAD_START_MAX))
+        .unwrap_or(HEAD_START_DEFAULT)
+}
+
+/// 赛跑赢下的连接
+struct Won {
+    stream: TlsStream<BoxStream>,
+    addr: SocketAddr,
+    /// 这次尝试本身的耗时（TCP + TLS），进 EdgePin 的 RTT 表
+    rtt: Duration,
+    took_over: bool,
+}
+
+/// 一轮赛跑的结果；`failed` 是确实失败了的地址（被中止的不在内）
+pub(crate) struct RaceOutcome<T> {
+    pub result: Result<(T, SocketAddr, Duration)>,
+    pub failed: Vec<SocketAddr>,
+}
+
+/// 交错赛跑（Happy Eyeballs 的结构）：`addrs[0]` 立即起跑，领先 `head_start` 后其余按
+/// `stagger` 间隔逐个起跑；任一失败立即放行下一个；任一成功立即中止其余（含没起跑的）。
+/// 遇到 ECH 被拒（带 retry_configs）中止整轮返回，由调用方换钥匙重跑
+pub(crate) async fn race_staggered<T, F, Fut>(
+    addrs: Vec<SocketAddr>,
+    head_start: Duration,
+    stagger: Duration,
+    attempt: F,
+) -> RaceOutcome<T>
+where
+    T: Send + 'static,
+    F: Fn(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = Result<T>> + Send + 'static,
+{
+    let mut pending: std::collections::VecDeque<SocketAddr> = addrs.into();
+    let mut failed = Vec::new();
+    let mut last_error: Option<DohProxyError> = None;
+    let mut set = tokio::task::JoinSet::new();
+    let spawn = |set: &mut tokio::task::JoinSet<_>, addr: SocketAddr| {
+        STATS.race_spawned.inc();
+        let attempt = attempt(addr);
+        set.spawn(async move {
+            let start = std::time::Instant::now();
+            let result = attempt.await;
+            (addr, result, start.elapsed())
+        });
+    };
+    let Some(addr) = pending.pop_front() else {
+        return RaceOutcome {
+            result: Err(DohProxyError::Proxy("No addresses to connect".to_string())),
+            failed,
+        };
+    };
+    spawn(&mut set, addr);
+    let mut next_at = tokio::time::Instant::now() + head_start;
+    loop {
+        tokio::select! {
+            joined = set.join_next(), if !set.is_empty() => {
+                let Some(joined) = joined else { continue };
+                match joined {
+                    Ok((addr, Ok(value), elapsed)) => {
+                        for _ in 0..set.len() {
+                            STATS.race_aborted.inc();
+                        }
+                        set.abort_all();
+                        STATS.race_won.inc();
+                        return RaceOutcome {
+                            result: Ok((value, addr, elapsed)),
+                            failed,
+                        };
+                    }
+                    Ok((addr, Err(error), _)) => {
+                        failed.push(addr);
+                        if matches!(error, DohProxyError::EchRetry { .. }) {
+                            set.abort_all();
+                            return RaceOutcome {
+                                result: Err(error),
+                                failed,
+                            };
+                        }
+                        last_error = Some(error);
+                    }
+                    Err(join_error) => {
+                        last_error = Some(DohProxyError::Proxy(format!(
+                            "connect task failed: {}",
+                            join_error
+                        )));
+                    }
+                }
+                // 有人失败：下一个立即起跑，不等间隔
+                if let Some(next) = pending.pop_front() {
+                    spawn(&mut set, next);
+                    next_at = tokio::time::Instant::now() + stagger;
+                }
+            }
+            _ = tokio::time::sleep_until(next_at), if !pending.is_empty() => {
+                if let Some(next) = pending.pop_front() {
+                    spawn(&mut set, next);
+                }
+                next_at = tokio::time::Instant::now() + stagger;
+            }
+            else => break,
+        }
+    }
+    RaceOutcome {
+        result: Err(last_error
+            .unwrap_or_else(|| DohProxyError::Proxy("All connection attempts failed".to_string()))),
+        failed,
+    }
+}
+
+/// 单个地址：TCP（5 s）+ TLS（10 s）。ECH 被拒且带 retry_configs 时返回 [`DohProxyError::EchRetry`]
+async fn attempt_tls(
+    connector: TlsConnector,
+    addr: SocketAddr,
+    server_name: ServerName<'static>,
+) -> Result<TlsStream<BoxStream>> {
+    let tcp = match timed_tcp_connect(addr, ATTEMPT_TCP_TIMEOUT).await {
+        Ok(tcp) => tcp,
+        Err(e) => {
+            warn!("TCP connect to {} failed: {}", addr, e);
+            return Err(e);
+        }
+    };
+    let start = std::time::Instant::now();
+    match tokio::time::timeout(
+        ATTEMPT_TLS_TIMEOUT,
+        connector.connect(server_name, Box::new(tcp) as BoxStream),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => {
+            crate::stats::record_handshake(stream.get_ref().1, start.elapsed());
+            STATS.race_handshake_ok.inc();
+            Ok(stream)
+        }
+        Ok(Err(e)) => {
+            STATS.tls_fail.inc();
+            match crate::probe::ech_retry_configs(&e).filter(|c| !c.is_empty()) {
+                Some(configs) => {
+                    warn!(
+                        "ECH rejected by {} with retry_configs (public_name {:?})",
+                        addr,
+                        crate::probe::ech_public_names(&configs)
+                    );
+                    Err(DohProxyError::EchRetry {
+                        addr,
+                        configs: crate::probe::encode_ech_config_list(&configs)
+                            .as_ref()
+                            .to_vec(),
+                    })
+                }
+                None => {
+                    warn!("TLS handshake failed to {}: {}", addr, e);
+                    Err(DohProxyError::Io(e))
+                }
+            }
+        }
+        Err(_) => {
+            STATS.tls_fail.inc();
+            warn!("TLS handshake timed out to {}", addr);
+            Err(DohProxyError::Timeout)
+        }
     }
 }
 
@@ -1070,6 +1029,159 @@ mod tests {
         let connector =
             DohTlsConnector::new(Some(resolver), true, Duration::from_secs(2), None, None);
         (connector, edge)
+    }
+
+    fn race_addr(n: u8) -> SocketAddr {
+        SocketAddr::new(IpAddr::from([192, 0, 2, n]), 443)
+    }
+
+    /// 尝试被中止（future 被丢弃）时计数
+    struct DropFlag(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// 按地址末位给出假尝试：(多久之后, 成功与否)；None = 永不完成
+    fn fake_race(
+        plan: &'static [(u8, Option<(u64, bool)>)],
+        started: Arc<parking_lot::Mutex<Vec<u8>>>,
+        dropped: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> impl Fn(SocketAddr) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u8>> + Send>>
+    {
+        move |addr: SocketAddr| {
+            let started = started.clone();
+            let dropped = dropped.clone();
+            let n = match addr.ip() {
+                IpAddr::V4(v4) => v4.octets()[3],
+                IpAddr::V6(_) => 0,
+            };
+            let behavior = plan.iter().find(|(id, _)| *id == n).and_then(|(_, b)| *b);
+            Box::pin(async move {
+                started.lock().push(n);
+                let _flag = DropFlag(dropped);
+                match behavior {
+                    Some((ms, ok)) => {
+                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                        if ok {
+                            Ok(n)
+                        } else {
+                            Err(DohProxyError::Timeout)
+                        }
+                    }
+                    None => std::future::pending().await,
+                }
+            })
+        }
+    }
+
+    /// 首选地址领先期内赢下：还在跑的候选被中止，没起跑的永不起跑
+    #[tokio::test(start_paused = true)]
+    async fn race_aborts_losers_and_never_starts_the_rest() {
+        let started = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        static PLAN: [(u8, Option<(u64, bool)>); 3] = [(1, Some((300, true))), (2, None), (3, None)];
+        let outcome = race_staggered(
+            vec![race_addr(1), race_addr(2), race_addr(3)],
+            Duration::from_millis(100),
+            Duration::from_millis(250),
+            fake_race(&PLAN, started.clone(), dropped.clone()),
+        )
+        .await;
+        let (winner, addr, _) = outcome.result.unwrap();
+        assert_eq!((winner, addr), (1, race_addr(1)));
+        assert!(outcome.failed.is_empty());
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*started.lock(), vec![1, 2]);
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// 首选地址失败立即放行下一个，不等领先期
+    #[tokio::test(start_paused = true)]
+    async fn race_failure_releases_the_next_candidate_immediately() {
+        let started = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        static PLAN: [(u8, Option<(u64, bool)>); 2] = [(1, Some((10, false))), (2, Some((50, true)))];
+        let begin = tokio::time::Instant::now();
+        let outcome = race_staggered(
+            vec![race_addr(1), race_addr(2)],
+            Duration::from_millis(1000),
+            Duration::from_millis(250),
+            fake_race(&PLAN, started, dropped),
+        )
+        .await;
+        assert_eq!(outcome.result.unwrap().0, 2);
+        assert_eq!(outcome.failed, vec![race_addr(1)]);
+        assert!(begin.elapsed() < Duration::from_millis(100), "{:?}", begin.elapsed());
+    }
+
+    /// 首选地址卡住：领先期一过下一个起跑；首选被中止，不算失败
+    #[tokio::test(start_paused = true)]
+    async fn race_head_start_bounds_a_stuck_first_choice() {
+        let started = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        static PLAN: [(u8, Option<(u64, bool)>); 2] = [(1, None), (2, Some((10, true)))];
+        let begin = tokio::time::Instant::now();
+        let outcome = race_staggered(
+            vec![race_addr(1), race_addr(2)],
+            Duration::from_millis(600),
+            Duration::from_millis(250),
+            fake_race(&PLAN, started, dropped),
+        )
+        .await;
+        assert_eq!(outcome.result.unwrap().0, 2);
+        assert!(outcome.failed.is_empty());
+        let elapsed = begin.elapsed();
+        assert!(elapsed >= Duration::from_millis(600) && elapsed < Duration::from_millis(700), "{:?}", elapsed);
+    }
+
+    /// ECH 被拒（带 retry_configs）：整轮中止交给调用方换钥匙
+    #[tokio::test(start_paused = true)]
+    async fn race_stops_on_ech_retry() {
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempt = {
+            let dropped = dropped.clone();
+            move |addr: SocketAddr| {
+                let dropped = dropped.clone();
+                async move {
+                    let _flag = DropFlag(dropped);
+                    if addr == race_addr(1) {
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                        Err(DohProxyError::EchRetry {
+                            addr,
+                            configs: vec![1, 2, 3],
+                        })
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(1000)).await;
+                        Ok(())
+                    }
+                }
+            }
+        };
+        let outcome = race_staggered(
+            vec![race_addr(1), race_addr(2)],
+            Duration::from_millis(300),
+            Duration::from_millis(250),
+            attempt,
+        )
+        .await;
+        assert!(matches!(outcome.result, Err(DohProxyError::EchRetry { .. })));
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn head_start_is_twice_the_handshake_time_within_bounds() {
+        assert_eq!(race_head_start(None), Duration::from_millis(600));
+        assert_eq!(race_head_start(Some(Duration::from_millis(50))), Duration::from_millis(300));
+        assert_eq!(race_head_start(Some(Duration::from_millis(400))), Duration::from_millis(800));
+        assert_eq!(race_head_start(Some(Duration::from_secs(3))), Duration::from_millis(1500));
     }
 
     /// 隧道（connect_tcp）与 TLS 主路径同一套钉选：覆盖域名有赢家就连赢家，连通回报给 EdgePin

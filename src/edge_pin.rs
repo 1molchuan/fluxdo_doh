@@ -11,7 +11,7 @@
 //!    连不上、由另一族接管时才切换。清缓存（网络切换）时重置。
 //! 3. 候选一律先排首选族（钉住时是赢家的族，否则是亲和族，再否则配置偏好），族内按 RTT。
 //! 4. 粘性 IP 只记实际连通过的地址；与亲和族不一致的读取时作废。
-//! 5. 赢家在 60 s 内连败 3 次即解除钉住：所有覆盖域名一起离开它（指向它的粘性 IP 一并作废），
+//! 5. 赢家在 60 s 内连败 2 次即解除钉住：所有覆盖域名一起离开它（指向它的粘性 IP 一并作废），
 //!    交 Selector 降级重赛。
 //!
 //! 读写是单向的：Selector 只经 [`EdgePin::set_pin`] 交出赢家、经
@@ -34,7 +34,7 @@ const STICKY_IP_TTL_SECS: u64 = 600;
 /// 建连 RTT 记录有效期
 const IP_RTT_TTL_SECS: u64 = 600;
 /// 赢家连续失败阈值与窗口
-pub const WINNER_FAIL_THRESHOLD: usize = 3;
+pub const WINNER_FAIL_THRESHOLD: usize = 2;
 pub const WINNER_FAIL_WINDOW_SECS: u64 = 60;
 /// 粘性 / RTT 表超过这么多条时写入顺手清过期
 const PRUNE_THRESHOLD: usize = 256;
@@ -456,6 +456,17 @@ impl EdgePin {
         self.listener.read().as_ref()?.upgrade()
     }
 
+    /// 该地址最近一次建连（TCP + TLS）耗时，没有记录或已过期时为 None
+    pub fn rtt(&self, ip: IpAddr) -> Option<Duration> {
+        let now = Instant::now();
+        self.state
+            .read()
+            .rtt
+            .get(&ip)
+            .filter(|entry| entry.expires_at > now)
+            .map(|entry| Duration::from_millis(entry.value.min(u64::MAX as u128) as u64))
+    }
+
     /// 当前出站地址族亲和（`Some(true)` = IPv6），未建连过时为 `None`
     pub fn affinity(&self) -> Option<bool> {
         self.state.read().affinity
@@ -770,9 +781,8 @@ mod tests {
         edge.report("example.com", winner, Outcome::Failed);
         edge.report("linux.do", ip("104.21.0.9"), Outcome::Failed);
         edge.report("linux.do", winner, Outcome::Failed);
+        assert_eq!(edge.winner_fail_streak(), 1);
         edge.report("connect.linux.do", winner, Outcome::Failed);
-        assert_eq!(edge.winner_fail_streak(), 2);
-        edge.report("cdk.linux.do", winner, Outcome::Failed);
         assert_eq!(edge.winner_fail_streak(), 0);
         for host in [
             "linux.do",

@@ -2725,9 +2725,8 @@ mod tests {
         edge.report("linux.do", ip("104.21.0.9"), failed); // 非赢家不计
         edge.report("example.com", winner, failed); // 非覆盖域名不计
         edge.report("linux.do", winner, failed);
-        edge.report("linux.do", winner, failed);
-        assert_eq!(edge.winner_fail_streak(), 2);
-        assert_eq!(selector.status_json()["fail_streak"], 2);
+        assert_eq!(edge.winner_fail_streak(), 1);
+        assert_eq!(selector.status_json()["fail_streak"], 1);
         edge.report(
             "linux.do",
             winner,
@@ -2737,7 +2736,7 @@ mod tests {
             },
         );
         assert_eq!(edge.winner_fail_streak(), 0);
-        for _ in 0..3 {
+        for _ in 0..WINNER_FAIL_THRESHOLD {
             edge.report("linux.do", winner, failed);
         }
         // 降级后发车：run_race 走 gather（无公共 DoH、无 atlas）→ 无候选 → Failed

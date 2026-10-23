@@ -124,6 +124,7 @@ net_stats! {
         race_spawned: "赛跑排上的地址数",
         race_handshake_ok: "赛跑中完成 TLS 握手的地址数（含输家）",
         race_won: "赛跑出结果（赢家数）；race_handshake_ok - race_won = 白做的握手",
+        race_aborted: "赛跑出结果时中止的在途尝试",
         tunnel_ok: "隧道（CONNECT 不做 MITM）上游 TCP 连通",
         tunnel_fail: "隧道上游 TCP 连不通",
         gw_requests: "网关转发的请求",
