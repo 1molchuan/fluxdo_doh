@@ -18,6 +18,7 @@ pub mod ffi;
 pub mod probe;
 pub mod proxy;
 pub mod select;
+mod single_flight;
 pub mod stats;
 pub mod tls_crypto;
 pub mod upstream;
