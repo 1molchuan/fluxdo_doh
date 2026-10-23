@@ -22,6 +22,11 @@ name = "race"
 path = "examples/race.rs"
 required-features = ["ech"]
 
+[[example]]
+name = "gateway_bench"
+path = "examples/gateway_bench.rs"
+required-features = ["ech"]
+
 [features]
 default = []
 # Enable ECH support (requires cmake, NASM on Windows)
