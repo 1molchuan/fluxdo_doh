@@ -204,6 +204,12 @@ impl DohProxyServer {
 
     /// Start the proxy server
     pub async fn start(&self) -> Result<()> {
+        let listener = self.bind().await?;
+        self.serve(listener).await
+    }
+
+    /// 绑定监听端口，返回后 [`Self::port`] 即可用；接着交给 [`Self::serve`]
+    pub async fn bind(&self) -> Result<TcpListener> {
         let bind_addr = format!("{}:{}", self.config.bind_addr, self.config.bind_port);
         let listener = TcpListener::bind(&bind_addr).await?;
 
@@ -211,7 +217,11 @@ impl DohProxyServer {
         *self.local_addr.write() = Some(local_addr);
 
         info!("Local proxy server listening on {}", local_addr);
+        Ok(listener)
+    }
 
+    /// 在已绑定的端口上接受连接，直到 [`Self::stop`]
+    pub async fn serve(&self, listener: TcpListener) -> Result<()> {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let mitm_scope: Arc<[String]> = self.config.mitm_hosts.clone().into();
         crate::stats::spawn_reporter(self.shutdown_tx.subscribe());

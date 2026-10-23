@@ -163,6 +163,17 @@ fn start_server_with_config(config: ProxyConfig) -> c_int {
         }
     };
 
+    // 同步绑定端口：返回时端口已可用，不再固定睡 200 ms 等后台任务绑定
+    let listener = match rt.block_on(server.bind()) {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::error!("Failed to bind DOH proxy server: {}", e);
+            server.stop();
+            return -1;
+        }
+    };
+    let actual_port = server.port().unwrap_or(0) as c_int;
+
     // Store the server
     let server_holder = get_server_holder();
     let server_clone = server.clone();
@@ -171,23 +182,10 @@ fn start_server_with_config(config: ProxyConfig) -> c_int {
         *guard = Some(server);
     });
 
-    // Start server in background
+    // Serve in background
     rt.spawn(async move {
-        if let Err(e) = server_clone.start().await {
+        if let Err(e) = server_clone.serve(listener).await {
             tracing::error!("DOH proxy server error: {}", e);
-        }
-    });
-
-    // Wait a bit for server to bind
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
-    // Get the actual port
-    let actual_port = rt.block_on(async {
-        let guard = server_holder.read().await;
-        if let Some(ref server) = *guard {
-            server.port().unwrap_or(0) as c_int
-        } else {
-            0
         }
     });
 
