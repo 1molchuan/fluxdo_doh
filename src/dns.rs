@@ -44,6 +44,8 @@ const DEFAULT_TTL_SECS: u64 = 300;
 const CLEANUP_INTERVAL: u64 = 100;
 /// ECH 负结果（确定无 ECH）缓存时长，取短值以便域名启用 ECH 后尽快生效
 const ECH_NEGATIVE_TTL_SECS: u64 = 60;
+/// ECH 查询出错（不是「确定没有」）后的短负缓存：免得接下来每次建连都再白等一轮出错的查询
+const ECH_ERROR_NEGATIVE_TTL_SECS: u64 = 15;
 /// 有备用节点时，主客户端（系统 DNS）的连接超时（含 DNS 解析和 TLS 握手），超时即改走备用节点
 const DOH_PRIMARY_CONNECT_TIMEOUT_SECS: u64 = 3;
 /// 备用节点客户端的连接超时，按节点数平分到每个 IP
@@ -1074,6 +1076,23 @@ impl RouteTableStore {
             .filter(|table| table.is_usable(now))
     }
 
+    /// 手头现成可用的表，不等拉取：过期但可用时顺带后台刷新，没有可用表时触发一次拉取
+    fn current_nowait(self: &Arc<Self>) -> Option<Arc<RouteTable>> {
+        let now = Instant::now();
+        let table = self.table.read().clone();
+        match table {
+            Some(table) if table.is_fresh(now) => Some(table),
+            Some(table) if table.is_usable(now) => {
+                self.spawn_refresh();
+                Some(table)
+            }
+            _ => {
+                self.spawn_refresh();
+                None
+            }
+        }
+    }
+
     fn spawn_refresh(self: &Arc<Self>) {
         if self.in_backoff(Instant::now()) {
             return;
@@ -1409,6 +1428,13 @@ impl DnsResolver {
         let host = self.doh_ip.as_ref()?.host().to_string();
         let store = Self::route_table_registry().read().get(&host).cloned()?;
         store.current().await
+    }
+
+    /// 同上，但不等拉取：只给手头现成可用的表
+    fn route_table_nowait(&self) -> Option<Arc<RouteTable>> {
+        let host = self.doh_ip.as_ref()?.host().to_string();
+        let store = Self::route_table_registry().read().get(&host).cloned()?;
+        store.current_nowait()
     }
 
     fn accel_upstreams() -> &'static RwLock<HashMap<String, DohUpstream>> {
@@ -1945,6 +1971,13 @@ impl DnsResolver {
             match self.ech_inflight.join(domain) {
                 Joined::Leader(leader) => {
                     let result = self.lookup_ech_config_leader(domain).await;
+                    // 覆盖域名有 Selector 的钥匙兜底，不记；其余查询出错短暂记为无 ECH
+                    if result.is_err() && !EdgePin::is_covered(domain) {
+                        self.put_ech_negative_for(
+                            domain,
+                            Duration::from_secs(ECH_ERROR_NEGATIVE_TTL_SECS),
+                        );
+                    }
                     leader.finish(&result);
                     return result;
                 }
@@ -2111,17 +2144,27 @@ impl DnsResolver {
         // 定期清理过期缓存
         self.maybe_cleanup_caches();
 
-        // 查表模式：命中直接用表里的地址，不发 DoH；表外域名按表的 miss 策略
-        let table = self.active_route_table().await;
-        STATS.routes_wait.record(lookup_start.elapsed());
-
-        // 一等：优选覆盖的域名有赢家（EdgePin 钉住）时不再解析，赢家在前、表地址兜底；
-        // 等待竞速与等待拉表共用从 lookup 开始算的同一个 deadline
+        // 一等：优选覆盖的域名有赢家（EdgePin 钉住）时不再解析，赢家在前、表地址兜底。
+        // 等赢家与等拉表同时进行、共用从 lookup 开始算的同一个 deadline：赢家先到就不再等表
+        // （只用手头现成的表），没有赢家再接着等表。非覆盖域名不等赢家
         let deadline = lookup_start + Duration::from_secs(SELECT_LOOKUP_WAIT_SECS);
-        let pin_start = Instant::now();
-        let winner = self.edge_pin.settled_winner(domain, deadline).await;
-        STATS.pin_wait.record(pin_start.elapsed());
+        let table_wait = self.active_route_table();
+        tokio::pin!(table_wait);
+        let winner_wait = self.edge_pin.settled_winner(domain, deadline);
+        tokio::pin!(winner_wait);
+        let mut table: Option<Option<Arc<RouteTable>>> = None;
+        let winner = loop {
+            tokio::select! {
+                winner = &mut winner_wait => break winner,
+                ready = &mut table_wait, if table.is_none() => {
+                    STATS.routes_wait.record(lookup_start.elapsed());
+                    table = Some(ready);
+                }
+            }
+        };
+        STATS.pin_wait.record(lookup_start.elapsed());
         if let Some(winner) = winner {
+            let table = table.flatten().or_else(|| self.route_table_nowait());
             let mut addrs = vec![winner];
             if let Some(entry) = table.as_ref().and_then(|table| table.lookup(domain)) {
                 let mut extra = entry.addrs.clone();
@@ -2135,6 +2178,15 @@ impl DnsResolver {
             debug!("Selector winner first for {}", domain);
             return Ok(addrs);
         }
+        // 查表模式：命中直接用表里的地址，不发 DoH；表外域名按表的 miss 策略
+        let table = match table {
+            Some(table) => table,
+            None => {
+                let table = table_wait.await;
+                STATS.routes_wait.record(lookup_start.elapsed());
+                table
+            }
+        };
         if let Some(entry) = table.as_ref().and_then(|table| table.lookup(domain)) {
             if !entry.addrs.is_empty() {
                 let mut addrs = entry.addrs.clone();
@@ -2631,7 +2683,11 @@ impl DnsResolver {
 
     /// 写入 ECH 负缓存（确定无 ECH 时调用）
     fn put_ech_negative(&self, domain: &str) {
-        let expires_at = std::time::Instant::now() + Duration::from_secs(ECH_NEGATIVE_TTL_SECS);
+        self.put_ech_negative_for(domain, Duration::from_secs(ECH_NEGATIVE_TTL_SECS));
+    }
+
+    fn put_ech_negative_for(&self, domain: &str, ttl: Duration) {
+        let expires_at = std::time::Instant::now() + ttl;
         let mut cache = self.ech_negative_cache.write();
         cache.insert(domain.to_string(), expires_at);
         if cache.len() > MAX_CACHE_SIZE {
