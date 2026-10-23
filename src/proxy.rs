@@ -617,6 +617,10 @@ async fn gateway_forward_request(
             }
 
             match gateway_parse_host(&host_header) {
+                // 指向本机的请求（端口探测、误配）不转发：转回网关自己只会撞上一次 TLS 失败
+                Some((host, _)) if is_loopback_host(&host) => {
+                    return Ok(gateway_error_response(400, "Loopback host is not proxied"));
+                }
                 Some(hp) => hp,
                 None => return Ok(gateway_error_response(400, "Invalid Host header")),
             }
@@ -959,6 +963,15 @@ fn gateway_parse_host(host_header: &str) -> Option<(String, u16)> {
     }
 }
 
+/// `localhost` 或回环地址字面量
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// 判断是否为 Cloudflare 验证（Turnstile）基础设施域名。
 ///
 /// challenges.cloudflare.com 是 CF Turnstile 全球统一的固定域名（api.js 与
@@ -1076,7 +1089,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::{in_mitm_scope, is_cf_challenge_host};
+    use super::{gateway_parse_host, in_mitm_scope, is_cf_challenge_host, is_loopback_host};
 
     /// MITM 范围为空 = 不限；有值时按后缀匹配，同名前缀的伪装域不算
     #[test]
@@ -1107,5 +1120,17 @@ mod tests {
         assert!(!is_cf_challenge_host("challenges.cloudflare.com.evil.test"));
         assert!(!is_cf_challenge_host("linux.do"));
         assert!(!is_cf_challenge_host(""));
+    }
+
+    /// 网关不转发指向本机的 Host（端口探测会带 `Host: 127.0.0.1:<网关端口>`）
+    #[test]
+    fn loopback_hosts_are_recognised() {
+        for host in ["localhost", "LOCALHOST.", "127.0.0.1", "127.8.9.10", "::1"] {
+            assert!(is_loopback_host(host), "{}", host);
+        }
+        for host in ["linux.do", "localhost.linux.do", "10.0.0.1", "::2", ""] {
+            assert!(!is_loopback_host(host), "{}", host);
+        }
+        assert_eq!(gateway_parse_host("[::1]:8080"), Some(("::1".to_string(), 8080)));
     }
 }
