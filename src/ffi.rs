@@ -587,12 +587,20 @@ pub extern "C" fn doh_proxy_network_changed(sig: *const c_char) -> c_int {
         return -1;
     };
     match crate::select::Selector::global() {
+        // 有优选：换网由它判断（首个签名只是补登记），真换网时 EdgePin 代数递增、旧连接作废
         Some(selector) => {
             let _guard = get_runtime().enter();
             selector.on_network_changed(&sig);
             1
         }
-        None => 0,
+        // 没有优选：连接池自己作废旧连接，换网后它们多半已经死了
+        None => {
+            let server = get_runtime().block_on(async { get_server_holder().read().await.clone() });
+            if let Some(server) = server {
+                server.pool().bump_epoch("network changed");
+            }
+            0
+        }
     }
 }
 

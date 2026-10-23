@@ -55,7 +55,7 @@ impl Timer {
         serde_json::json!({
             "n": count,
             "total_ms": total_ms,
-            "avg_ms": if count == 0 { 0 } else { total_ms / count },
+            "avg_ms": total_ms.checked_div(count).unwrap_or(0),
             "max_ms": self.max_ms.load(Relaxed),
         })
     }
@@ -129,8 +129,16 @@ net_stats! {
         gw_requests: "网关转发的请求",
         gw_h2_reuse: "网关复用池里的 h2 连接",
         gw_h2_new: "网关新建 h2 连接",
-        gw_h1_new: "网关新建 h1 连接（不入池）",
+        gw_h1_reuse: "网关复用池里的空闲 h1 连接",
+        gw_h1_new: "网关新建 h1 连接",
         gw_502: "网关因建连 / 握手 / 转发失败回 502",
+        pool_dial_joined: "冷 key 并发请求等同一次建连（单飞）",
+        pool_preconnect: "启动预连成功",
+        pool_stale_dropped: "取连接时因代数 / 地址族不符丢弃",
+        pool_reaped: "回收器回收的连接（关闭 / 过期 / 空闲超时）",
+        pool_suspend_flush: "进程冻结后整体作废连接",
+        pool_retry_unsent: "复用连接上请求没发出去，换新连接重发",
+        pool_retry_idempotent: "复用连接上幂等请求出错，换新连接重发",
         dns_inflight_timeout: "解析跟随者等满上限仍没等到领头查询",
     }
     timers {
