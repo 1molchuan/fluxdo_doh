@@ -6,6 +6,7 @@
 use crate::dns::{DnsCacheRecord, DnsCacheStats, DnsResolver};
 use crate::edge_pin::{EdgePin, Outcome, Route};
 use crate::error::{DohProxyError, Result};
+use crate::stats::STATS;
 use crate::upstream::connect_tunnel;
 use crate::{BoxStream, UpstreamProxyConfig};
 use rustls::{pki_types::ServerName, ClientConfig, RootCertStore};
@@ -162,6 +163,22 @@ impl DohTlsConnector {
         edge: &EdgePin,
         route: &Route,
     ) -> Result<BoxStream> {
+        let result = self.connect_tcp_route_inner(host, port, edge, route).await;
+        if result.is_ok() {
+            STATS.tunnel_ok.inc();
+        } else {
+            STATS.tunnel_fail.inc();
+        }
+        result
+    }
+
+    async fn connect_tcp_route_inner(
+        &self,
+        host: &str,
+        port: u16,
+        edge: &EdgePin,
+        route: &Route,
+    ) -> Result<BoxStream> {
         let mut last_err: Option<DohProxyError> = None;
         if let Some(ip) = route.first {
             match self.tcp_connect_addr(SocketAddr::new(ip, port)).await {
@@ -239,21 +256,33 @@ impl DohTlsConnector {
 
     /// 连接单个已解析的地址（带超时）
     async fn tcp_connect_addr(&self, addr: SocketAddr) -> Result<TcpStream> {
-        tokio::time::timeout(self.timeout, TcpStream::connect(addr))
-            .await
-            .map_err(|_| DohProxyError::Timeout)?
-            .map_err(DohProxyError::Io)
+        timed_tcp_connect(addr, self.timeout).await
     }
 
     /// Connect to a server using ECH if available
     /// Returns a TLS stream that can be used for bidirectional I/O
     pub async fn connect(&self, host: &str, port: u16) -> Result<TlsStream<BoxStream>> {
-        self.connect_inner(host, port, false).await
+        Self::counted(self.connect_inner(host, port, false)).await
     }
 
     /// Connect with HTTP/2 ALPN negotiation (for gateway reverse proxy)
     pub async fn connect_h2(&self, host: &str, port: u16) -> Result<TlsStream<BoxStream>> {
-        self.connect_inner(host, port, true).await
+        Self::counted(self.connect_inner(host, port, true)).await
+    }
+
+    async fn counted(
+        connect: impl std::future::Future<Output = Result<TlsStream<BoxStream>>>,
+    ) -> Result<TlsStream<BoxStream>> {
+        let start = std::time::Instant::now();
+        let result = connect.await;
+        match &result {
+            Ok(_) => {
+                STATS.connect_ok.inc();
+                STATS.connect.record(start.elapsed());
+            }
+            Err(_) => STATS.connect_fail.inc(),
+        }
+        result
     }
 
     pub fn root_store(&self) -> &RootCertStore {
@@ -290,6 +319,7 @@ impl DohTlsConnector {
         host: &str,
         configs: Vec<u8>,
     ) -> rustls::pki_types::EchConfigListBytes<'static> {
+        STATS.ech_retry_adopted.inc();
         let key = rustls::pki_types::EchConfigListBytes::from(configs);
         if let Some(resolver) = &self.dns_resolver {
             resolver.override_ech_config(
@@ -444,6 +474,11 @@ impl DohTlsConnector {
                         .try_connect(&connector, socket_addr, host, server_name.clone())
                         .await;
                 }
+            }
+            if attempt.is_ok() {
+                STATS.first_ok.inc();
+            } else {
+                STATS.first_fail.inc();
             }
             match attempt {
                 Ok(stream) => {
@@ -792,10 +827,7 @@ impl DohTlsConnector {
         server_name: ServerName<'static>,
     ) -> Result<TlsStream<BoxStream>> {
         // TCP 连接阶段：5s 超时
-        let tcp_stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr))
-            .await
-            .map_err(|_| DohProxyError::Timeout)?
-            .map_err(DohProxyError::Io)?;
+        let tcp_stream = timed_tcp_connect(addr, Duration::from_secs(5)).await?;
 
         // TLS 握手阶段：10s 超时
         tokio::time::timeout(
@@ -809,7 +841,10 @@ impl DohTlsConnector {
             ),
         )
         .await
-        .map_err(|_| DohProxyError::Timeout)?
+        .map_err(|_| {
+            STATS.tls_fail.inc();
+            DohProxyError::Timeout
+        })?
     }
 
     /// 交错并行连接多个地址，每个地址间 250ms 延迟启动，先成功者胜出
@@ -845,6 +880,7 @@ impl DohTlsConnector {
         let attempt_start = std::time::Instant::now();
 
         for (i, addr) in addrs.iter().enumerate() {
+            STATS.race_spawned.inc();
             let socket_addr = SocketAddr::new(*addr, port);
             let connector = connector.clone();
             let server_name = server_name.clone();
@@ -858,31 +894,35 @@ impl DohTlsConnector {
                 debug!("Trying to connect to {}:{} via {}", host, port, socket_addr);
                 let start = std::time::Instant::now();
                 // TCP 连接：5s 超时
-                let tcp_result =
-                    tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(socket_addr))
-                        .await;
-                let tcp_stream = match tcp_result {
-                    Ok(Ok(s)) => s,
-                    Ok(Err(e)) => {
-                        warn!("TCP connect failed to {}: {}", socket_addr, e);
-                        let _ = tx.send(Err(DohProxyError::Io(e))).await;
-                        return;
-                    }
-                    Err(_) => {
+                let tcp_stream = match timed_tcp_connect(socket_addr, Duration::from_secs(5)).await
+                {
+                    Ok(s) => s,
+                    Err(DohProxyError::Timeout) => {
                         warn!("TCP connect timed out to {}", socket_addr);
                         let _ = tx.send(Err(DohProxyError::Timeout)).await;
                         return;
                     }
+                    Err(e) => {
+                        warn!("TCP connect failed to {}: {}", socket_addr, e);
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
                 };
                 // TLS 握手：10s 超时
+                let tls_start = std::time::Instant::now();
                 let tls_result = tokio::time::timeout(
                     Duration::from_secs(10),
                     connector.connect(server_name, Box::new(tcp_stream) as BoxStream),
                 )
                 .await;
+                if !matches!(tls_result, Ok(Ok(_))) {
+                    STATS.tls_fail.inc();
+                }
                 match tls_result {
                     Ok(Ok(stream)) => {
                         let rtt = start.elapsed();
+                        crate::stats::record_handshake(stream.get_ref().1, tls_start.elapsed());
+                        STATS.race_handshake_ok.inc();
                         let _ = tx.send(Ok((stream, socket_addr, rtt))).await;
                     }
                     Ok(Err(e)) => {
@@ -925,6 +965,7 @@ impl DohTlsConnector {
             received += 1;
             match result {
                 Ok((stream, socket_addr, rtt)) => {
+                    STATS.race_won.inc();
                     debug!(
                         "Connected to {}:{} via {} in {} ms",
                         host,
@@ -959,13 +1000,16 @@ impl DohTlsConnector {
         host: &str,
         port: u16,
     ) -> Result<TlsStream<BoxStream>> {
+        let start = std::time::Instant::now();
         let tls_stream =
             tokio::time::timeout(self.timeout, connector.connect(server_name, tcp_stream))
                 .await
-                .map_err(|_| DohProxyError::Timeout)?
-                .map_err(|e| DohProxyError::Io(e))?;
+                .map_err(|_| DohProxyError::Timeout)
+                .and_then(|result| result.map_err(DohProxyError::Io))
+                .inspect_err(|_| STATS.tls_fail.inc())?;
 
         let (_, conn) = tls_stream.get_ref();
+        crate::stats::record_handshake(conn, start.elapsed());
         debug!(
             "TLS connection established for {}:{}, protocol: {:?}",
             host,
@@ -975,6 +1019,20 @@ impl DohTlsConnector {
 
         Ok(tls_stream)
     }
+}
+
+/// 带超时的 TCP 连接，计入连通耗时 / 失败数
+async fn timed_tcp_connect(addr: SocketAddr, timeout: Duration) -> Result<TcpStream> {
+    let start = std::time::Instant::now();
+    let result = tokio::time::timeout(timeout, TcpStream::connect(addr))
+        .await
+        .map_err(|_| DohProxyError::Timeout)
+        .and_then(|result| result.map_err(DohProxyError::Io));
+    match &result {
+        Ok(_) => STATS.tcp_connect.record(start.elapsed()),
+        Err(_) => STATS.tcp_fail.inc(),
+    }
+    result
 }
 
 #[cfg(test)]

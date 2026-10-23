@@ -8,6 +8,7 @@ use crate::cert::CertManager;
 use crate::dns::DnsResolver;
 use crate::ech::DohTlsConnector;
 use crate::error::{DohProxyError, Result};
+use crate::stats::STATS;
 use crate::ProxyConfig;
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
@@ -213,6 +214,7 @@ impl DohProxyServer {
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let mitm_scope: Arc<[String]> = self.config.mitm_hosts.clone().into();
+        crate::stats::spawn_reporter(self.shutdown_tx.subscribe());
 
         loop {
             tokio::select! {
@@ -220,6 +222,7 @@ impl DohProxyServer {
                     match result {
                         Ok((stream, peer_addr)) => {
                             debug!("New connection from {}", peer_addr);
+                            crate::stats::STATS.loopback_accepts.inc();
 
                             let enable_doh = self.config.enable_doh;
                             let gateway_mode = self.config.gateway_mode;
@@ -609,6 +612,8 @@ async fn gateway_forward_request(
         }
     };
     let host_key = format!("{}:{}", host, port);
+    let started = std::time::Instant::now();
+    STATS.gw_requests.inc();
 
     debug!("Gateway {} {} -> {}", req.method(), req.uri(), host_key);
 
@@ -616,7 +621,10 @@ async fn gateway_forward_request(
     let mut sender: Option<GatewaySender> = {
         let mut p = pool.lock().await;
         match p.get(&host_key) {
-            Some(s) if s.is_ready() => Some(GatewaySender::H2(s.clone())),
+            Some(s) if s.is_ready() => {
+                STATS.gw_h2_reuse.inc();
+                Some(GatewaySender::H2(s.clone()))
+            }
             _ => {
                 p.remove(&host_key);
                 None
@@ -630,6 +638,7 @@ async fn gateway_forward_request(
             Ok(s) => s,
             Err(e) => {
                 warn!("Gateway connect failed for {}: {}", host_key, e);
+                STATS.gw_502.inc();
                 return Ok(gateway_error_response(
                     502,
                     &format!("Connect failed: {}", e),
@@ -653,6 +662,7 @@ async fn gateway_forward_request(
                 Ok(pair) => pair,
                 Err(e) => {
                     warn!("Gateway H2 handshake failed for {}: {}", host_key, e);
+                    STATS.gw_502.inc();
                     return Ok(gateway_error_response(
                         502,
                         &format!("H2 handshake failed: {}", e),
@@ -664,6 +674,7 @@ async fn gateway_forward_request(
                     debug!("Gateway H2 conn closed: {}", e);
                 }
             });
+            STATS.gw_h2_new.inc();
             let s_clone = s.clone();
             sender = Some(GatewaySender::H2(s));
             pool.lock().await.insert(host_key.clone(), s_clone);
@@ -673,6 +684,7 @@ async fn gateway_forward_request(
                 Ok(pair) => pair,
                 Err(e) => {
                     warn!("Gateway H1 handshake failed for {}: {}", host_key, e);
+                    STATS.gw_502.inc();
                     return Ok(gateway_error_response(
                         502,
                         &format!("H1 handshake failed: {}", e),
@@ -684,6 +696,7 @@ async fn gateway_forward_request(
                     debug!("Gateway H1 conn closed: {}", e);
                 }
             });
+            STATS.gw_h1_new.inc();
             // H1 不能 clone/多路复用，不入池
             sender = Some(GatewaySender::H1(s));
         }
@@ -712,9 +725,13 @@ async fn gateway_forward_request(
     };
 
     match result {
-        Ok(resp) => Ok(resp.map(|b| b.boxed())),
+        Ok(resp) => {
+            STATS.gw_ttfb.record(started.elapsed());
+            Ok(resp.map(|b| b.boxed()))
+        }
         Err(e) => {
             warn!("Gateway forward failed for {}: {}", host_key, e);
+            STATS.gw_502.inc();
             // Remove broken connection from pool
             pool.lock().await.remove(&host_key);
             Ok(gateway_error_response(

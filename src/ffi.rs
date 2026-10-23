@@ -694,6 +694,16 @@ pub extern "C" fn doh_proxy_accel_request(
     }
 }
 
+/// 网络引擎计数（建连、握手、网关转发、解析等待）：`{"ok":true,"stats":{...}}`。
+/// 进程级累计，代理重启不清零。返回的字符串需要调用 doh_proxy_free_string 释放
+#[no_mangle]
+pub extern "C" fn doh_proxy_net_stats() -> *mut c_char {
+    json_to_c_string(serde_json::json!({
+        "ok": true,
+        "stats": crate::stats::snapshot(),
+    }))
+}
+
 /// Return shared DNS resolver cache statistics.
 /// The caller must free the returned string with doh_proxy_free_string.
 #[no_mangle]

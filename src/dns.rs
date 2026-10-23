@@ -3,6 +3,7 @@
 use crate::edge_pin::EdgePin;
 use crate::error::{DohProxyError, Result};
 use crate::select::{Selector, SELECT_LOOKUP_WAIT_SECS};
+use crate::stats::STATS;
 use crate::UpstreamProxyConfig;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
@@ -1944,11 +1945,7 @@ impl DnsResolver {
 
         if !is_leader {
             // 领头查询可能在这里注册等待前就已通知，设上限避免一直挂起
-            let _ = tokio::time::timeout(
-                Duration::from_secs(INFLIGHT_WAIT_TIMEOUT_SECS),
-                notify.notified(),
-            )
-            .await;
+            Self::follower_wait(&notify).await;
             let cache = self.ech_cache.read();
             if let Some(cached) = cache.get(domain) {
                 if cached.expires_at > std::time::Instant::now() {
@@ -2106,6 +2103,18 @@ impl DnsResolver {
         prefixed
     }
 
+    /// 跟随者等领头查询，设上限避免一直挂起
+    async fn follower_wait(notify: &Notify) {
+        let start = Instant::now();
+        let waited =
+            tokio::time::timeout(Duration::from_secs(INFLIGHT_WAIT_TIMEOUT_SECS), notify.notified())
+                .await;
+        STATS.dns_follower_wait.record(start.elapsed());
+        if waited.is_err() {
+            STATS.dns_inflight_timeout.inc();
+        }
+    }
+
     /// Lookup IP addresses for a domain
     pub async fn lookup_ip(&self, domain: &str) -> Result<Vec<IpAddr>> {
         // IP 字面量不用解析
@@ -2113,17 +2122,26 @@ impl DnsResolver {
             return Ok(vec![ip]);
         }
         let lookup_start = Instant::now();
+        let result = self.lookup_ip_inner(domain, lookup_start).await;
+        STATS.lookup_ip.record(lookup_start.elapsed());
+        result
+    }
 
+    async fn lookup_ip_inner(&self, domain: &str, lookup_start: Instant) -> Result<Vec<IpAddr>> {
         // 定期清理过期缓存
         self.maybe_cleanup_caches();
 
         // 查表模式：命中直接用表里的地址，不发 DoH；表外域名按表的 miss 策略
         let table = self.active_route_table().await;
+        STATS.routes_wait.record(lookup_start.elapsed());
 
         // 一等：优选覆盖的域名有赢家（EdgePin 钉住）时不再解析，赢家在前、表地址兜底；
         // 等待竞速与等待拉表共用从 lookup 开始算的同一个 deadline
         let deadline = lookup_start + Duration::from_secs(SELECT_LOOKUP_WAIT_SECS);
-        if let Some(winner) = self.edge_pin.settled_winner(domain, deadline).await {
+        let pin_start = Instant::now();
+        let winner = self.edge_pin.settled_winner(domain, deadline).await;
+        STATS.pin_wait.record(pin_start.elapsed());
+        if let Some(winner) = winner {
             let mut addrs = vec![winner];
             if let Some(entry) = table.as_ref().and_then(|table| table.lookup(domain)) {
                 let mut extra = entry.addrs.clone();
@@ -2175,11 +2193,7 @@ impl DnsResolver {
 
         if !is_leader {
             // 领头查询可能在这里注册等待前就已通知，设上限避免一直挂起
-            let _ = tokio::time::timeout(
-                Duration::from_secs(INFLIGHT_WAIT_TIMEOUT_SECS),
-                notify.notified(),
-            )
-            .await;
+            Self::follower_wait(&notify).await;
             let cache = self.ip_cache.read();
             if let Some(cached) = cache.get(domain) {
                 if cached.expires_at > std::time::Instant::now() {
