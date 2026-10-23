@@ -9,6 +9,8 @@
 //! - `--doh <url>`：DoH 服务器（默认 App 游客档的公共加速）
 //! - `--host <host>` / `--path <path>`：请求目标（默认 linux.do /srv/status；无 cookie，403 质询不影响计时）
 //! - `--idle <s>`：空闲场景等多久（默认 20，Dart 回环连接空闲 15 s 就关）
+//! - `--preconnect`：启动后预连目标主机（App 传 `preconnect_hosts`）
+//! - `--cold-delay <ms>`：代理就绪后过多久才发首个请求（App 里中间隔着 Flutter 初始化，默认 0）
 //! - `--only cold,burst6,...`：只跑这些场景（cold burst6 serial20 idle netchange）
 //! - `--json`：末尾输出一行 JSON 汇总
 
@@ -35,7 +37,7 @@ const ATLAS_ROUTES: &str = "https://atlas.1molchuan.top/v1/routes";
 const UA: &str = "cfluxdo-gateway-bench";
 
 /// 每个场景前后对比的计数
-const COUNTERS: [&str; 16] = [
+const COUNTERS: [&str; 20] = [
     "loopback_accepts",
     "connect_ok",
     "connect_fail",
@@ -52,6 +54,10 @@ const COUNTERS: [&str; 16] = [
     "gw_h2_reuse",
     "gw_h1_new",
     "gw_502",
+    "pool_dial_joined",
+    "pool_preconnect",
+    "pool_retry_unsent",
+    "pool_retry_idempotent",
 ];
 const TIMERS: [&str; 4] = ["pin_wait", "routes_wait", "dns_follower_wait", "connect"];
 
@@ -144,7 +150,7 @@ fn report(name: &str, samples: &[Sample], d: &Value) -> Value {
         + d["tls_hrr"].as_u64().unwrap_or(0)
         + d["tls_resumed"].as_u64().unwrap_or(0);
     println!(
-        "{:<10} n={:<2} ttfb p50={:>5} p90={:>5} max={:>5} ms | 握手 {} (resumed {}) 赛跑 {}/{} 胜 {} | h2 新 {} 复用 {} h1 {} 502 {} | 等pin {} ms 等表 {} ms | {}",
+        "{:<10} n={:<2} ttfb p50={:>5} p90={:>5} max={:>5} ms | 握手 {} (resumed {}) 赛跑 {}/{} 胜 {} | h2 新 {} 复用 {} 单飞 {} 预连 {} 重发 {} h1 {} 502 {} | 等pin {} ms 等表 {} ms | {}",
         name,
         samples.len(),
         pick(0.5),
@@ -157,6 +163,9 @@ fn report(name: &str, samples: &[Sample], d: &Value) -> Value {
         d["race_won"],
         d["gw_h2_new"],
         d["gw_h2_reuse"],
+        d["pool_dial_joined"],
+        d["pool_preconnect"],
+        d["pool_retry_unsent"].as_u64().unwrap_or(0) + d["pool_retry_idempotent"].as_u64().unwrap_or(0),
         d["gw_h1_new"],
         d["gw_502"],
         d["pin_wait"]["total_ms"],
@@ -203,6 +212,8 @@ async fn main() {
         arg("--only").map(|v| v.split(',').map(|s| s.trim().to_string()).collect());
     let want = |name: &str| only.as_ref().is_none_or(|list| list.iter().any(|s| s == name));
     let emit_json = args.iter().any(|a| a == "--json");
+    let preconnect = args.iter().any(|a| a == "--preconnect");
+    let cold_delay_ms: u64 = arg("--cold-delay").and_then(|v| v.parse().ok()).unwrap_or(0);
 
     let seed: Value = seed_path
         .as_deref()
@@ -230,6 +241,7 @@ async fn main() {
         extra_covered_hosts: vec!["atlas.1molchuan.top".into(), "cfhub6.1molchuan.top".into()],
         app_version: Some("bench".to_string()),
         network_sig: arg("--sig"),
+        preconnect_hosts: if preconnect { vec![host.clone()] } else { Vec::new() },
         ..Default::default()
     };
     println!(
@@ -269,6 +281,7 @@ async fn main() {
     };
 
     if want("cold") {
+        tokio::time::sleep(Duration::from_millis(cold_delay_ms)).await;
         let before = doh_proxy::stats::snapshot();
         let sample = one_shot(port, &host, &path).await;
         run("cold", vec![sample], before);
