@@ -23,6 +23,7 @@
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -140,6 +141,9 @@ pub struct EdgePin {
     /// 配置的地址族偏好，亲和未定时用
     prefer_ipv6: bool,
     state: RwLock<State>,
+    /// 出站条件的代数：换网、亲和切换、钉住状态变化、清缓存时递增。
+    /// 上游连接池据此判断旧连接还能不能复用（见 upstream_pool.rs）
+    epoch: AtomicU64,
     /// 钉住状态变化时唤醒 [`EdgePin::settled_winner`]
     pin_changed: Notify,
     listener: RwLock<Option<Weak<dyn PinListener>>>,
@@ -150,6 +154,7 @@ impl EdgePin {
         Self {
             prefer_ipv6,
             state: RwLock::new(State::default()),
+            epoch: AtomicU64::new(0),
             pin_changed: Notify::new(),
             listener: RwLock::new(None),
         }
@@ -301,7 +306,9 @@ impl EdgePin {
                         }
                     }
                     // 赢家连通即把亲和强制定到赢家的地址族，后续所有域名跟着走
-                    Self::record_family(&mut state, ip, pinned || took_over);
+                    if Self::record_family(&mut state, ip, pinned || took_over) {
+                        self.bump_epoch();
+                    }
                 }
                 Outcome::Failed => {
                     state.sticky.remove(host);
@@ -323,6 +330,7 @@ impl EdgePin {
                             // 所有覆盖域名一起离开它：降级到重赛出结果之间不能各自回到旧赢家
                             state.sticky.retain(|_, entry| entry.value != ip);
                             demoted = Some(ip);
+                            self.bump_epoch();
                         }
                     }
                 }
@@ -355,21 +363,29 @@ impl EdgePin {
     }
 
     /// 记录一次成功建连所用的地址族。`force` 为 false 时只在尚无亲和时写入；
-    /// 为 true（经赢家连通 / 原亲和族整族连不上、由另一族接管）时强制切换
-    fn record_family(state: &mut State, addr: IpAddr, force: bool) {
+    /// 为 true（经赢家连通 / 原亲和族整族连不上、由另一族接管）时强制切换。
+    /// 返回是否从一族切到了另一族（首次定下不算）
+    fn record_family(state: &mut State, addr: IpAddr, force: bool) -> bool {
         let is_ipv6 = addr.is_ipv6();
         let family = if is_ipv6 { "IPv6" } else { "IPv4" };
-        match state.affinity {
-            Some(current) if current == is_ipv6 => return,
-            Some(_) if !force => return,
-            Some(_) => info!("Address family affinity switched to {}", family),
-            None => info!("Address family affinity set to {}", family),
-        }
+        let switched = match state.affinity {
+            Some(current) if current == is_ipv6 => return false,
+            Some(_) if !force => return false,
+            Some(_) => {
+                info!("Address family affinity switched to {}", family);
+                true
+            }
+            None => {
+                info!("Address family affinity set to {}", family);
+                false
+            }
+        };
         state.affinity = Some(is_ipv6);
         #[cfg(test)]
         {
             state.affinity_changes += 1;
         }
+        switched
     }
 
     // ---------- Selector ----------
@@ -388,7 +404,42 @@ impl EdgePin {
         };
         if changed {
             debug!("edge: pin -> {:?}", pin);
+            self.bump_epoch();
             self.pin_changed.notify_waiters();
+        }
+    }
+
+    /// 当前钉住状态
+    pub fn pin(&self) -> Pin {
+        self.state.read().pin
+    }
+
+    /// 出站条件的代数（见字段说明）
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    fn bump_epoch(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// 等钉住状态不再是待定（竞速 / 校验出结果）或到 `deadline`，返回那时的状态。
+    /// 与 [`Self::settled_winner`] 不同：不回调 Selector，只用来决定什么时候预连
+    pub async fn wait_settled(&self, deadline: Instant) -> Pin {
+        loop {
+            let notified = self.pin_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let pin = self.pin();
+            if pin != Pin::Pending {
+                return pin;
+            }
+            if tokio::time::timeout_at(deadline.into(), notified)
+                .await
+                .is_err()
+            {
+                return self.pin();
+            }
         }
     }
 
@@ -423,9 +474,10 @@ impl EdgePin {
             .count()
     }
 
-    /// 网络变了：旧网络上的失败不再算到赢家头上
+    /// 网络变了：旧网络上的失败不再算到赢家头上，旧连接不再复用
     pub fn network_changed(&self) {
         self.state.write().winner_fails.clear();
+        self.bump_epoch();
     }
 
     // ---------- 缓存 ----------
@@ -437,6 +489,8 @@ impl EdgePin {
         state.sticky.clear();
         state.rtt.clear();
         state.affinity = None;
+        drop(state);
+        self.bump_epoch();
     }
 
     /// 清过期条目
@@ -528,6 +582,51 @@ mod tests {
         // 网络切换清缓存：亲和重置
         edge.clear();
         assert_eq!(edge.affinity(), None);
+    }
+
+    /// 代数只在出站条件真变了时递增：亲和首次定下、同一赢家重复交出都不算
+    #[test]
+    fn epoch_bumps_only_when_outbound_conditions_change() {
+        let edge = EdgePin::new(false);
+        let v4 = ip("198.51.100.10");
+        let v6 = ip("2001:db8::10");
+        let mut last = edge.epoch();
+        let mut bumped = |edge: &EdgePin| {
+            let now = edge.epoch();
+            let changed = now != last;
+            last = now;
+            changed
+        };
+
+        edge.report("linux.do", v4, connected());
+        assert!(!bumped(&edge), "first affinity is not a change");
+        edge.report("linux.do", v4, connected());
+        assert!(!bumped(&edge));
+        edge.report(
+            "linux.do",
+            v6,
+            Outcome::Connected {
+                rtt: None,
+                took_over: true,
+            },
+        );
+        assert!(bumped(&edge), "affinity switch");
+
+        edge.set_pin(Pin::Winner(v6));
+        assert!(bumped(&edge), "pin change");
+        edge.set_pin(Pin::Winner(v6));
+        assert!(!bumped(&edge), "same pin again");
+
+        for _ in 0..WINNER_FAIL_THRESHOLD {
+            edge.report("linux.do", v6, Outcome::Failed);
+        }
+        assert_eq!(edge.pin(), Pin::None);
+        assert!(bumped(&edge), "winner demoted");
+
+        edge.network_changed();
+        assert!(bumped(&edge), "network changed");
+        edge.clear();
+        assert!(bumped(&edge), "caches cleared");
     }
 
     const COVERED: [&str; 3] = ["linux.do", "connect.linux.do", "cdk.linux.do"];

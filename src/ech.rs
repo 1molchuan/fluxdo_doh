@@ -263,17 +263,28 @@ impl DohTlsConnector {
     /// Connect to a server using ECH if available
     /// Returns a TLS stream that can be used for bidirectional I/O
     pub async fn connect(&self, host: &str, port: u16) -> Result<TlsStream<BoxStream>> {
-        Self::counted(self.connect_inner(host, port, false)).await
+        Self::counted(self.connect_inner(host, port, false))
+            .await
+            .map(|(stream, _)| stream)
     }
 
     /// Connect with HTTP/2 ALPN negotiation (for gateway reverse proxy)
     pub async fn connect_h2(&self, host: &str, port: u16) -> Result<TlsStream<BoxStream>> {
+        Self::counted(self.connect_inner(host, port, true))
+            .await
+            .map(|(stream, _)| stream)
+    }
+
+    /// 同 [`Self::connect_h2`]，另给出对端地址（经上游代理时为 None）：连接池按它核对地址族
+    pub async fn connect_h2_with_peer(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<(TlsStream<BoxStream>, Option<SocketAddr>)> {
         Self::counted(self.connect_inner(host, port, true)).await
     }
 
-    async fn counted(
-        connect: impl std::future::Future<Output = Result<TlsStream<BoxStream>>>,
-    ) -> Result<TlsStream<BoxStream>> {
+    async fn counted<T>(connect: impl std::future::Future<Output = Result<T>>) -> Result<T> {
         let start = std::time::Instant::now();
         let result = connect.await;
         match &result {
@@ -354,7 +365,7 @@ impl DohTlsConnector {
         host: &str,
         port: u16,
         h2_alpn: bool,
-    ) -> Result<TlsStream<BoxStream>> {
+    ) -> Result<(TlsStream<BoxStream>, Option<SocketAddr>)> {
         let start = std::time::Instant::now();
         let server_name = ServerName::try_from(host.to_string())
             .map_err(|_| DohProxyError::InvalidUrl(format!("Invalid server name: {}", host)))?;
@@ -381,7 +392,7 @@ impl DohTlsConnector {
                 port,
                 start.elapsed().as_millis()
             );
-            return Ok(tls_stream);
+            return Ok((tls_stream, None));
         }
 
         let dns_resolver = self
@@ -444,7 +455,7 @@ impl DohTlsConnector {
                 port,
                 start.elapsed().as_millis()
             );
-            return Ok(tls_stream);
+            return Ok((tls_stream, None));
         }
 
         // 2. 先单独试 EdgePin 给的首选地址：覆盖域名有赢家时是赢家（不看各自的粘性 IP
@@ -511,7 +522,7 @@ impl DohTlsConnector {
                         port,
                         start.elapsed().as_millis()
                     );
-                    return Ok(stream);
+                    return Ok((stream, Some(socket_addr)));
                 }
                 Err(e) => {
                     warn!(
@@ -698,7 +709,7 @@ impl DohTlsConnector {
                     port,
                     start.elapsed().as_millis()
                 );
-                Ok(stream)
+                Ok((stream, Some(socket_addr)))
             }
             Err(e) => {
                 // 赢家在列表首位先试过，整体失败就记它一次
