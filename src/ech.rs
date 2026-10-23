@@ -151,6 +151,7 @@ impl DohTlsConnector {
             .await
             .map_err(|_| DohProxyError::Timeout)?
             .map_err(DohProxyError::Io)?;
+        let _ = stream.set_nodelay(true);
         Ok(Box::new(stream))
     }
 
@@ -1021,7 +1022,7 @@ impl DohTlsConnector {
     }
 }
 
-/// 带超时的 TCP 连接，计入连通耗时 / 失败数
+/// 带超时的 TCP 连接（TCP_NODELAY），计入连通耗时 / 失败数
 async fn timed_tcp_connect(addr: SocketAddr, timeout: Duration) -> Result<TcpStream> {
     let start = std::time::Instant::now();
     let result = tokio::time::timeout(timeout, TcpStream::connect(addr))
@@ -1029,7 +1030,11 @@ async fn timed_tcp_connect(addr: SocketAddr, timeout: Duration) -> Result<TcpStr
         .map_err(|_| DohProxyError::Timeout)
         .and_then(|result| result.map_err(DohProxyError::Io));
     match &result {
-        Ok(_) => STATS.tcp_connect.record(start.elapsed()),
+        Ok(stream) => {
+            STATS.tcp_connect.record(start.elapsed());
+            // 握手与小请求都是小包往返，关掉 Nagle
+            let _ = stream.set_nodelay(true);
+        }
         Err(_) => STATS.tcp_fail.inc(),
     }
     result

@@ -115,6 +115,7 @@ pub async fn connect_http_tunnel(
     );
 
     let mut stream = TcpStream::connect((proxy.host.as_str(), proxy.port)).await?;
+    let _ = stream.set_nodelay(true);
     let mut request = format!(
         "CONNECT {} HTTP/1.1\r\nHost: {}\r\nProxy-Connection: Keep-Alive\r\n",
         authority, authority
@@ -212,6 +213,7 @@ pub async fn connect_socks5_tunnel(
     );
 
     let mut stream = TcpStream::connect((proxy.host.as_str(), proxy.port)).await?;
+    let _ = stream.set_nodelay(true);
     let has_auth = proxy.auth_pair().is_some();
     let methods = if has_auth {
         vec![0x00, 0x02]

@@ -233,6 +233,7 @@ impl DohProxyServer {
                         Ok((stream, peer_addr)) => {
                             debug!("New connection from {}", peer_addr);
                             crate::stats::STATS.loopback_accepts.inc();
+                            let _ = stream.set_nodelay(true);
 
                             let enable_doh = self.config.enable_doh;
                             let gateway_mode = self.config.gateway_mode;
