@@ -177,7 +177,8 @@ impl EdgePin {
             .write() = normalized;
     }
 
-    /// 是否由本地优选覆盖：linux.do / *.linux.do，以及登记的额外主机名。
+    /// 是否由本地优选覆盖：linux.do / *.linux.do，以及登记的额外主机名（含其子域，
+    /// 另一个论坛 idcflare.com 就靠这条跟 linux.do 共用赢家）。
     /// 不按「表内地址在 CF 网段」扩展：别的 zone 可能用 CF 专用边缘，赢家 IP 对它们是 403，
     /// 会把无关失败算到赢家头上
     pub fn is_covered(host: &str) -> bool {
@@ -185,9 +186,14 @@ impl EdgePin {
         if host == "linux.do" || host.ends_with(".linux.do") {
             return true;
         }
-        EXTRA_COVERED_HOSTS
-            .get()
-            .is_some_and(|hosts| hosts.read().contains(&host))
+        EXTRA_COVERED_HOSTS.get().is_some_and(|hosts| {
+            hosts.read().iter().any(|extra| {
+                host == *extra
+                    || (host.len() > extra.len() + 1
+                        && host.ends_with(extra.as_str())
+                        && host.as_bytes()[host.len() - extra.len() - 1] == b'.')
+            })
+        })
     }
 
     // ---------- 建连方：问 ----------
@@ -807,5 +813,18 @@ mod tests {
             assert_eq!(route.first, None, "{} 不能再回到旧赢家", host);
         }
         assert_eq!(edge.settled_winner("linux.do", Instant::now()).await, None);
+    }
+
+    #[test]
+    fn extra_covered_hosts_match_subdomains_too() {
+        EdgePin::set_extra_covered_hosts(&["idcflare.com".to_string(), "Atlas.Example.".to_string()]);
+        assert!(EdgePin::is_covered("idcflare.com"));
+        assert!(EdgePin::is_covered("www.idcflare.com"));
+        assert!(EdgePin::is_covered("IDCFLARE.COM."));
+        assert!(EdgePin::is_covered("atlas.example"));
+        assert!(!EdgePin::is_covered("notidcflare.com"));
+        assert!(!EdgePin::is_covered("idcflare.com.evil.test"));
+        assert!(EdgePin::is_covered("cdn.linux.do"));
+        EdgePin::set_extra_covered_hosts(&[]);
     }
 }
