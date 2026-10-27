@@ -36,6 +36,9 @@ const MIN_TTL_SECS: u64 = 60;
 /// Cloudflare 的公共 ECH 入口：解析到 CF 共享网段，开了 ECH 的 CF 站点都能经这些
 /// 地址连（内层 SNI 仍是原域名，2026-10-21 实测 linux.do ECH Accepted）
 const CLOUDFLARE_ECH_ENTRY: &str = "cloudflare-ech.com";
+/// 覆盖域名查不到自己的 ECH 时借这个域名的钥匙：Cloudflare 全网同一套 ECH 钥匙
+/// （外层都是 cloudflare-ech.com），idcflare.com 用 linux.do 的钥匙 2026-10-27 实测 Accepted
+const SHARED_ECH_KEY_HOST: &str = "linux.do";
 /// TTL 上限（秒）
 const MAX_TTL_SECS: u64 = 1800;
 /// 默认 TTL（秒），无法获取时使用
@@ -1942,9 +1945,16 @@ impl DnsResolver {
             }
         }
 
-        // 查表模式：表里有就用表里的 ECH，没有按无 ECH 处理，都不再查 DoH
+        // 查表模式：表里有就用表里的 ECH，没有按无 ECH 处理，都不再查 DoH。
+        // 覆盖域名（另一个论坛 idcflare.com 等）不在表里时借 linux.do 的钥匙：按无 ECH 处理就是
+        // 明文 SNI 握手，国内直接被掐（Selector 还没钥匙的冷启动窗口里实测 tls handshake eof）
         if let Some(table) = self.active_route_table().await {
-            return Ok(table.lookup(domain).and_then(|entry| entry.ech.clone()));
+            let entry = table.lookup(domain).or_else(|| {
+                EdgePin::is_covered(domain)
+                    .then(|| table.lookup(SHARED_ECH_KEY_HOST))
+                    .flatten()
+            });
+            return Ok(entry.and_then(|entry| entry.ech.clone()));
         }
 
         // Check cache first
@@ -2418,6 +2428,10 @@ impl DnsResolver {
                 None
             }
         };
+        let ech_config = match ech_config {
+            None if EdgePin::is_covered(domain) => self.covered_ech_fallback(domain).await,
+            other => other,
+        };
 
         // 尝试从 HTTPS 记录中获取 IP hint 并合并
         let ip_result = match ip_result {
@@ -2426,6 +2440,31 @@ impl DnsResolver {
         };
 
         (ech_config, ip_result)
+    }
+
+    /// 覆盖域名查完还没有 ECH（冷启动 Selector 钥匙过期正在竞速、DoH 没给）：查 IP 要等赢家，
+    /// 等到时竞速多半已经拿到钥匙，再问一次 Selector；还没有就借 linux.do 的钥匙。
+    /// 否则这条连接明文 SNI，国内被掐，而且会作为 h2 连接在池里被后续请求一直复用
+    async fn covered_ech_fallback(&self, domain: &str) -> Option<EchConfigListBytes<'static>> {
+        if let Some(key) = Selector::global().and_then(|s| s.current_ech_key()) {
+            debug!("Selector ECH key used for {} after waiting for the pin", domain);
+            return Some(key);
+        }
+        if domain
+            .trim_end_matches('.')
+            .eq_ignore_ascii_case(SHARED_ECH_KEY_HOST)
+        {
+            return None;
+        }
+        let key = self
+            .lookup_ech_config(SHARED_ECH_KEY_HOST)
+            .await
+            .ok()
+            .flatten();
+        if key.is_some() {
+            debug!("Borrowed {} ECH key for {}", SHARED_ECH_KEY_HOST, domain);
+        }
+        key
     }
 
     pub async fn lookup_host(&self, domain: &str, force_refresh: bool) -> Result<LookupHostResult> {
@@ -3855,6 +3894,37 @@ pub(crate) mod tests {
             Some(DOH_USER_AGENT)
         );
         assert!(header_value(&heads[0], "authorization").is_none());
+    }
+
+    /// 覆盖域名不在表里时借 linux.do 的 ECH 钥匙（另一个论坛 idcflare.com 不能明文 SNI）；
+    /// 表里明确列出、没给钥匙的覆盖域名建连时也借；非覆盖域名表外仍按无 ECH
+    #[tokio::test]
+    async fn route_table_lends_linux_do_ech_to_covered_hosts() {
+        let (doh_port, doh_seen) = spawn_fake_doh().await;
+        let table = serde_json::json!({
+            "generated": now_unix(),
+            "serial": now_unix(),
+            "ttl": 600,
+            "max_stale": 86400,
+            "routes": [
+                {"name": "linux.do", "wildcard": false, "v4": [TABLE_V4.to_string()], "ech": STANDARD.encode([0xfe, 0x0d, 0x00, 0x00])},
+                {"name": "connect.linux.do", "wildcard": false, "v4": [TABLE_V4.to_string()]}
+            ]
+        })
+        .to_string();
+        let (routes_port, _) = spawn_fake_json("/v1/routes", vec![(200, table)]).await;
+        let (resolver, _) =
+            table_mode_resolver("table-lend-ech.invalid", doh_port, routes_port).await;
+        let shared: &[u8] = &[0x00, 0x04, 0xfe, 0x0d, 0x00, 0x00];
+
+        let lent = resolver.lookup_ech_config("cdn.linux.do").await.unwrap();
+        assert_eq!(lent.as_ref().map(|key| key.as_ref()), Some(shared));
+        assert!(resolver.lookup_ech_config("connect.linux.do").await.unwrap().is_none());
+        let (ech, _) = resolver.lookup_ech_and_ip("connect.linux.do").await;
+        assert_eq!(ech.as_ref().map(|key| key.as_ref()), Some(shared));
+        assert!(resolver.lookup_ech_config("example.com").await.unwrap().is_none());
+
+        assert!(doh_seen.lock().is_empty(), "{:?}", doh_seen.lock());
     }
 
     /// 通配只向下匹配，精确条目不向下匹配；ech 字段解成带长度前缀的 ECHConfigList
