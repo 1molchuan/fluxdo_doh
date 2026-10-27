@@ -47,6 +47,18 @@ impl Default for ProbeTimeouts {
     }
 }
 
+impl ProbeTimeouts {
+    /// 宽限档：默认档全部超时（刚开机 / 移动网络刚从休眠唤醒 / 慢出口）时
+    /// 再探一次用。只拿来复核少数几个地址，不用于大面积竞速
+    pub fn patient() -> Self {
+        Self {
+            tcp: Duration::from_millis(5000),
+            tls: Duration::from_millis(6000),
+            http: Duration::from_millis(4000),
+        }
+    }
+}
+
 /// 一次探测的目标
 #[derive(Clone, Debug)]
 pub struct ProbeTarget {
@@ -69,6 +81,13 @@ pub enum ProbeFailure {
     /// 200 但 trace 正文里的 `h=` 不是目标站
     BodyMismatch,
     Http(String),
+}
+
+impl ProbeFailure {
+    /// 只是没等到（网络慢），不说明这个地址坏了
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Self::TcpTimeout | Self::TlsTimeout | Self::HttpTimeout)
+    }
 }
 
 impl std::fmt::Display for ProbeFailure {

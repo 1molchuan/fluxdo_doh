@@ -34,6 +34,8 @@ use tracing::{debug, info, warn};
 
 /// 同时进行的探测数
 const SELECT_CONCURRENCY: usize = 8;
+/// 全部超时后放宽时限复核的候选数（上次的赢家优先）
+const SELECT_PATIENT_RETRY_MAX: usize = 4;
 /// 首个通过后再等这么久收更快的，然后收敛
 const SELECT_GRACE_MS: u64 = 400;
 /// 累计这么多个通过即收敛
@@ -1021,7 +1023,24 @@ impl Selector {
         let selector = self.clone();
         let handle = tokio::spawn(async move {
             let guard = RaceGuard(selector.clone());
-            let outcome = selector.probe_with_pool(winner.ip).await;
+            let mut outcome = selector
+                .probe_with_pool(winner.ip, &Self::probe_timeouts())
+                .await;
+            // 只是没等到（冷启动时网络还没热、移动网络刚唤醒）：放宽时限再探一次，
+            // 别因为一次超时就扔掉上次的赢家、整轮重新优选（冷启动要多等好几秒）
+            if outcome
+                .as_ref()
+                .and_then(|o| o.failure.as_ref())
+                .is_some_and(ProbeFailure::is_timeout)
+            {
+                info!(
+                    "select: verify winner {} timed out, retrying with patient timeouts",
+                    winner.ip
+                );
+                outcome = selector
+                    .probe_with_pool(winner.ip, &ProbeTimeouts::patient())
+                    .await;
+            }
             match outcome {
                 Some(outcome) if outcome.ok => {
                     info!(
@@ -1083,7 +1102,12 @@ impl Selector {
     }
 
     /// 用一把钥匙探测一个 IP
-    async fn probe_ip(&self, ip: IpAddr, key: &EchConfigListBytes<'static>) -> ProbeOutcome {
+    async fn probe_ip(
+        &self,
+        ip: IpAddr,
+        key: &EchConfigListBytes<'static>,
+        timeouts: &ProbeTimeouts,
+    ) -> ProbeOutcome {
         match &self.prober {
             Prober::Fake(f) => f(ip, key.as_ref().to_vec()),
             Prober::Real => {
@@ -1104,7 +1128,7 @@ impl Selector {
                     ip,
                     inner_sni: PROBE_INNER_SNI,
                 };
-                probe::probe_once(&target, tls, &Self::probe_timeouts()).await
+                probe::probe_once(&target, tls, timeouts).await
             }
         }
     }
@@ -1125,7 +1149,7 @@ impl Selector {
             }
         }
         let _ = self.gather().await;
-        self.probe_with_pool(ip).await
+        self.probe_with_pool(ip, &Self::probe_timeouts()).await
     }
 
     /// 诊断用：在给定的流（如经代理隧道）上用池首钥匙探测 `ip`
@@ -1166,10 +1190,14 @@ impl Selector {
         Some(probe::probe_once_on(stream, &target, Instant::now(), tls, &Self::probe_timeouts()).await)
     }
 
-    async fn probe_with_pool(self: &Arc<Self>, ip: IpAddr) -> Option<ProbeOutcome> {
+    async fn probe_with_pool(
+        self: &Arc<Self>,
+        ip: IpAddr,
+        timeouts: &ProbeTimeouts,
+    ) -> Option<ProbeOutcome> {
         let keys = self.key_pool();
         let first = keys.first()?;
-        let outcome = self.probe_ip(ip, first).await;
+        let outcome = self.probe_ip(ip, first, timeouts).await;
         match &outcome.failure {
             Some(ProbeFailure::EchRejected {
                 retry_configs: Some(bytes),
@@ -1177,7 +1205,7 @@ impl Selector {
                 let key = EchConfigListBytes::from(bytes.clone());
                 self.adopt_ech_key(&key, EchKeySource::RetryConfigs);
                 debug!("select: {} rejected ech with retry_configs, retrying", ip);
-                Some(self.probe_ip(ip, &key).await)
+                Some(self.probe_ip(ip, &key, timeouts).await)
             }
             Some(ProbeFailure::EchRejected {
                 retry_configs: None,
@@ -1191,7 +1219,7 @@ impl Selector {
                         ip,
                         outcome.failure.as_ref().map(|f| f.to_string()).unwrap_or_default()
                     );
-                    let retry = self.probe_ip(ip, next).await;
+                    let retry = self.probe_ip(ip, next, timeouts).await;
                     if retry.ok {
                         let source = self
                             .inner
@@ -1747,6 +1775,19 @@ impl Selector {
             inner.state.races_log.push(now);
             inner.state.races_log.retain(|at| now.saturating_sub(*at) < 3600);
         }
+        self.race_with(candidates, keys, Self::probe_timeouts(), true)
+            .await;
+    }
+
+    /// 一轮探测。[patient_retry]：全部只是超时（网络慢，不是地址坏）时，
+    /// 挑前几个候选（上次的赢家优先）放宽时限再探一次，再不行才判失败
+    async fn race_with(
+        self: &Arc<Self>,
+        candidates: Vec<Candidate>,
+        keys: Vec<EchConfigListBytes<'static>>,
+        timeouts: ProbeTimeouts,
+        patient_retry: bool,
+    ) {
         if keys.is_empty() {
             warn!("select: no ech key available, falling back to tier 2");
             self.finish_failed("no ech key");
@@ -1778,6 +1819,13 @@ impl Selector {
         let total = Duration::from_millis(SELECT_RACE_TOTAL_MS);
         let semaphore = Arc::new(Semaphore::new(SELECT_CONCURRENCY));
         let mut set: JoinSet<(Candidate, Option<ProbeOutcome>)> = JoinSet::new();
+        let mut retry_pool: Vec<Candidate> = candidates
+            .iter()
+            .filter(|c| c.source == CandidateSource::Sticky)
+            .chain(candidates.iter().filter(|c| c.source != CandidateSource::Sticky))
+            .take(SELECT_PATIENT_RETRY_MAX)
+            .cloned()
+            .collect();
         for candidate in candidates {
             let selector = self.clone();
             let semaphore = semaphore.clone();
@@ -1785,7 +1833,7 @@ impl Selector {
                 let Ok(_permit) = semaphore.acquire_owned().await else {
                     return (candidate, None);
                 };
-                let outcome = selector.probe_with_pool(candidate.ip).await;
+                let outcome = selector.probe_with_pool(candidate.ip, &timeouts).await;
                 (candidate, outcome)
             });
         }
@@ -1874,6 +1922,23 @@ impl Selector {
                 summary.join(" "),
                 sample.join("; ")
             );
+            let all_timeouts = !all.is_empty()
+                && all
+                    .iter()
+                    .all(|o| o.failure.as_ref().is_some_and(ProbeFailure::is_timeout));
+            if patient_retry && all_timeouts {
+                // 只留真探过、且只是超时的地址（没轮到的不算）
+                retry_pool.retain(|c| all.iter().any(|o| o.ip == c.ip));
+                if !retry_pool.is_empty() {
+                    info!(
+                        "select: every probe timed out, retrying {} candidates with patient timeouts",
+                        retry_pool.len()
+                    );
+                    Box::pin(self.race_with(retry_pool, keys, ProbeTimeouts::patient(), false))
+                        .await;
+                    return;
+                }
+            }
             self.finish_failed("no candidate passed");
             return;
         };
@@ -1916,9 +1981,12 @@ impl Selector {
         self.maybe_report(&all).await;
     }
 
+    /// 本轮没选出赢家。上次的赢家**留在持久化状态里**（不钉住，Failed 下
+    /// pin 为 None）：一轮全失败多半是此刻网络不通，不说明它坏了；下次启动 /
+    /// 换网先校验它，也作为下一轮的 Sticky 候选。真被实际流量连续打挂的赢家
+    /// 由 [PinListener::winner_failed] 清掉
     fn finish_failed(&self, reason: &str) {
         let mut inner = self.inner.lock();
-        inner.state.winner = None;
         inner.phase = Phase::Failed;
         inner.failed_at = Some(Instant::now());
         inner.last_error = Some(reason.to_string());
@@ -2618,6 +2686,114 @@ mod tests {
             .settled_winner("linux.do", Instant::now() + Duration::from_millis(50))
             .await;
         assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_race_keeps_last_winner_for_next_start_but_unpinned() {
+        let mut state = state_with_key(1);
+        state.winner = Some(Winner {
+            ip: ip("104.21.0.9"),
+            latency_ms: 30,
+            verified_at: 1,
+            source: CandidateSource::Atlas,
+            ech_source: EchKeySource::Persisted,
+        });
+        let selector = fake_selector(
+            SelectMode::LocalAtlas,
+            state,
+            Arc::new(|ip, _| outcome(ip, false, 5, Some(ProbeFailure::HttpStatus(403)))),
+        );
+        selector
+            .race_candidates(candidates(&["104.21.0.1"]), selector.key_pool())
+            .await;
+        assert_eq!(selector.phase(), Phase::Failed);
+        assert!(selector.winner_ip().is_none(), "失败后不再钉住");
+        let persisted = SelectState::from_json(&selector.state_json()).unwrap();
+        assert_eq!(persisted.winner.map(|w| w.ip), Some(ip("104.21.0.9")));
+    }
+
+    #[tokio::test]
+    async fn all_timeouts_get_one_patient_retry_with_sticky_first() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probed: Arc<Mutex<Vec<IpAddr>>> = Arc::new(Mutex::new(Vec::new()));
+        let (c, p) = (calls.clone(), probed.clone());
+        let selector = fake_selector(
+            SelectMode::LocalAtlas,
+            state_with_key(1),
+            Arc::new(move |ip, _| {
+                p.lock().push(ip);
+                // 第一轮三个都超时，复核时才通
+                if c.fetch_add(1, Ordering::SeqCst) < 3 {
+                    outcome(ip, false, 2000, Some(ProbeFailure::TcpTimeout))
+                } else {
+                    outcome(ip, true, 40, None)
+                }
+            }),
+        );
+        let mut list = candidates(&["104.21.0.1", "104.21.0.2"]);
+        list.push(Candidate {
+            ip: ip("104.21.0.7"),
+            source: CandidateSource::Sticky,
+        });
+        selector.race_candidates(list, selector.key_pool()).await;
+        assert_eq!(selector.phase(), Phase::Ready);
+        assert!(selector.winner_ip().is_some());
+        let probed = probed.lock().clone();
+        assert_eq!(probed.len(), 6, "三个各探一次，再三个复核一次");
+        assert_eq!(probed[3], ip("104.21.0.7"), "复核先探上次的赢家");
+        assert_eq!(selector.inner.lock().state.races_log.len(), 1, "复核不另算一轮");
+    }
+
+    #[tokio::test]
+    async fn non_timeout_failures_are_not_retried() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let selector = fake_selector(
+            SelectMode::LocalAtlas,
+            state_with_key(1),
+            Arc::new(move |ip, _| {
+                c.fetch_add(1, Ordering::SeqCst);
+                outcome(ip, false, 5, Some(ProbeFailure::TcpConnect))
+            }),
+        );
+        selector
+            .race_candidates(candidates(&["104.21.0.1", "104.21.0.2"]), selector.key_pool())
+            .await;
+        assert_eq!(selector.phase(), Phase::Failed);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn verify_timeout_retries_patiently_and_keeps_winner() {
+        let mut state = state_with_key(1);
+        state.winner = Some(Winner {
+            ip: ip("104.21.0.1"),
+            latency_ms: 30,
+            verified_at: 1,
+            source: CandidateSource::Atlas,
+            ech_source: EchKeySource::Persisted,
+        });
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let selector = fake_selector(
+            SelectMode::LocalAtlas,
+            state,
+            Arc::new(move |ip, _| {
+                if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                    outcome(ip, false, 2000, Some(ProbeFailure::TlsTimeout))
+                } else {
+                    outcome(ip, true, 180, None)
+                }
+            }),
+        );
+        selector.start();
+        wait_phase(&selector, Phase::Ready).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(selector.winner_ip(), Some(ip("104.21.0.1")));
+        assert_eq!(
+            selector.inner.lock().state.winner.as_ref().unwrap().latency_ms,
+            180
+        );
     }
 
     #[tokio::test]
