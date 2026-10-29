@@ -621,6 +621,10 @@ async fn handle_gateway_connection(
 type GatewayBody = BoxBody<Bytes, hyper::Error>;
 type GatewayResponse = std::result::Result<Response<GatewayBody>, Infallible>;
 
+/// 网关自己生成的错误响应带上这个头：调用方据此区分「网关连不上上游」与
+/// 「源站真的回了 5xx」（Dart 侧把正文记进日志排查）
+pub const GATEWAY_ERROR_HEADER: &str = "x-cfluxdo-gateway-error";
+
 fn gateway_error_response(status: u16, msg: &str) -> Response<GatewayBody> {
     let body = Full::new(Bytes::from(msg.to_owned()))
         .map_err(|never| match never {})
@@ -628,6 +632,7 @@ fn gateway_error_response(status: u16, msg: &str) -> Response<GatewayBody> {
     Response::builder()
         .status(status)
         .header("Content-Type", "text/plain")
+        .header(GATEWAY_ERROR_HEADER, "1")
         .body(body)
         .unwrap()
 }
@@ -812,7 +817,24 @@ async fn gateway_handle_connect(
         }
     };
 
-    let connector_clone = connector.clone();
+    // h1 MITM 要先连上游：连不上就直接给 CONNECT 回 502。以前先回 200、
+    // 等浏览器发来 ClientHello 后才去连，上游一失败只能把连接掐掉，浏览器
+    // 记成 TLS 握手失败（「此网站无法提供安全连接」，看着像证书问题），
+    // 现在记成隧道连接失败，和真实原因一致。h2 MITM 的上游按请求从池里取，
+    // 失败时在 TLS 里回 502，不受影响。
+    let upstream = if h2_mitm {
+        None
+    } else {
+        match connector.connect(&host, port).await {
+            Ok(tls) => Some(tls),
+            Err(e) => {
+                warn!("Gateway MITM upstream connect failed {}:{}: {}", host, port, e);
+                STATS.gw_502.inc();
+                return Ok(gateway_error_response(502, &e.to_string()));
+            }
+        }
+    };
+
     let host_clone = host.clone();
 
     // Spawn MITM handling after upgrade
@@ -824,10 +846,9 @@ async fn gateway_handle_connect(
                     io,
                     &host_clone,
                     port,
-                    connector_clone,
+                    upstream,
                     pool,
                     cert_manager,
-                    h2_mitm,
                 )
                 .await
                 {
@@ -846,20 +867,23 @@ async fn gateway_handle_connect(
 }
 
 /// Run MITM on an upgraded CONNECT connection (WebView).
-async fn gateway_mitm_upgraded<I>(
+///
+/// [upstream] 是回 200 之前已连好的上游（h1 MITM）；None 表示 h2 MITM，
+/// 上游按请求从池里取。
+async fn gateway_mitm_upgraded<I, S>(
     client_io: I,
     host: &str,
     port: u16,
-    connector: Arc<DohTlsConnector>,
+    upstream: Option<S>,
     pool: Arc<UpstreamPool>,
     cert_manager: Arc<CertManager>,
-    h2_mitm: bool,
 ) -> Result<()>
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     // h2 MITM：accept client TLS（ALPN 含 h2）后交给 hyper 转发，上游按需连（带 ECH）
-    if h2_mitm {
+    let Some(server_tls) = upstream else {
         let server_config = cert_manager.get_server_config(host)?;
         let acceptor = TlsAcceptor::from(server_config);
         let client_tls = acceptor
@@ -867,10 +891,7 @@ where
             .await
             .map_err(DohProxyError::Io)?;
         return mitm_serve(client_tls, host.to_string(), port, pool).await;
-    }
-
-    // Connect to real server with TLS+ECH
-    let server_tls = connector.connect(host, port).await?;
+    };
 
     // TLS handshake with client (MITM)
     let server_config = cert_manager.get_server_config(host)?;
