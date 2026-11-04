@@ -503,6 +503,84 @@ pub extern "C" fn doh_proxy_report_host_failure(
     }
 }
 
+/// 采纳一把服务端随 ECH 拒绝下发的新钥匙（retry_configs，base64 的 ECHConfigList）。
+///
+/// rhttp 直连自己握手，钥匙过期时拿不到核心的自愈结果；它把 CF 回的 retry_configs
+/// 交回来，这里放进 Selector 钥匙池首位（覆盖域名）并作为 resolver 的覆盖钥匙，
+/// 下一次 lookup 就给出新钥匙。`ttl_secs` <= 0 用默认覆盖时长。返回 1 已采纳、0 失败
+#[no_mangle]
+pub extern "C" fn doh_proxy_adopt_ech_config(
+    host: *const c_char,
+    doh_server: *const c_char,
+    doh_server_ech: *const c_char,
+    prefer_ipv6: c_int,
+    ech_config_b64: *const c_char,
+    ttl_secs: i64,
+) -> c_int {
+    use base64::Engine;
+
+    doh_proxy_init_logging();
+
+    let host_str = match parse_required_string(host, "host") {
+        Ok(value) => value,
+        Err(message) => {
+            tracing::warn!("adopt_ech_config: {}", message);
+            return 0;
+        }
+    };
+    let key_bytes = match parse_required_string(ech_config_b64, "ech_config")
+        .and_then(|value| {
+            base64::engine::general_purpose::STANDARD
+                .decode(value.trim())
+                .map_err(|e| e.to_string())
+        }) {
+        Ok(bytes) if !bytes.is_empty() => bytes,
+        Ok(_) => {
+            tracing::warn!("adopt_ech_config: empty key");
+            return 0;
+        }
+        Err(message) => {
+            tracing::warn!("adopt_ech_config: invalid key: {}", message);
+            return 0;
+        }
+    };
+    let key = rustls::pki_types::EchConfigListBytes::from(key_bytes);
+    let ttl = if ttl_secs > 0 {
+        std::time::Duration::from_secs(ttl_secs as u64)
+    } else {
+        std::time::Duration::from_secs(crate::ech::ECH_OVERRIDE_TTL_SECS)
+    };
+    let doh_url = parse_optional_string(doh_server)
+        .unwrap_or_else(|| "https://cloudflare-dns.com/dns-query".to_string());
+    let doh_url_ech = parse_optional_string(doh_server_ech);
+
+    if crate::edge_pin::EdgePin::is_covered(&host_str) {
+        if let Some(selector) = crate::select::Selector::global() {
+            selector.adopt_ech_key(&key, crate::select::EchKeySource::RetryConfigs);
+        }
+    }
+
+    let rt = get_runtime();
+    let result = rt.block_on(async {
+        let effective_doh_url_ech = doh_url_ech.as_deref().unwrap_or(doh_url.as_str());
+        let resolver =
+            ffi_resolver(&doh_url, Some(effective_doh_url_ech), prefer_ipv6 != 0).await?;
+        resolver.override_ech_config(&host_str, key, ttl);
+        Ok::<(), crate::error::DohProxyError>(())
+    });
+
+    match result {
+        Ok(()) => {
+            tracing::info!("adopt_ech_config: retry_configs adopted for {}", host_str);
+            1
+        }
+        Err(error) => {
+            tracing::warn!("adopt_ech_config failed for {}: {}", host_str, error);
+            0
+        }
+    }
+}
+
 /// Clear the shared preferred IP for a host.
 /// Returns 1 on success, 0 on failure.
 #[no_mangle]

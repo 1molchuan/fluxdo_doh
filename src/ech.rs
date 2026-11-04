@@ -24,7 +24,7 @@ use rustls::client::EchConfig;
 
 /// 服务端 retry_configs 给的新钥匙在 resolver 里覆盖多久
 #[cfg(feature = "ech")]
-const ECH_OVERRIDE_TTL_SECS: u64 = 21600;
+pub(crate) const ECH_OVERRIDE_TTL_SECS: u64 = 21600;
 
 /// ECH-enabled TLS connector
 pub struct DohTlsConnector {
