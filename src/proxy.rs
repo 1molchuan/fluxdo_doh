@@ -632,9 +632,25 @@ fn gateway_error_response(status: u16, msg: &str) -> Response<GatewayBody> {
     Response::builder()
         .status(status)
         .header("Content-Type", "text/plain")
-        .header(GATEWAY_ERROR_HEADER, "1")
+        // 头里也带原因：流式响应在 Dart 拦截器里读不到正文，只能看头
+        .header(GATEWAY_ERROR_HEADER, gateway_error_header_value(msg))
         .body(body)
         .unwrap()
+}
+
+/// 原因压成头能放的样子：只留可打印 ASCII（其余换成 '?'），最多 200 字节；空的给 "1"
+fn gateway_error_header_value(msg: &str) -> String {
+    let value: String = msg
+        .chars()
+        .map(|c| if (' '..='~').contains(&c) { c } else { '?' })
+        .take(200)
+        .collect();
+    let value = value.trim().to_owned();
+    if value.is_empty() {
+        "1".to_owned()
+    } else {
+        value
+    }
 }
 
 /// 把明文请求经共用的上游连接池转发到真实服务端（TLS + ECH，h2 优先）
