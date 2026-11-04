@@ -22,8 +22,7 @@ use tracing::{debug, info, warn};
 #[cfg(feature = "ech")]
 use rustls::client::EchConfig;
 
-/// 服务端 retry_configs 给的新钥匙在 resolver 里覆盖多久
-#[cfg(feature = "ech")]
+/// 服务端 retry_configs 给的新钥匙在 resolver 里覆盖多久（FFI 采纳钥匙也用它，不随 ech 特性开关）
 pub(crate) const ECH_OVERRIDE_TTL_SECS: u64 = 21600;
 
 /// ECH-enabled TLS connector
