@@ -4,7 +4,7 @@
 //! and enables true ECH encryption of the SNI field.
 
 use crate::dns::{DnsCacheRecord, DnsCacheStats, DnsResolver};
-use crate::edge_pin::{EdgePin, Outcome, Route};
+use crate::edge_pin::{is_cf_challenge_host, EdgePin, Outcome, Pin, Route};
 use crate::error::{DohProxyError, Result};
 use crate::stats::STATS;
 use crate::upstream::connect_tunnel;
@@ -123,6 +123,18 @@ impl DohTlsConnector {
 
         // 优先 DoH 解析（不走系统 DNS），按 EdgePin 的计划逐个尝试
         if let Some(resolver) = self.dns_resolver.as_ref() {
+            // CF 验证域名借优选赢家（见 EdgePin::route）：赢家先起跑，解析结果只当后备，
+            // 解析慢或失败都不耽误它
+            let edge = resolver.edge_pin();
+            if is_cf_challenge_host(host) && matches!(edge.pin(), Pin::Winner(_)) {
+                let addrs = tokio::time::timeout(CHALLENGE_LOOKUP_WAIT, resolver.lookup_ip(host))
+                    .await
+                    .ok()
+                    .and_then(|result| result.ok())
+                    .unwrap_or_default();
+                let route = edge.route(host, addrs);
+                return self.connect_tcp_route(host, port, edge, &route).await;
+            }
             match resolver.lookup_ip(host).await {
                 Ok(addrs) if !addrs.is_empty() => {
                     let edge = resolver.edge_pin();
@@ -817,6 +829,8 @@ impl DohTlsConnector {
 
 /// 同族候选之间的起跑间隔
 const RACE_STAGGER: Duration = Duration::from_millis(250);
+/// CF 验证域名有赢家可借时，最多等它自己的解析这么久（解析结果只当后备）
+const CHALLENGE_LOOKUP_WAIT: Duration = Duration::from_millis(1500);
 /// 单个地址的 TCP / TLS 超时
 const ATTEMPT_TCP_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTEMPT_TLS_TIMEOUT: Duration = Duration::from_secs(10);

@@ -7,6 +7,7 @@
 use crate::cert::CertManager;
 use crate::dns::DnsResolver;
 use crate::ech::DohTlsConnector;
+use crate::edge_pin::is_cf_challenge_host;
 use crate::error::{DohProxyError, Result};
 use crate::stats::STATS;
 use crate::upstream_pool::{Lane, Replay, UpstreamPool};
@@ -767,30 +768,27 @@ async fn gateway_handle_connect_tunnel(
 
     info!("Gateway CONNECT (tunnel) {}:{}", host, port);
 
-    let connector_clone = connector.clone();
-    let host_clone = host.clone();
+    // 先连上游再回 200，连不上就给 CONNECT 回 502（与 MITM 的 CONNECT 一致）：以前先回 200
+    // 再连，失败只能掐断，浏览器记成 TLS 握手失败。验证页的 Turnstile 走这条路
+    let server_stream = match connector.connect_tcp(&host, port).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            warn!("Gateway tunnel connect failed {}:{}: {}", host, port, e);
+            STATS.gw_502.inc();
+            return Ok(gateway_error_response(502, &e.to_string()));
+        }
+    };
 
     tokio::spawn(async move {
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
                 let io = TokioIo::new(upgraded);
-                // Connect to remote via DOH-resolved address
-                match connector_clone.connect_tcp(&host_clone, port).await {
-                    Ok(server_stream) => {
-                        let (mut cr, mut cw) = tokio::io::split(io);
-                        let (mut sr, mut sw) = tokio::io::split(server_stream);
-                        let _ = tokio::try_join!(
-                            tokio::io::copy(&mut cr, &mut sw),
-                            tokio::io::copy(&mut sr, &mut cw),
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Gateway tunnel connect failed {}:{}: {}",
-                            host_clone, port, e
-                        );
-                    }
-                }
+                let (mut cr, mut cw) = tokio::io::split(io);
+                let (mut sr, mut sw) = tokio::io::split(server_stream);
+                let _ = tokio::try_join!(
+                    tokio::io::copy(&mut cr, &mut sw),
+                    tokio::io::copy(&mut sr, &mut cw),
+                );
             }
             Err(e) => warn!("Gateway CONNECT tunnel upgrade failed: {}", e),
         }
@@ -983,16 +981,6 @@ fn in_mitm_scope(scope: &[String], host: &str) -> bool {
     })
 }
 
-fn is_cf_challenge_host(host: &str) -> bool {
-    const CF_CHALLENGE_DOMAIN: &str = "challenges.cloudflare.com";
-    let host = host.trim_end_matches('.');
-    if host.eq_ignore_ascii_case(CF_CHALLENGE_DOMAIN) {
-        return true;
-    }
-    host.len() > CF_CHALLENGE_DOMAIN.len() + 1
-        && host.as_bytes()[host.len() - CF_CHALLENGE_DOMAIN.len() - 1] == b'.'
-        && host[host.len() - CF_CHALLENGE_DOMAIN.len()..].eq_ignore_ascii_case(CF_CHALLENGE_DOMAIN)
-}
 
 /// Parse host:port from CONNECT target
 fn parse_host_port(target: &str) -> Result<(String, u16)> {
