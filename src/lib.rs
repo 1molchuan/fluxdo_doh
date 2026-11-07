@@ -171,6 +171,10 @@ pub struct ProxyConfig {
     pub doh_ech_auth_token: Option<String>,
     /// Whether to prefer IPv6
     pub prefer_ipv6: bool,
+    /// 地址族自动（App「IP 协议：自动」）：本地优选在本机有 IPv6 路由时偏好 IPv6 赢家，
+    /// IPv6 不通或慢太多时用 IPv4（见 select.rs 的 `FamilyPref::Auto`）。`prefer_ipv6` 为 true 时不看它
+    #[serde(default)]
+    pub ipv6_auto: bool,
     /// Connection timeout in seconds
     pub timeout_secs: u64,
     /// Optional upstream proxy configuration
@@ -261,6 +265,7 @@ impl Default for ProxyConfig {
             doh_auth_token: None,
             doh_ech_auth_token: None,
             prefer_ipv6: false,
+            ipv6_auto: false,
             timeout_secs: 30,
             upstream_proxy: None,
             server_ip: None,

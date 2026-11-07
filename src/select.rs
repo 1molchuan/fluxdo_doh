@@ -38,6 +38,12 @@ const SELECT_CONCURRENCY: usize = 8;
 const SELECT_PATIENT_RETRY_MAX: usize = 4;
 /// 首个通过后再等这么久收更快的，然后收敛
 const SELECT_GRACE_MS: u64 = 400;
+/// 首个通过来自非首选地址族、首选族还有探测在途时，最多再等首选族这么久（Happy Eyeballs 式让先）
+const SELECT_FAMILY_GRACE_MS: u64 = 1500;
+/// 自动地址族：IPv6 最快者比 IPv4 最快者慢出一倍以上（且多出至少这么多）才让给 IPv4
+const V6_TOLERANCE_MIN_MS: u64 = 300;
+/// 某个网络上按 IPv6 偏好竞速过的结论多久内有效（见 [`Selector::family_rerace_due`]）
+const FAMILY_CHECK_TTL_SECS: u64 = 24 * 3600;
 /// 累计这么多个通过即收敛
 const SELECT_MAX_PASSES: usize = 4;
 /// 一轮探测的总预算
@@ -53,9 +59,10 @@ const VENDOR_MAX_PER_DOMAIN: usize = 4;
 /// 大厂域名 / 社区域名各自的总配额，给随机抽样留位置
 const VENDOR_MAX_TOTAL: usize = 10;
 const COMMUNITY_MAX_TOTAL: usize = 4;
-/// 随机抽样的 v4 / v6 个数
+/// 随机抽样的 v4 / v6 个数；首选 IPv6 时 v6 多抽些
 const RANDOM_V4_SAMPLES: usize = 12;
 const RANDOM_V6_SAMPLES: usize = 4;
+const RANDOM_V6_SAMPLES_PREFERRED: usize = 8;
 /// 公共 DoH 单次查询超时与并发
 const PUBLIC_DOH_TIMEOUT_MS: u64 = 3000;
 const PUBLIC_DOH_CONCURRENCY: usize = 6;
@@ -156,6 +163,66 @@ impl SelectMode {
     }
 }
 
+/// 挑赢家时的地址族偏好（App「IP 协议」设置）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FamilyPref {
+    /// IPv4 优先：有 IPv4 通过就不用 IPv6
+    V4,
+    /// IPv6 优先：有 IPv6 通过就用它，不论多慢
+    V6,
+    /// 自动（默认）：本机有 IPv6 路由、这个网络上没验出 IPv6 不通时偏好 IPv6，
+    /// 但 IPv6 比 IPv4 慢太多（见 [`V6_TOLERANCE_MIN_MS`]）时让给 IPv4。
+    /// 双栈网络的 IPv4 出口多是运营商 NAT 共享地址，CF 风险分高、频繁弹盾；IPv6 多为独享地址
+    Auto,
+}
+
+impl FamilyPref {
+    pub fn from_config(prefer_ipv6: bool, ipv6_auto: bool) -> Self {
+        if prefer_ipv6 {
+            Self::V6
+        } else if ipv6_auto {
+            Self::Auto
+        } else {
+            Self::V4
+        }
+    }
+
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::V4 => "v4",
+            Self::V6 => "v6",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+/// 一轮竞速按哪一族挑赢家
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RaceFamily {
+    prefer_v6: bool,
+    /// 首选族慢太多时可以让给另一族（只有自动模式、且不受亲和约束时）
+    tolerant: bool,
+    /// 首选族来自连接层亲和（铸过 cf_clearance 的出口），不是配置
+    bound: bool,
+}
+
+/// 某个网络上按 IPv6 偏好竞速过的结论
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FamilyCheck {
+    /// 那次竞速时的网络签名
+    #[serde(default)]
+    pub sig: Option<String>,
+    pub at: u64,
+    /// 那次有 IPv6 候选通过
+    pub v6_ok: bool,
+}
+
+impl FamilyCheck {
+    fn fresh_for(&self, sig: &Option<String>, now: u64) -> bool {
+        self.sig == *sig && now.saturating_sub(self.at) < FAMILY_CHECK_TTL_SECS
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
@@ -250,6 +317,9 @@ pub struct SelectState {
     /// 近期发车时刻（unix 秒），用于每小时预算
     #[serde(default)]
     pub races_log: Vec<u64>,
+    /// 自动 / IPv6 优先：最近一次不受亲和约束、按 IPv6 偏好跑完的竞速结论
+    #[serde(default)]
+    pub family_check: Option<FamilyCheck>,
 }
 
 impl SelectState {
@@ -372,10 +442,15 @@ struct Inner {
     netchange_gen: u64,
     /// 本次竞速结束后待上报的结果
     report_pending: bool,
+    /// 最近一次发车的原因：换网 / 启动的竞速不受旧亲和约束（见 [`Selector::race_family`]）
+    race_trigger: RaceTrigger,
 }
 
 pub struct Selector {
     mode: SelectMode,
+    family_pref: FamilyPref,
+    /// 测试用：覆盖本机地址族探测
+    family_override: Mutex<Option<cfnet::FamilySupport>>,
     inner: Mutex<Inner>,
     /// 出站钉选：赢家只经它交给建连路径，赢家的地址族按它的亲和挑
     edge: Arc<EdgePin>,
@@ -449,6 +524,53 @@ fn split_url(url: &str) -> Option<(String, String)> {
     Some((host, path))
 }
 
+/// 两族交替排（首选族先），族内保持原顺序；排在最前的粘性赢家不动。
+/// 并发探测按顺序领号，交替后首批里就有首选族，不用等另一族探完一批才轮到
+fn interleave_families(candidates: Vec<Candidate>, prefer_v6: bool) -> Vec<Candidate> {
+    let mut rest = candidates.into_iter().peekable();
+    let mut out = Vec::new();
+    if let Some(sticky) = rest.next_if(|c| c.source == CandidateSource::Sticky) {
+        out.push(sticky);
+    }
+    let (preferred, other): (Vec<Candidate>, Vec<Candidate>) =
+        rest.partition(|c| c.ip.is_ipv6() == prefer_v6);
+    let (mut preferred, mut other) = (preferred.into_iter(), other.into_iter());
+    loop {
+        match (preferred.next(), other.next()) {
+            (None, None) => break,
+            (a, b) => out.extend(a.into_iter().chain(b)),
+        }
+    }
+    out
+}
+
+/// 挑赢家：首选族优先、族内最低延迟。`tolerant`（自动模式）时首选族最快者比另一族最快者
+/// 慢出一倍以上、且多出至少 [`V6_TOLERANCE_MIN_MS`]，就让给另一族
+fn pick_winner(
+    passes: &[(Candidate, ProbeOutcome)],
+    family: RaceFamily,
+) -> Option<(Candidate, ProbeOutcome)> {
+    let fastest = |v6: bool| {
+        passes
+            .iter()
+            .filter(|(candidate, _)| candidate.ip.is_ipv6() == v6)
+            .min_by_key(|(_, outcome)| outcome.latency)
+    };
+    let pick = match (fastest(family.prefer_v6), fastest(!family.prefer_v6)) {
+        (Some(preferred), Some(other))
+            if family.tolerant
+                && preferred.1.latency
+                    > other.1.latency
+                        + other.1.latency.max(Duration::from_millis(V6_TOLERANCE_MIN_MS)) =>
+        {
+            other
+        }
+        (Some(preferred), _) => preferred,
+        (None, other) => other?,
+    };
+    Some(pick.clone())
+}
+
 /// 竞速结束时复位 single-flight，任务被取消也会执行
 struct RaceGuard(Arc<Selector>);
 
@@ -520,6 +642,7 @@ impl Selector {
             .unwrap_or_default();
         let selector = Self::build(
             mode,
+            FamilyPref::from_config(config.prefer_ipv6, config.ipv6_auto),
             state,
             config.network_sig.clone(),
             roots,
@@ -540,6 +663,7 @@ impl Selector {
     /// 不依赖 ProxyConfig 的构造，供 example 与测试
     pub fn standalone(
         mode: SelectMode,
+        family_pref: FamilyPref,
         atlas_routes_url: Option<&str>,
         state_json: Option<&str>,
         network_sig: Option<&str>,
@@ -555,6 +679,7 @@ impl Selector {
             .unwrap_or_default();
         Self::build(
             mode,
+            family_pref,
             state,
             network_sig.map(str::to_string),
             roots,
@@ -563,7 +688,7 @@ impl Selector {
             atlas,
             None,
             None,
-            Arc::new(EdgePin::new(false)),
+            Arc::new(EdgePin::new(family_pref == FamilyPref::V6)),
             Prober::Real,
         )
     }
@@ -571,6 +696,7 @@ impl Selector {
     #[allow(clippy::too_many_arguments)]
     fn build(
         mode: SelectMode,
+        family_pref: FamilyPref,
         state: SelectState,
         current_sig: Option<String>,
         roots: RootCertStore,
@@ -588,6 +714,8 @@ impl Selector {
             .collect();
         let selector = Arc::new(Self {
             mode,
+            family_pref,
+            family_override: Mutex::new(None),
             inner: Mutex::new(Inner {
                 state,
                 phase: Phase::Idle,
@@ -598,6 +726,7 @@ impl Selector {
                 failed_at: None,
                 netchange_gen: 0,
                 report_pending: false,
+                race_trigger: RaceTrigger::Auto,
             }),
             edge,
             alive: AtomicBool::new(true),
@@ -689,8 +818,90 @@ impl Selector {
         self.mode
     }
 
+    pub fn family_pref(&self) -> FamilyPref {
+        self.family_pref
+    }
+
     pub fn phase(&self) -> Phase {
         self.inner.lock().phase
+    }
+
+    // ---------- 地址族 ----------
+
+    /// 本机出站地址族；两族都探不到时当作只有 IPv4
+    fn local_family(&self) -> cfnet::FamilySupport {
+        let family = self
+            .family_override
+            .lock()
+            .unwrap_or_else(cfnet::local_family_support);
+        if family.v4 || family.v6 {
+            family
+        } else {
+            cfnet::FamilySupport { v4: true, v6: false }
+        }
+    }
+
+    #[cfg(test)]
+    fn set_local_family(&self, family: cfnet::FamilySupport) {
+        *self.family_override.lock() = Some(family);
+    }
+
+    /// 这一轮按哪一族挑赢家。会话中途的重赛（赢家坏了、手动）沿用连接层亲和：
+    /// 那一族的出口上铸过 cf_clearance，翻族就要重新过盾。启动和换网的竞速不受旧亲和约束——
+    /// 启动时是新进程（或设置变了重启网关），换网后出口本来就变了，clearance 反正要重铸。
+    /// 不受约束时按配置：IPv4 / IPv6 优先严格按族；自动 → 本机有 IPv6 路由、这个网络上
+    /// 24 小时内没验出 IPv6 不通就偏好 IPv6，慢太多时让给 IPv4
+    fn race_family(&self) -> RaceFamily {
+        let trigger = self.inner.lock().race_trigger;
+        if !matches!(trigger, RaceTrigger::Start | RaceTrigger::Network) {
+            if let Some(v6) = self.edge.affinity() {
+                return RaceFamily {
+                    prefer_v6: v6,
+                    tolerant: false,
+                    bound: true,
+                };
+            }
+        }
+        let prefer_v6 = match self.family_pref {
+            FamilyPref::V4 => false,
+            FamilyPref::V6 => true,
+            FamilyPref::Auto => self.local_family().v6 && !self.v6_known_broken(),
+        };
+        RaceFamily {
+            prefer_v6,
+            tolerant: self.family_pref == FamilyPref::Auto,
+            bound: false,
+        }
+    }
+
+    /// 这个网络上 24 小时内按 IPv6 偏好竞速过、而 IPv6 一个都没通过
+    fn v6_known_broken(&self) -> bool {
+        let inner = self.inner.lock();
+        inner
+            .state
+            .family_check
+            .as_ref()
+            .is_some_and(|check| !check.v6_ok && check.fresh_for(&inner.current_sig, now_unix()))
+    }
+
+    /// 持久化赢家是 IPv4、按配置这里该用 IPv6：不校验它，直接重新竞速一次（升级到自动
+    /// 后首次启动、换到有 IPv6 的网络）。代价是出口换了要重新过一次盾，所以同一个网络
+    /// 24 小时内只折腾一次：自动模式下这个网络上竞速过就不再来（不论那次选了哪一族）；
+    /// IPv6 优先模式下只在那次 IPv6 不通时不再来
+    fn family_rerace_due(&self, winner: IpAddr) -> bool {
+        if winner.is_ipv6() || self.family_pref == FamilyPref::V4 || !self.local_family().v6 {
+            return false;
+        }
+        let inner = self.inner.lock();
+        match inner
+            .state
+            .family_check
+            .as_ref()
+            .filter(|check| check.fresh_for(&inner.current_sig, now_unix()))
+        {
+            Some(check) => self.family_pref == FamilyPref::V6 && check.v6_ok,
+            None => true,
+        }
     }
 
     // ---------- 启动 / 状态 ----------
@@ -702,8 +913,9 @@ impl Selector {
             (inner.state.winner.clone(), inner.current_sig.clone())
         };
         info!(
-            "select: start mode={} persisted_winner={} keys={} sig={}",
+            "select: start mode={} family={} persisted_winner={} keys={} sig={}",
             self.mode.wire(),
+            self.family_pref.wire(),
             winner
                 .as_ref()
                 .map(|w| w.ip.to_string())
@@ -712,7 +924,7 @@ impl Selector {
             sig.as_deref().unwrap_or("-")
         );
         if winner.is_some() {
-            self.spawn_verify();
+            self.spawn_verify(RaceTrigger::Start);
         } else {
             self.spawn_race(RaceTrigger::Start);
         }
@@ -839,10 +1051,19 @@ impl Selector {
     }
 
     pub fn status_json(&self) -> serde_json::Value {
+        let local = self.local_family();
+        let affinity = self.edge.affinity();
         let inner = self.inner.lock();
         serde_json::json!({
             "ok": true,
             "mode": self.mode.wire(),
+            "family": {
+                "pref": self.family_pref.wire(),
+                "local_v4": local.v4,
+                "local_v6": local.v6,
+                "affinity": affinity.map(|v6| if v6 { "v6" } else { "v4" }),
+                "check": inner.state.family_check,
+            },
             "phase": inner.phase,
             "winner": inner.state.winner,
             "last_race_at": inner.state.last_race_at,
@@ -906,7 +1127,7 @@ impl Selector {
                 return;
             }
             if has_winner {
-                selector.spawn_verify();
+                selector.spawn_verify(RaceTrigger::Network);
             } else {
                 selector.spawn_race(RaceTrigger::Network);
             }
@@ -983,6 +1204,7 @@ impl Selector {
             let mut inner = self.inner.lock();
             inner.phase = Phase::Racing;
             inner.last_error = None;
+            inner.race_trigger = trigger;
         }
         self.sync_pin();
         info!("select: racing ({:?})", trigger);
@@ -1000,8 +1222,19 @@ impl Selector {
         true
     }
 
-    /// 校验持久化赢家：通过 → Ready，失败 → 竞速
-    fn spawn_verify(self: &Arc<Self>) {
+    /// 校验持久化赢家：通过 → Ready，失败 → 竞速。赢家的地址族与这里该用的不符
+    /// （见 [`Self::family_rerace_due`]）时不校验，直接竞速。`trigger` 是改为竞速时的发车原因
+    fn spawn_verify(self: &Arc<Self>, trigger: RaceTrigger) {
+        let persisted = self.inner.lock().state.winner.as_ref().map(|w| w.ip);
+        if let Some(ip) = persisted.filter(|ip| self.family_rerace_due(*ip)) {
+            info!(
+                "select: persisted winner {} is IPv4 but IPv6 is preferred here (family={}), racing instead of verifying",
+                ip,
+                self.family_pref.wire()
+            );
+            self.spawn_race(trigger);
+            return;
+        }
         if self
             .racing
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1017,7 +1250,7 @@ impl Selector {
         self.sync_pin();
         let Some(winner) = winner else {
             self.racing.store(false, Ordering::Release);
-            self.spawn_race(RaceTrigger::Start);
+            self.spawn_race(trigger);
             return;
         };
         let selector = self.clone();
@@ -1072,7 +1305,7 @@ impl Selector {
                         .unwrap_or_else(|| "no ech key".to_string());
                     warn!("select: verify winner {} failed: {} -> racing", winner.ip, reason);
                     drop(guard);
-                    selector.spawn_race(RaceTrigger::Start);
+                    selector.spawn_race(trigger);
                 }
             }
         })
@@ -1605,12 +1838,8 @@ impl Selector {
 
     /// 收集候选与钥匙（含超时）
     async fn gather(self: &Arc<Self>) -> (Vec<Candidate>, Vec<EchConfigListBytes<'static>>) {
-        let family = cfnet::local_family_support();
-        let family = if family.v4 || family.v6 {
-            family
-        } else {
-            cfnet::FamilySupport { v4: true, v6: false }
-        };
+        let family = self.local_family();
+        let prefer_v6 = self.race_family().prefer_v6;
         let sticky = self.inner.lock().state.winner.as_ref().map(|w| w.ip);
         let vendor_sink: Arc<Mutex<Vec<IpAddr>>> = Arc::new(Mutex::new(Vec::new()));
         let community_sink: Arc<Mutex<Vec<IpAddr>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1693,12 +1922,19 @@ impl Selector {
             let community_n = candidates.len() - before;
             let before = candidates.len();
             let rng = ring::rand::SystemRandom::new();
+            // 首选 IPv6 时先抽 v6、多抽几个：否则随机 v4 先把候选上限占满，v6 根本排不上
+            let v6_first = prefer_v6 && family.v6;
+            if v6_first {
+                for ip in cfnet::sample_v6(RANDOM_V6_SAMPLES_PREFERRED, &rng) {
+                    push(ip, CandidateSource::Random, &mut candidates);
+                }
+            }
             if family.v4 {
                 for ip in cfnet::sample_v4_one_per_24(RANDOM_V4_SAMPLES, &rng) {
                     push(ip, CandidateSource::Random, &mut candidates);
                 }
             }
-            if family.v6 {
+            if family.v6 && !v6_first {
                 for ip in cfnet::sample_v6(RANDOM_V6_SAMPLES, &rng) {
                     push(ip, CandidateSource::Random, &mut candidates);
                 }
@@ -1706,7 +1942,7 @@ impl Selector {
             (vendor_n, community_n, candidates.len() - before)
         };
         info!(
-            "select: candidates total={} sticky={} atlas={} vendor={} community={} random={} (v4 {}, v6 {})",
+            "select: candidates total={} sticky={} atlas={} vendor={} community={} random={} (v4 {}, v6 {}, ipv6 candidates {}, prefer {})",
             candidates.len(),
             candidates.iter().filter(|c| c.source == CandidateSource::Sticky).count(),
             candidates.iter().filter(|c| c.source == CandidateSource::Atlas).count(),
@@ -1714,8 +1950,15 @@ impl Selector {
             community_n,
             random_n,
             family.v4,
-            family.v6
+            family.v6,
+            candidates.iter().filter(|c| c.ip.is_ipv6()).count(),
+            if prefer_v6 { "IPv6" } else { "IPv4" }
         );
+        let candidates = if prefer_v6 {
+            interleave_families(candidates, true)
+        } else {
+            candidates
+        };
 
         // 钥匙池：持久化 > atlas > HTTPS 记录（都已在收集期间入池）> 二等表 / DoH 的 linux.do ECH
         if self.key_pool().is_empty() {
@@ -1817,6 +2060,11 @@ impl Selector {
 
         let start = Instant::now();
         let total = Duration::from_millis(SELECT_RACE_TOTAL_MS);
+        let family = self.race_family();
+        let set_family_count = candidates
+            .iter()
+            .filter(|c| c.ip.is_ipv6() == family.prefer_v6)
+            .count();
         let semaphore = Arc::new(Semaphore::new(SELECT_CONCURRENCY));
         let mut set: JoinSet<(Candidate, Option<ProbeOutcome>)> = JoinSet::new();
         let mut retry_pool: Vec<Candidate> = candidates
@@ -1841,17 +2089,41 @@ impl Selector {
         let mut passes: Vec<(Candidate, ProbeOutcome)> = Vec::new();
         let mut all: Vec<ProbeOutcome> = Vec::new();
         let mut first_pass_at: Option<Instant> = None;
+        // 首选族还没出结果的探测数、是否已有首选族通过、IPv6 出了几个结果
+        let mut preferred_pending = set_family_count;
+        let mut preferred_passed = false;
+        let mut v6_outcomes = 0usize;
         loop {
             let now = Instant::now();
             let mut deadline = start + total;
+            // 首选族还没有通过、又还有探测在途：首个通过（另一族的）之后多等首选族一会儿
+            let await_preferred = !preferred_passed && preferred_pending > 0;
             if let Some(at) = first_pass_at {
-                deadline = deadline.min(at + Duration::from_millis(SELECT_GRACE_MS));
+                let grace = if await_preferred {
+                    SELECT_FAMILY_GRACE_MS
+                } else {
+                    SELECT_GRACE_MS
+                };
+                deadline = deadline.min(at + Duration::from_millis(grace));
             }
-            if passes.len() >= SELECT_MAX_PASSES || now >= deadline {
+            if (passes.len() >= SELECT_MAX_PASSES && !await_preferred) || now >= deadline {
                 break;
             }
             match tokio::time::timeout(deadline - now, set.join_next()).await {
-                Ok(Some(Ok((candidate, Some(outcome))))) => {
+                Ok(Some(Ok((candidate, outcome)))) => {
+                    let preferred = candidate.ip.is_ipv6() == family.prefer_v6;
+                    if preferred {
+                        preferred_pending = preferred_pending.saturating_sub(1);
+                    }
+                    let Some(outcome) = outcome else {
+                        continue;
+                    };
+                    if candidate.ip.is_ipv6() {
+                        v6_outcomes += 1;
+                    }
+                    if outcome.ok && preferred {
+                        preferred_passed = true;
+                    }
                     debug!(
                         "select: {} ({:?}) -> {} {} ms{}",
                         candidate.ip,
@@ -1870,23 +2142,16 @@ impl Selector {
                     }
                     all.push(outcome);
                 }
-                Ok(Some(Ok((_, None)))) | Ok(Some(Err(_))) => continue,
+                Ok(Some(Err(_))) => continue,
                 Ok(None) => break,
                 Err(_) => break,
             }
         }
         set.abort_all();
 
-        // 先按地址族，再按延迟。地址族优先沿用连接层当前的亲和（已经用它铸过 cf_clearance），
-        // 没有亲和才看配置偏好：重新优选不能把整个 App 翻到另一个出口 IP 上
-        let prefer_ipv6 = self.edge.effective_prefer_ipv6();
-        let Some((best, outcome)) = passes
-            .iter()
-            .min_by_key(|(candidate, outcome)| {
-                (candidate.ip.is_ipv6() != prefer_ipv6, outcome.latency)
-            })
-            .cloned()
-        else {
+        // 先按地址族（见 race_family：会话中途沿用亲和，不把整个 App 翻到另一个出口 IP 上），
+        // 再按延迟；自动模式下首选族慢太多时让给另一族
+        let Some((best, outcome)) = pick_winner(&passes, family) else {
             // 安卓日志只到 info，这里把失败原因按类型汇总，方便真机排障
             let mut kinds: Vec<(String, usize)> = Vec::new();
             for outcome in &all {
@@ -1950,15 +2215,21 @@ impl Selector {
             .first()
             .map(|k| k.source)
             .unwrap_or(EchKeySource::Persisted);
+        let v6_passed = passes.iter().filter(|(c, _)| c.ip.is_ipv6()).count();
         info!(
-            "select: winner {} {} ms source={:?} ech={:?} ({} passed of {} probed in {} ms)",
+            "select: winner {} {} ms source={:?} ech={:?} ({} passed of {} probed in {} ms; IPv6 {} passed of {}, family={} prefer={}{})",
             best.ip,
             outcome.latency.as_millis(),
             best.source,
             ech_source,
             passes.len(),
             all.len(),
-            start.elapsed().as_millis()
+            start.elapsed().as_millis(),
+            v6_passed,
+            v6_outcomes,
+            self.family_pref.wire(),
+            if family.prefer_v6 { "IPv6" } else { "IPv4" },
+            if family.bound { " (affinity)" } else { "" }
         );
         {
             let mut inner = self.inner.lock();
@@ -1975,6 +2246,14 @@ impl Selector {
             inner.phase = Phase::Ready;
             inner.last_error = None;
             inner.report_pending = passes.len() >= 2;
+            // 按 IPv6 偏好、不受亲和约束地探过 IPv6：记下这个网络上的结论（见 family_rerace_due）
+            if !family.bound && self.family_pref != FamilyPref::V4 && v6_outcomes > 0 {
+                inner.state.family_check = Some(FamilyCheck {
+                    sig: inner.current_sig.clone(),
+                    at: now_unix(),
+                    v6_ok: v6_passed > 0,
+                });
+            }
         }
         self.sync_pin();
         self.push_state();
@@ -2350,10 +2629,28 @@ mod tests {
         f: ProbeFn,
         edge: Arc<EdgePin>,
     ) -> Arc<Selector> {
+        // 地址族偏好跟 EdgePin 的配置走（老用例用 EdgePin::new(true) 表示「IPv6 优先」）
+        let family_pref = if edge.prefer_ipv6() {
+            FamilyPref::V6
+        } else {
+            FamilyPref::V4
+        };
+        fake_selector_family(mode, family_pref, state, f, edge)
+    }
+
+    /// 同上，指定地址族偏好
+    fn fake_selector_family(
+        mode: SelectMode,
+        family_pref: FamilyPref,
+        state: SelectState,
+        f: ProbeFn,
+        edge: Arc<EdgePin>,
+    ) -> Arc<Selector> {
         let roots = RootCertStore::empty();
         let provider = Arc::new(crate::tls_crypto::build_provider());
         Selector::build(
             mode,
+            family_pref,
             state,
             Some("wifi".to_string()),
             roots,
@@ -2375,6 +2672,7 @@ mod tests {
     fn selector_with_public_doh(public_doh: Vec<(String, DohUpstream)>) -> Arc<Selector> {
         Selector::build(
             SelectMode::LocalAtlas,
+            FamilyPref::V4,
             SelectState::default(),
             Some("wifi".to_string()),
             RootCertStore::empty(),
@@ -3028,6 +3326,321 @@ mod tests {
         );
     }
 
+    const DUAL_STACK: cfnet::FamilySupport = cfnet::FamilySupport { v4: true, v6: true };
+    const V4_ONLY: cfnet::FamilySupport = cfnet::FamilySupport { v4: true, v6: false };
+
+    /// v4 / v6 各自固定延迟都通过的假探测
+    fn by_family(v4_ms: u64, v6_ms: u64) -> ProbeFn {
+        Arc::new(move |ip, _| {
+            outcome(ip, true, if ip.is_ipv6() { v6_ms } else { v4_ms }, None)
+        })
+    }
+
+    fn auto_selector(state: SelectState, f: ProbeFn, local: cfnet::FamilySupport) -> Arc<Selector> {
+        let selector = fake_selector_family(
+            SelectMode::LocalAtlas,
+            FamilyPref::Auto,
+            state,
+            f,
+            Arc::new(EdgePin::new(false)),
+        );
+        selector.set_local_family(local);
+        selector
+    }
+
+    fn v4_winner_state() -> SelectState {
+        let mut state = state_with_key(1);
+        state.winner = Some(Winner {
+            ip: ip("104.21.0.1"),
+            latency_ms: 30,
+            verified_at: 1,
+            source: CandidateSource::Sticky,
+            ech_source: EchKeySource::Persisted,
+        });
+        state.network_sig = Some("wifi".to_string());
+        state
+    }
+
+    #[test]
+    fn family_pref_from_config() {
+        assert_eq!(FamilyPref::from_config(true, true), FamilyPref::V6);
+        assert_eq!(FamilyPref::from_config(true, false), FamilyPref::V6);
+        assert_eq!(FamilyPref::from_config(false, true), FamilyPref::Auto);
+        assert_eq!(FamilyPref::from_config(false, false), FamilyPref::V4);
+        // 老的状态 JSON 没有 family_check，照常读
+        let state = SelectState::from_json(r#"{"v":1}"#).unwrap();
+        assert!(state.family_check.is_none());
+    }
+
+    #[test]
+    fn interleave_keeps_sticky_first_and_alternates_families() {
+        let mut list = vec![Candidate {
+            ip: ip("104.21.0.9"),
+            source: CandidateSource::Sticky,
+        }];
+        list.extend(candidates(&[
+            "104.21.0.1",
+            "104.21.0.2",
+            "104.21.0.3",
+            "2606:4700::1",
+            "2606:4700::2",
+        ]));
+        let order: Vec<String> = interleave_families(list, true)
+            .iter()
+            .map(|c| c.ip.to_string())
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "104.21.0.9",
+                "2606:4700::1",
+                "104.21.0.1",
+                "2606:4700::2",
+                "104.21.0.2",
+                "104.21.0.3"
+            ]
+        );
+    }
+
+    #[test]
+    fn pick_winner_tolerance_only_in_auto() {
+        let passes: Vec<(Candidate, ProbeOutcome)> = [("104.21.0.1", 20), ("2606:4700::1", 300)]
+            .iter()
+            .map(|(text, ms)| {
+                (
+                    Candidate {
+                        ip: ip(text),
+                        source: CandidateSource::Vendor,
+                    },
+                    outcome(ip(text), true, *ms, None),
+                )
+            })
+            .collect();
+        let family = |tolerant| RaceFamily {
+            prefer_v6: true,
+            tolerant,
+            bound: false,
+        };
+        // 自动：v6 300 ms 在 v4 20 ms + 300 ms 之内，仍选 v6
+        assert!(pick_winner(&passes, family(true)).unwrap().0.ip.is_ipv6());
+        let mut slow = passes.clone();
+        slow[1].1.latency = Duration::from_millis(400);
+        // 自动：v6 慢出 320 ms 以上，让给 v4
+        assert!(pick_winner(&slow, family(true)).unwrap().0.ip.is_ipv4());
+        // IPv6 优先：再慢也选 v6
+        assert!(pick_winner(&slow, family(false)).unwrap().0.ip.is_ipv6());
+        // 只有另一族通过：用另一族
+        assert!(pick_winner(&slow[..1], family(false)).unwrap().0.ip.is_ipv4());
+        assert!(pick_winner(&[], family(true)).is_none());
+    }
+
+    #[tokio::test]
+    async fn auto_prefers_ipv6_on_dual_stack_and_records_the_check() {
+        let selector = auto_selector(state_with_key(1), by_family(20, 60), DUAL_STACK);
+        selector
+            .race_candidates(
+                candidates(&["104.21.0.1", "2606:4700::6810:1"]),
+                selector.key_pool(),
+            )
+            .await;
+        assert_eq!(selector.winner_ip(), Some(ip("2606:4700::6810:1")));
+        let check = selector.inner.lock().state.family_check.clone().unwrap();
+        assert!(check.v6_ok);
+        assert_eq!(check.sig.as_deref(), Some("wifi"));
+        // 只有 IPv4 路由的网络：自动等于 IPv4 优先
+        let selector = auto_selector(state_with_key(1), by_family(60, 20), V4_ONLY);
+        selector
+            .race_candidates(
+                candidates(&["104.21.0.1", "2606:4700::6810:1"]),
+                selector.key_pool(),
+            )
+            .await;
+        assert_eq!(selector.winner_ip(), Some(ip("104.21.0.1")));
+    }
+
+    #[tokio::test]
+    async fn auto_yields_to_ipv4_when_ipv6_is_much_slower_or_dead() {
+        let selector = auto_selector(state_with_key(1), by_family(20, 900), DUAL_STACK);
+        selector
+            .race_candidates(
+                candidates(&["104.21.0.1", "2606:4700::6810:1"]),
+                selector.key_pool(),
+            )
+            .await;
+        assert_eq!(selector.winner_ip(), Some(ip("104.21.0.1")));
+        assert!(selector.inner.lock().state.family_check.as_ref().unwrap().v6_ok);
+
+        // IPv6 一个都不通：记下这个网络上 IPv6 不通，之后自动模式在这里按 IPv4 排
+        let selector = auto_selector(
+            state_with_key(1),
+            Arc::new(|ip, _| {
+                if ip.is_ipv6() {
+                    outcome(ip, false, 5, Some(ProbeFailure::TcpConnect))
+                } else {
+                    outcome(ip, true, 30, None)
+                }
+            }),
+            DUAL_STACK,
+        );
+        selector
+            .race_candidates(
+                candidates(&["104.21.0.1", "2606:4700::6810:1"]),
+                selector.key_pool(),
+            )
+            .await;
+        assert_eq!(selector.winner_ip(), Some(ip("104.21.0.1")));
+        assert!(!selector.inner.lock().state.family_check.as_ref().unwrap().v6_ok);
+        assert!(selector.v6_known_broken());
+        assert!(!selector.race_family().prefer_v6);
+        // 换了网络，结论不适用
+        selector.inner.lock().current_sig = Some("mobile".to_string());
+        assert!(selector.race_family().prefer_v6);
+    }
+
+    #[tokio::test]
+    async fn race_waits_for_preferred_family_beyond_max_passes() {
+        // 四个 v4 先通过（以前凑满四个就收敛，v6 根本没机会），IPv6 优先要等到 v6
+        let selector = fake_selector_family(
+            SelectMode::LocalAtlas,
+            FamilyPref::V6,
+            state_with_key(1),
+            by_family(10, 80),
+            Arc::new(EdgePin::new(true)),
+        );
+        selector.set_local_family(DUAL_STACK);
+        selector
+            .race_candidates(
+                candidates(&[
+                    "104.21.0.1",
+                    "104.21.0.2",
+                    "104.21.0.3",
+                    "104.21.0.4",
+                    "104.21.0.5",
+                    "2606:4700::6810:1",
+                ]),
+                selector.key_pool(),
+            )
+            .await;
+        assert_eq!(selector.winner_ip(), Some(ip("2606:4700::6810:1")));
+    }
+
+    #[tokio::test]
+    async fn midsession_rerace_keeps_affinity_but_network_change_does_not() {
+        let edge = Arc::new(EdgePin::new(false));
+        edge.report(
+            "linux.do",
+            ip("104.21.0.7"),
+            crate::edge_pin::Outcome::Connected {
+                rtt: None,
+                took_over: false,
+            },
+        );
+        let selector = fake_selector_family(
+            SelectMode::LocalAtlas,
+            FamilyPref::Auto,
+            state_with_key(1),
+            by_family(60, 20),
+            edge,
+        );
+        selector.set_local_family(DUAL_STACK);
+        // 会话中途（赢家坏了的重赛）：沿用 IPv4 亲和，也不记结论
+        selector
+            .race_candidates(
+                candidates(&["104.21.0.1", "2606:4700::6810:1"]),
+                selector.key_pool(),
+            )
+            .await;
+        assert_eq!(selector.winner_ip(), Some(ip("104.21.0.1")));
+        assert!(selector.inner.lock().state.family_check.is_none());
+        // 换网后的竞速：旧亲和不算数，按自动偏好选 IPv6
+        selector.inner.lock().race_trigger = RaceTrigger::Network;
+        selector
+            .race_candidates(
+                candidates(&["104.21.0.1", "2606:4700::6810:1"]),
+                selector.key_pool(),
+            )
+            .await;
+        assert_eq!(selector.winner_ip(), Some(ip("2606:4700::6810:1")));
+    }
+
+    #[test]
+    fn family_rerace_due_rules() {
+        let now = now_unix();
+        let check = |v6_ok| {
+            Some(FamilyCheck {
+                sig: Some("wifi".to_string()),
+                at: now,
+                v6_ok,
+            })
+        };
+        let selector = auto_selector(v4_winner_state(), by_family(20, 20), DUAL_STACK);
+        let v4 = ip("104.21.0.1");
+        // 自动：IPv4 赢家、有 IPv6、这个网络上没竞速过 → 重赛
+        assert!(selector.family_rerace_due(v4));
+        assert!(!selector.family_rerace_due(ip("2606:4700::1")));
+        // 竞速过（不论结果）→ 24 小时内不再来
+        selector.inner.lock().state.family_check = check(true);
+        assert!(!selector.family_rerace_due(v4));
+        selector.inner.lock().state.family_check = check(false);
+        assert!(!selector.family_rerace_due(v4));
+        // 结论过期或换了网络 → 再来
+        selector.inner.lock().state.family_check = Some(FamilyCheck {
+            sig: Some("wifi".to_string()),
+            at: now - FAMILY_CHECK_TTL_SECS - 1,
+            v6_ok: false,
+        });
+        assert!(selector.family_rerace_due(v4));
+        selector.inner.lock().state.family_check = check(true);
+        selector.inner.lock().current_sig = Some("mobile".to_string());
+        assert!(selector.family_rerace_due(v4));
+        // 没有 IPv6 路由 → 不来
+        selector.set_local_family(V4_ONLY);
+        assert!(!selector.family_rerace_due(v4));
+
+        // IPv6 优先：只在那次 IPv6 不通时不再来
+        let selector = fake_selector_family(
+            SelectMode::LocalAtlas,
+            FamilyPref::V6,
+            v4_winner_state(),
+            by_family(20, 20),
+            Arc::new(EdgePin::new(true)),
+        );
+        selector.set_local_family(DUAL_STACK);
+        selector.inner.lock().state.family_check = check(true);
+        assert!(selector.family_rerace_due(v4));
+        selector.inner.lock().state.family_check = check(false);
+        assert!(!selector.family_rerace_due(v4));
+
+        // IPv4 优先：从不
+        let selector = fake_selector(SelectMode::LocalAtlas, v4_winner_state(), by_family(20, 20));
+        selector.set_local_family(DUAL_STACK);
+        assert!(!selector.family_rerace_due(v4));
+    }
+
+    #[tokio::test]
+    async fn start_reraces_an_ipv4_winner_when_auto_prefers_ipv6() {
+        let selector = auto_selector(v4_winner_state(), by_family(20, 40), DUAL_STACK);
+        selector.start();
+        // 不校验旧赢家（校验中会乐观钉住它），直接竞速
+        assert_eq!(selector.phase(), Phase::Racing);
+        wait_phase(&selector, Phase::Ready).await;
+        assert!(selector.winner_ip().unwrap().is_ipv6());
+        assert!(selector.inner.lock().state.family_check.as_ref().unwrap().v6_ok);
+
+        // 同一个网络上竞速过：下次启动照常校验
+        let mut state = v4_winner_state();
+        state.family_check = Some(FamilyCheck {
+            sig: Some("wifi".to_string()),
+            at: now_unix(),
+            v6_ok: true,
+        });
+        let selector = auto_selector(state, by_family(20, 40), DUAL_STACK);
+        selector.start();
+        assert_eq!(selector.phase(), Phase::Verifying);
+        wait_phase(&selector, Phase::Ready).await;
+        assert_eq!(selector.winner_ip(), Some(ip("104.21.0.1")));
+    }
+
     #[test]
     fn atlas_routes_parsing_filters_non_cloudflare_and_takes_key() {
         let body = serde_json::json!({
@@ -3096,6 +3709,7 @@ mod tests {
     async fn live_race_local_atlas() {
         let selector = Selector::standalone(
             SelectMode::LocalAtlas,
+            FamilyPref::Auto,
             Some("https://atlas.1molchuan.top/v1/routes"),
             None,
             Some("test"),

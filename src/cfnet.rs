@@ -158,40 +158,36 @@ pub fn sample_v4_one_per_24(n: usize, rng: &dyn SecureRandom) -> Vec<IpAddr> {
     out
 }
 
-/// 按网段大小加权随机抽 `n` 个 IPv6：每个 /64 最多一个，接口标识随机（非零）
+/// 随机抽 `n` 个服务共享池站点的 IPv6（互不相同）。只在 CF 给代理站点用的段里抽：
+/// - `2606:4700:3030::/48`～`3037::/48`，接口标识形如对应的 IPv4 共享池地址
+///   （`::6815:xxxx` = 104.21.x.x、`::ac43:xxxx` = 172.67.x.x）；
+/// - `2606:4700::/64` 里的 `::6812:0`～`::681f:ffff`（104.18～104.31，跳过自家资产段）。
+///
+/// 在整个公布网段里随机抽的地址多半没有路由（2026-11 实测 TCP 超时），上面这些实测都能
+/// 经 ECH 服务 linux.do
 pub fn sample_v6(n: usize, rng: &dyn SecureRandom) -> Vec<IpAddr> {
-    // 每个网段含多少个 /64（/29 → 2^35，够用但不要溢出 u64）
-    let weights: Vec<u64> = CF_V6
-        .iter()
-        .map(|(_, prefix)| 1u64 << (64u32.saturating_sub(*prefix as u32)))
-        .collect();
-    let total: u64 = weights.iter().sum();
-    let mut seen_64: Vec<u128> = Vec::with_capacity(n);
+    const PREFIX: u128 = v6(0x2606, 0x4700, 0, 0);
     let mut out = Vec::with_capacity(n);
     let mut attempts = 0usize;
     while out.len() < n && attempts < n * 16 {
         attempts += 1;
-        let mut pick = random_below(rng, total);
-        let mut index = 0usize;
-        for (i, weight) in weights.iter().enumerate() {
-            if pick < *weight {
-                index = i;
-                break;
-            }
-            pick -= *weight;
-        }
-        let (net, _) = CF_V6[index];
-        let subnet = net | ((pick as u128) << 64);
-        if seen_64.contains(&subnet) {
-            continue;
-        }
-        let mut iid = [0u8; 8];
-        if rng.fill(&mut iid).is_err() {
+        let mut bytes = [0u8; 4];
+        if rng.fill(&mut bytes).is_err() {
             break;
         }
-        let iid = u64::from_le_bytes(iid).max(1) as u128;
-        seen_64.push(subnet);
-        out.push(IpAddr::V6(Ipv6Addr::from(subnet | iid)));
+        let low = u16::from_be_bytes([bytes[2], bytes[3]]).max(1) as u128;
+        let addr = if bytes[0] % 3 == 0 {
+            let high = 0x6812 + (bytes[1] % 14) as u128;
+            PREFIX | (high << 16) | low
+        } else {
+            let net = 0x3030 + (bytes[1] % 8) as u128;
+            let high: u128 = if bytes[0] & 1 == 0 { 0x6815 } else { 0xac43 };
+            PREFIX | (net << 80) | (high << 16) | low
+        };
+        let ip = IpAddr::V6(Ipv6Addr::from(addr));
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
     }
     out
 }
@@ -284,21 +280,29 @@ mod tests {
     }
 
     #[test]
-    fn v6_samples_are_distinct_cloudflare() {
+    fn v6_samples_are_distinct_serving_cloudflare_addresses() {
         let rng = ring::rand::SystemRandom::new();
-        let ips = sample_v6(4, &rng);
-        assert_eq!(ips.len(), 4);
-        let mut prefixes: Vec<u128> = ips
-            .iter()
-            .map(|ip| match ip {
-                IpAddr::V6(v6) => u128::from(*v6) >> 64,
-                _ => panic!("expected v6"),
-            })
-            .collect();
-        prefixes.sort_unstable();
-        prefixes.dedup();
-        assert_eq!(prefixes.len(), 4);
-        assert!(ips.iter().all(|ip| is_cloudflare(*ip)));
+        let ips = sample_v6(8, &rng);
+        assert_eq!(ips.len(), 8);
+        let mut sorted = ips.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 8);
+        for ip in &ips {
+            assert!(is_cloudflare(*ip), "{} not in CF", ip);
+            let IpAddr::V6(v6) = ip else {
+                panic!("expected v6")
+            };
+            let s = v6.segments();
+            assert_eq!(&s[..2], &[0x2606, 0x4700]);
+            assert_eq!(&s[3..6], &[0, 0, 0]);
+            match s[2] {
+                0 => assert!((0x6812..=0x681f).contains(&s[6]), "{}", ip),
+                0x3030..=0x3037 => assert!(s[6] == 0x6815 || s[6] == 0xac43, "{}", ip),
+                other => panic!("unexpected /48 {:x} in {}", other, ip),
+            }
+            assert_ne!(s[7], 0);
+        }
     }
 
     #[test]

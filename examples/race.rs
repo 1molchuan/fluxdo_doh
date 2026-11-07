@@ -1,8 +1,8 @@
 //! 在 VPS / 开发机上跑一轮本地优选竞速，看候选、赢家与状态 JSON。
 //!
-//! 用法：`cargo run --example race --features ech -- [--mode local_atlas|atlas_only] [--atlas <url>] [--json]`
+//! 用法：`cargo run --example race --features ech -- [--mode local_atlas|atlas_only] [--family auto|v6|v4] [--atlas <url>] [--json]`
 
-use doh_proxy::select::{Phase, SelectMode, Selector};
+use doh_proxy::select::{FamilyPref, Phase, SelectMode, Selector};
 use std::time::{Duration, Instant};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -28,8 +28,14 @@ async fn main() {
         .unwrap_or(SelectMode::LocalAtlas);
     let atlas = arg("--atlas").unwrap_or_else(|| "https://atlas.1molchuan.top/v1/routes".to_string());
     let json = args.iter().any(|a| a == "--json");
+    // --family auto|v6|v4：挑赢家的地址族偏好（App「IP 协议」），默认 auto
+    let family = match arg("--family").as_deref() {
+        Some("v4") => FamilyPref::V4,
+        Some("v6") => FamilyPref::V6,
+        _ => FamilyPref::Auto,
+    };
 
-    let selector = Selector::standalone(mode, Some(&atlas), None, Some("cli"));
+    let selector = Selector::standalone(mode, family, Some(&atlas), None, Some("cli"));
     // --probe <ip>：只探测这个 IP（钥匙照常从 atlas / HTTPS 记录拿）
     if let Some(ip) = arg("--probe").and_then(|v| v.parse::<std::net::IpAddr>().ok()) {
         // --via-proxy host:port：经 HTTP CONNECT 隧道探测（复现模拟器 / 特定出口的路径）

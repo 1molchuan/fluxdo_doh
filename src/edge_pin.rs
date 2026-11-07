@@ -42,6 +42,19 @@ const PRUNE_THRESHOLD: usize = 256;
 /// 除 linux.do / *.linux.do 外也由优选覆盖的主机名（atlas、cfhub6）
 static EXTRA_COVERED_HOSTS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
 
+/// CF 验证域名（Turnstile 的 challenges.cloudflare.com 及其子域）。WebView 对它做端到端 TLS
+/// （网关只开隧道、不 MITM）；建连时借优选赢家（见 [`EdgePin::route`]）
+pub fn is_cf_challenge_host(host: &str) -> bool {
+    const CF_CHALLENGE_DOMAIN: &str = "challenges.cloudflare.com";
+    let host = host.trim_end_matches('.');
+    if host.eq_ignore_ascii_case(CF_CHALLENGE_DOMAIN) {
+        return true;
+    }
+    host.len() > CF_CHALLENGE_DOMAIN.len() + 1
+        && host.as_bytes()[host.len() - CF_CHALLENGE_DOMAIN.len() - 1] == b'.'
+        && host[host.len() - CF_CHALLENGE_DOMAIN.len()..].eq_ignore_ascii_case(CF_CHALLENGE_DOMAIN)
+}
+
 /// Selector 交给 EdgePin 的钉住状态
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Pin {
@@ -230,8 +243,11 @@ impl EdgePin {
 
     /// 给 `host` 排连接顺序。`resolved` 是解析结果（表 / DoH / 系统 DNS），可以为空
     pub fn route(&self, host: &str, resolved: Vec<IpAddr>) -> Route {
+        // CF 验证域名也先连赢家：共享池的 CF 地址都服务它（实测），与 linux.do 同一个出口、
+        // 同一族；它自己的解析结果（104.18.94/95 两个地址）有的网络连不上或很慢，只当后备。
+        // 它不算覆盖域名：连不上不记到赢家头上
         let winner = match self.state.read().pin {
-            Pin::Winner(ip) if Self::is_covered(host) => Some(ip),
+            Pin::Winner(ip) if Self::is_covered(host) || is_cf_challenge_host(host) => Some(ip),
             _ => None,
         };
         // 优选有赢家：覆盖域名一律先连赢家，不看各自的粘性 IP 和当前地址族亲和
@@ -496,6 +512,11 @@ impl EdgePin {
         self.affinity().unwrap_or(self.prefer_ipv6)
     }
 
+    /// 配置的地址族偏好（IPv6 优先模式）
+    pub fn prefer_ipv6(&self) -> bool {
+        self.prefer_ipv6
+    }
+
     /// 钉住的赢家在窗口内已失败几次
     pub fn winner_fail_streak(&self) -> usize {
         let now = Instant::now();
@@ -716,6 +737,35 @@ mod tests {
         edge.report("v6-only.example", table_v6, connected_in(10));
         assert_eq!(edge.affinity(), Some(false));
         assert_eq!(edge.state.read().affinity_changes, 2);
+    }
+
+    /// CF 验证域名借赢家：先连赢家、首选族跟赢家；它连不上不算赢家失败，不会把赢家降级
+    #[test]
+    fn challenge_host_borrows_winner_without_counting_failures() {
+        let edge = EdgePin::new(false);
+        let winner = ip("2606:4700::6810:9");
+        let resolved_v4 = ip("104.18.94.41");
+        let resolved_v6 = ip("2606:4700::6812:5e29");
+        edge.set_pin(Pin::Winner(winner));
+        let host = "challenges.cloudflare.com";
+        let route = edge.route(host, vec![resolved_v4, resolved_v6]);
+        assert_eq!(route.first, Some(winner));
+        assert!(route.primary_is_v6, "验证域名要跟赢家同族、同出口");
+        assert!(route.family_decided);
+        assert_eq!(route.addrs, vec![resolved_v6, resolved_v4]);
+        // 解析失败（空）也照样先连赢家
+        assert_eq!(edge.route(host, Vec::new()).first, Some(winner));
+
+        for _ in 0..WINNER_FAIL_THRESHOLD + 1 {
+            edge.report(host, winner, Outcome::Failed);
+        }
+        assert_eq!(edge.pin(), Pin::Winner(winner), "验证域名的失败不记到赢家头上");
+
+        // 没有赢家时按普通域名走
+        edge.set_pin(Pin::None);
+        assert_eq!(edge.route(host, vec![resolved_v4]).first, None);
+        assert!(is_cf_challenge_host("brunhild.challenges.cloudflare.com"));
+        assert!(!is_cf_challenge_host("cloudflare.com"));
     }
 
     /// 没有赢家：覆盖域名跟亲和族走（亲和族在前，另一族的粘性 IP 作废）；
