@@ -409,6 +409,8 @@ pub enum RaceTrigger {
     Network,
     Manual,
     Failed,
+    /// 赢家能用但地址族不是这里该用的：后台竞速，期间赢家照常钉住（见 spawn_family_race）
+    Family,
 }
 
 struct AtlasEndpoint {
@@ -853,7 +855,10 @@ impl Selector {
     /// 24 小时内没验出 IPv6 不通就偏好 IPv6，慢太多时让给 IPv4
     fn race_family(&self) -> RaceFamily {
         let trigger = self.inner.lock().race_trigger;
-        if !matches!(trigger, RaceTrigger::Start | RaceTrigger::Network) {
+        if !matches!(
+            trigger,
+            RaceTrigger::Start | RaceTrigger::Network | RaceTrigger::Family
+        ) {
             if let Some(v6) = self.edge.affinity() {
                 return RaceFamily {
                     prefer_v6: v6,
@@ -884,10 +889,10 @@ impl Selector {
             .is_some_and(|check| !check.v6_ok && check.fresh_for(&inner.current_sig, now_unix()))
     }
 
-    /// 持久化赢家是 IPv4、按配置这里该用 IPv6：不校验它，直接重新竞速一次（升级到自动
-    /// 后首次启动、换到有 IPv6 的网络）。代价是出口换了要重新过一次盾，所以同一个网络
-    /// 24 小时内只折腾一次：自动模式下这个网络上竞速过就不再来（不论那次选了哪一族）；
-    /// IPv6 优先模式下只在那次 IPv6 不通时不再来
+    /// 赢家是 IPv4、按配置这里该用 IPv6（升级到自动后首次启动、换到有 IPv6 的网络）：
+    /// 校验通过后在后台再竞速一轮（见 [`Self::spawn_family_race`]）。真换到 IPv6 出口要重新
+    /// 过一次盾，所以同一个网络 24 小时内只折腾一次：自动模式下这个网络上竞速过就不再来
+    /// （不论那次选了哪一族）；IPv6 优先模式下只在那次 IPv6 不通时不再来
     fn family_rerace_due(&self, winner: IpAddr) -> bool {
         if winner.is_ipv6() || self.family_pref == FamilyPref::V4 || !self.local_family().v6 {
             return false;
@@ -1222,19 +1227,9 @@ impl Selector {
         true
     }
 
-    /// 校验持久化赢家：通过 → Ready，失败 → 竞速。赢家的地址族与这里该用的不符
-    /// （见 [`Self::family_rerace_due`]）时不校验，直接竞速。`trigger` 是改为竞速时的发车原因
+    /// 校验持久化赢家：通过 → Ready（地址族不是这里该用的就再后台竞速一轮，见
+    /// [`Self::family_rerace_due`]），失败 → 竞速。`trigger` 是改为竞速时的发车原因
     fn spawn_verify(self: &Arc<Self>, trigger: RaceTrigger) {
-        let persisted = self.inner.lock().state.winner.as_ref().map(|w| w.ip);
-        if let Some(ip) = persisted.filter(|ip| self.family_rerace_due(*ip)) {
-            info!(
-                "select: persisted winner {} is IPv4 but IPv6 is preferred here (family={}), racing instead of verifying",
-                ip,
-                self.family_pref.wire()
-            );
-            self.spawn_race(trigger);
-            return;
-        }
         if self
             .racing
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1297,6 +1292,10 @@ impl Selector {
                     if sig_changed {
                         selector.push_state();
                     }
+                    if selector.family_rerace_due(winner.ip) {
+                        drop(guard);
+                        selector.spawn_family_race();
+                    }
                 }
                 other => {
                     let reason = other
@@ -1311,6 +1310,47 @@ impl Selector {
         })
         .abort_handle();
         self.track(handle);
+    }
+
+    /// 后台换族竞速：当前赢家照常钉住、阶段不变，解析不用等；出了结果再换过去，
+    /// 一个都没通过就当没发生过。先不动赢家是因为它的出口上铸着 cf_clearance——
+    /// 竞速要是还选它这一族，就不必为换族多过一次盾
+    fn spawn_family_race(self: &Arc<Self>) {
+        if self
+            .racing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        self.inner.lock().race_trigger = RaceTrigger::Family;
+        info!(
+            "select: winner is IPv4 but IPv6 is preferred here (family={}), racing in background",
+            self.family_pref.wire()
+        );
+        let selector = self.clone();
+        let generation = self.generation.load(Ordering::Acquire);
+        let handle = tokio::spawn(async move {
+            let _guard = RaceGuard(selector.clone());
+            if selector.generation.load(Ordering::Acquire) != generation {
+                return;
+            }
+            selector.run_race().await;
+        })
+        .abort_handle();
+        self.track(handle);
+    }
+
+    /// 一轮没出赢家：后台换族竞速当没发生过（当前赢家照常用），否则转 Failed
+    fn race_failed(&self, reason: &str) {
+        if self.inner.lock().race_trigger == RaceTrigger::Family {
+            warn!(
+                "select: background family race found no winner ({}), keeping the current one",
+                reason
+            );
+            return;
+        }
+        self.finish_failed(reason);
     }
 
     // ---------- 探测 ----------
@@ -2033,7 +2073,7 @@ impl Selector {
     ) {
         if keys.is_empty() {
             warn!("select: no ech key available, falling back to tier 2");
-            self.finish_failed("no ech key");
+            self.race_failed("no ech key");
             return;
         }
         {
@@ -2054,7 +2094,7 @@ impl Selector {
         }
         if candidates.is_empty() {
             warn!("select: no candidates, falling back to tier 2");
-            self.finish_failed("no candidates");
+            self.race_failed("no candidates");
             return;
         }
 
@@ -2204,7 +2244,7 @@ impl Selector {
                     return;
                 }
             }
-            self.finish_failed("no candidate passed");
+            self.race_failed("no candidate passed");
             return;
         };
         let ech_source = self
@@ -3617,17 +3657,30 @@ mod tests {
         assert!(!selector.family_rerace_due(v4));
     }
 
+    /// 等后台竞速（single-flight 标记）结束
+    async fn wait_idle(selector: &Arc<Selector>) {
+        let start = Instant::now();
+        while selector.racing.load(Ordering::Acquire) && start.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!selector.racing.load(Ordering::Acquire));
+    }
+
     #[tokio::test]
-    async fn start_reraces_an_ipv4_winner_when_auto_prefers_ipv6() {
+    async fn verified_ipv4_winner_is_kept_while_auto_races_for_ipv6_in_background() {
         let selector = auto_selector(v4_winner_state(), by_family(20, 40), DUAL_STACK);
         selector.start();
-        // 不校验旧赢家（校验中会乐观钉住它），直接竞速
-        assert_eq!(selector.phase(), Phase::Racing);
+        // 先照常校验旧赢家：校验中就乐观钉住它，解析不用等
+        assert_eq!(selector.phase(), Phase::Verifying);
+        assert_eq!(selector.winner_ip(), Some(ip("104.21.0.1")));
         wait_phase(&selector, Phase::Ready).await;
+        // 后台换族竞速期间阶段不变、旧赢家一直钉着；出结果后换到 IPv6
+        wait_idle(&selector).await;
+        assert_eq!(selector.phase(), Phase::Ready);
         assert!(selector.winner_ip().unwrap().is_ipv6());
         assert!(selector.inner.lock().state.family_check.as_ref().unwrap().v6_ok);
 
-        // 同一个网络上竞速过：下次启动照常校验
+        // 同一个网络上竞速过：下次启动照常校验，不再后台竞速
         let mut state = v4_winner_state();
         state.family_check = Some(FamilyCheck {
             sig: Some("wifi".to_string()),
@@ -3638,6 +3691,39 @@ mod tests {
         selector.start();
         assert_eq!(selector.phase(), Phase::Verifying);
         wait_phase(&selector, Phase::Ready).await;
+        wait_idle(&selector).await;
+        assert_eq!(selector.winner_ip(), Some(ip("104.21.0.1")));
+    }
+
+    #[tokio::test]
+    async fn background_family_race_without_winner_keeps_the_current_one() {
+        // 旧赢家校验能过，其余一律不通：后台竞速一无所获，旧赢家照用，不转 Failed
+        let selector = auto_selector(
+            v4_winner_state(),
+            Arc::new(|ip, _| {
+                if ip == "104.21.0.1".parse::<IpAddr>().unwrap() {
+                    outcome(ip, true, 30, None)
+                } else {
+                    outcome(ip, false, 5, Some(ProbeFailure::TcpConnect))
+                }
+            }),
+            DUAL_STACK,
+        );
+        selector.start();
+        wait_phase(&selector, Phase::Ready).await;
+        wait_idle(&selector).await;
+        // 粘性赢家自己也在候选里：它通过，仍是赢家；IPv6 一个都没通过，记下不通
+        assert_eq!(selector.phase(), Phase::Ready);
+        assert_eq!(selector.winner_ip(), Some(ip("104.21.0.1")));
+        assert!(!selector.inner.lock().state.family_check.as_ref().unwrap().v6_ok);
+
+        // 后台竞速连赢家都没通过（网络正抖）：当没发生过
+        let selector = auto_selector(v4_winner_state(), by_family(20, 40), DUAL_STACK);
+        selector.inner.lock().phase = Phase::Ready;
+        selector.sync_pin();
+        selector.inner.lock().race_trigger = RaceTrigger::Family;
+        selector.race_failed("no candidate passed");
+        assert_eq!(selector.phase(), Phase::Ready);
         assert_eq!(selector.winner_ip(), Some(ip("104.21.0.1")));
     }
 
