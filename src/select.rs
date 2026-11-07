@@ -889,12 +889,17 @@ impl Selector {
             .is_some_and(|check| !check.v6_ok && check.fresh_for(&inner.current_sig, now_unix()))
     }
 
-    /// 赢家是 IPv4、按配置这里该用 IPv6（升级到自动后首次启动、换到有 IPv6 的网络）：
-    /// 校验通过后在后台再竞速一轮（见 [`Self::spawn_family_race`]）。真换到 IPv6 出口要重新
-    /// 过一次盾，所以同一个网络 24 小时内只折腾一次：自动模式下这个网络上竞速过就不再来
-    /// （不论那次选了哪一族）；IPv6 优先模式下只在那次 IPv6 不通时不再来
+    /// 赢家的地址族不是这里该用的，校验通过后在后台再竞速一轮（见 [`Self::spawn_family_race`]）：
+    /// - IPv4 优先而赢家是 IPv6（从自动切回来）：本机有 IPv4 就换回去；
+    /// - 自动 / IPv6 优先而赢家是 IPv4（升级到自动后首次启动、换到有 IPv6 的网络）：真换到
+    ///   IPv6 出口要重新过一次盾，所以同一个网络 24 小时内只折腾一次——自动模式下这个网络上
+    ///   竞速过就不再来（不论那次选了哪一族）；IPv6 优先模式下只在那次 IPv6 不通时不再来
     fn family_rerace_due(&self, winner: IpAddr) -> bool {
-        if winner.is_ipv6() || self.family_pref == FamilyPref::V4 || !self.local_family().v6 {
+        let local = self.local_family();
+        if self.family_pref == FamilyPref::V4 {
+            return winner.is_ipv6() && local.v4;
+        }
+        if winner.is_ipv6() || !local.v6 {
             return false;
         }
         let inner = self.inner.lock();
@@ -1325,7 +1330,7 @@ impl Selector {
         }
         self.inner.lock().race_trigger = RaceTrigger::Family;
         info!(
-            "select: winner is IPv4 but IPv6 is preferred here (family={}), racing in background",
+            "select: winner's address family is not the preferred one here (family={}), racing in background",
             self.family_pref.wire()
         );
         let selector = self.clone();
@@ -3651,10 +3656,27 @@ mod tests {
         selector.inner.lock().state.family_check = check(false);
         assert!(!selector.family_rerace_due(v4));
 
-        // IPv4 优先：从不
+        // IPv4 优先：IPv4 赢家不动；从自动切回来、赢家还是 IPv6 时换回 IPv4（本机得有 IPv4）
         let selector = fake_selector(SelectMode::LocalAtlas, v4_winner_state(), by_family(20, 20));
         selector.set_local_family(DUAL_STACK);
         assert!(!selector.family_rerace_due(v4));
+        assert!(selector.family_rerace_due(ip("2606:4700::1")));
+        selector.set_local_family(cfnet::FamilySupport { v4: false, v6: true });
+        assert!(!selector.family_rerace_due(ip("2606:4700::1")));
+    }
+
+    #[tokio::test]
+    async fn switching_back_to_ipv4_moves_an_ipv6_winner_in_background() {
+        let mut state = v4_winner_state();
+        state.winner.as_mut().unwrap().ip = ip("2606:4700::6810:1");
+        let selector = fake_selector(SelectMode::LocalAtlas, state, by_family(60, 20));
+        selector.set_local_family(DUAL_STACK);
+        selector.start();
+        wait_phase(&selector, Phase::Ready).await;
+        wait_idle(&selector).await;
+        assert!(selector.winner_ip().unwrap().is_ipv4(), "IPv4 优先：v6 再快也换回 v4");
+        // IPv4 优先不记 IPv6 结论
+        assert!(selector.inner.lock().state.family_check.is_none());
     }
 
     /// 等后台竞速（single-flight 标记）结束
