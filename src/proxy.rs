@@ -725,6 +725,53 @@ async fn gateway_forward_request(
     }
 }
 
+/// h1 的协议升级请求（WebSocket）：`Connection` 里有 upgrade 且带 `Upgrade` 头
+fn is_upgrade_request<B>(req: &Request<B>) -> bool {
+    req.version() <= hyper::Version::HTTP_11
+        && req.headers().contains_key(hyper::header::UPGRADE)
+        && req
+            .headers()
+            .get_all(hyper::header::CONNECTION)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+}
+
+/// 转发 WebSocket 等协议升级：另建一条 h1 上游连接，101 之后两侧原样对接
+async fn gateway_forward_upgrade(
+    mut req: Request<Incoming>,
+    pool: Arc<UpstreamPool>,
+    (host, port): (String, u16),
+) -> GatewayResponse {
+    let client = hyper::upgrade::on(&mut req);
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    let authority = if port == 443 {
+        host.clone()
+    } else {
+        format!("{}:{}", host, port)
+    };
+    if let Ok(uri) = format!("https://{}{}", authority, path_and_query).parse() {
+        *req.uri_mut() = uri;
+    }
+    info!("MITM upgrade {} -> {}:{}", req.uri().path(), host, port);
+    match pool
+        .forward_upgrade(&host, port, req.map(|body| body.boxed()), client)
+        .await
+    {
+        Ok(response) => Ok(response),
+        Err(e) => {
+            warn!("MITM upgrade failed for {}:{}: {}", host, port, e);
+            STATS.gw_502.inc();
+            Ok(gateway_error_response(502, &e.to_string()))
+        }
+    }
+}
+
 /// h2 MITM：在已建立的 client TLS 上用 hyper 自动协商 h1/h2，把每个请求转发到上游（带 ECH）。
 /// CONNECT 已固定单 host，所有 h2 stream 复用同一条上游连接（h2 多路复用）。
 async fn mitm_serve<I>(
@@ -741,7 +788,12 @@ where
     let service = service_fn(move |req: Request<Incoming>| {
         let pool = pool.clone();
         let target = (host.clone(), port);
-        async move { gateway_forward_request(req, pool, Lane::Mitm, Some(target)).await }
+        async move {
+            if is_upgrade_request(&req) {
+                return gateway_forward_upgrade(req, pool, target).await;
+            }
+            gateway_forward_request(req, pool, Lane::Mitm, Some(target)).await
+        }
     });
 
     hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
@@ -1061,7 +1113,31 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::{gateway_parse_host, in_mitm_scope, is_cf_challenge_host, is_loopback_host};
+    use super::{
+        gateway_parse_host, in_mitm_scope, is_cf_challenge_host, is_loopback_host,
+        is_upgrade_request,
+    };
+
+    /// WebSocket 握手才算升级请求；普通 keep-alive、h2 请求、只有 Upgrade 头的都不算
+    #[test]
+    fn upgrade_requests_are_recognised() {
+        let build = |version, connection: Option<&str>, upgrade: bool| {
+            let mut builder = hyper::Request::builder().version(version);
+            if let Some(connection) = connection {
+                builder = builder.header("connection", connection);
+            }
+            if upgrade {
+                builder = builder.header("upgrade", "websocket");
+            }
+            builder.body(()).unwrap()
+        };
+        use hyper::Version;
+        assert!(is_upgrade_request(&build(Version::HTTP_11, Some("Upgrade"), true)));
+        assert!(is_upgrade_request(&build(Version::HTTP_11, Some("keep-alive, upgrade"), true)));
+        assert!(!is_upgrade_request(&build(Version::HTTP_11, Some("keep-alive"), true)));
+        assert!(!is_upgrade_request(&build(Version::HTTP_11, Some("upgrade"), false)));
+        assert!(!is_upgrade_request(&build(Version::HTTP_2, Some("upgrade"), true)));
+    }
 
     /// MITM 范围为空 = 不限；有值时按后缀匹配，同名前缀的伪装域不算
     #[test]
