@@ -15,6 +15,14 @@ fn main() {
     println!("cargo:rerun-if-changed=certs/ca.key");
     println!("cargo:rerun-if-changed=certs/ca.der");
 
+    // 安卓静态链接 C++ 运行库（见 .cargo/config.toml）：NDK 把它拆成 libc++_static.a 与
+    // libc++abi.a，BoringSSL 只声明了前者，异常与类型信息符号在后者里，这里补上
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android")
+        && std::env::var_os("CARGO_FEATURE_BROWSER_TLS").is_some()
+    {
+        println!("cargo:rustc-link-lib=c++abi");
+    }
+
     let cert_file = Path::new("certs/ca.crt");
     let key_file = Path::new("certs/ca.key");
 
