@@ -1777,8 +1777,15 @@ mod tests {
         assert_eq!(get(&pool, "/ok").await.unwrap(), 200);
         assert_eq!(pool.h2_count(Lane::Gateway, "example.test", 443), 1);
         server.abort_conn_of_request(0);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        pool.reap();
+        // 连接任务发现对端关闭要被调度到；整套测试并行跑时可能晚一些
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            pool.reap();
+            if pool.h2_count(Lane::Gateway, "example.test", 443) == 0 || Instant::now() > deadline {
+                break;
+            }
+        }
         assert_eq!(pool.h2_count(Lane::Gateway, "example.test", 443), 0);
     }
 }
