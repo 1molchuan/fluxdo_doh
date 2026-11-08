@@ -196,6 +196,25 @@ pub(crate) fn record_handshake(conn: &rustls::ClientConnection, elapsed: Duratio
     }
 }
 
+/// 按浏览器指纹（BoringSSL）握手的连接：计入同一组握手统计
+#[cfg(feature = "browser-tls")]
+pub(crate) fn record_browser_handshake(
+    ssl: &rama_tls_boring::core::ssl::SslRef,
+    elapsed: Duration,
+) {
+    STATS.tls_handshake.record(elapsed);
+    if ssl.session_reused() {
+        STATS.tls_resumed.inc();
+    } else {
+        STATS.tls_full.inc();
+    }
+    if ssl.ech_accepted() {
+        STATS.ech_accepted.inc();
+    } else {
+        STATS.ech_not_offered.inc();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

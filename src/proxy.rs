@@ -113,13 +113,29 @@ impl DohProxyServer {
         };
 
         let dns_resolver_for_selector = dns_resolver.clone();
-        let doh_tls_connector = Arc::new(DohTlsConnector::new(
+        let doh_tls_connector = DohTlsConnector::new(
             dns_resolver,
             config.enable_doh,
             Duration::from_secs(config.timeout_secs),
             config.upstream_proxy.clone(),
             config.server_ip.clone(),
-        ));
+        );
+        // 浏览器指纹：网关道与 h2 MITM 道的上游握手照 WebView 的 ClientHello 复刻
+        #[cfg(feature = "browser-tls")]
+        let doh_tls_connector = if config.browser_tls && config.enable_doh {
+            info!("Browser TLS fingerprint enabled");
+            doh_tls_connector.with_browser_tls(Arc::new(crate::browser_tls::BrowserTls::new(
+                config
+                    .fingerprint_cache_path
+                    .as_deref()
+                    .filter(|path| !path.is_empty())
+                    .map(std::path::PathBuf::from),
+                config.webview_user_agent.clone(),
+            )))
+        } else {
+            doh_tls_connector
+        };
+        let doh_tls_connector = Arc::new(doh_tls_connector);
 
         // 本地动态优选：一等链路。先卸载上一轮的实例（重启网关时）
         crate::edge_pin::EdgePin::set_extra_covered_hosts(&config.extra_covered_hosts);
@@ -178,6 +194,17 @@ impl DohProxyServer {
     /// 上游连接池（FFI 换网通知时作废旧连接）
     pub fn pool(&self) -> &Arc<UpstreamPool> {
         &self.pool
+    }
+
+    /// 浏览器指纹出口的状态（模板来源、代数）；没开时 `enabled: false`
+    pub fn fingerprint_status(&self) -> serde_json::Value {
+        #[cfg(feature = "browser-tls")]
+        if let Some(browser) = self.doh_tls_connector.browser_tls() {
+            let mut status = browser.templates().status_json();
+            status["enabled"] = serde_json::Value::Bool(true);
+            return status;
+        }
+        serde_json::json!({ "enabled": false })
     }
 
     /// Get the local address the server is bound to
@@ -496,6 +523,7 @@ async fn handle_connect_mitm(
             .reunite(writer)
             .map_err(|_| DohProxyError::Proxy("Failed to reunite TCP stream halves".to_string()))?;
         let client_stream = PrefixedStream::new(client_stream, buffered);
+        let client_stream = sniff_client_hello(client_stream, &doh_tls_connector).await;
 
         let server_config = cert_manager.get_server_config(&host)?;
         let acceptor = TlsAcceptor::from(server_config);
@@ -507,6 +535,7 @@ async fn handle_connect_mitm(
             }
         };
         info!("Client TLS handshake complete for {} (h2 MITM)", host);
+        let client_tls = sniff_h2_preface(client_tls, &doh_tls_connector).await;
         return mitm_serve(client_tls, host, port, pool).await;
     }
 
@@ -535,6 +564,7 @@ async fn handle_connect_mitm(
         .reunite(writer)
         .map_err(|_| DohProxyError::Proxy("Failed to reunite TCP stream halves".to_string()))?;
     let client_stream = PrefixedStream::new(client_stream, buffered);
+    let client_stream = sniff_client_hello(client_stream, &doh_tls_connector).await;
 
     let server_config = cert_manager.get_server_config(&host)?;
     let acceptor = TlsAcceptor::from(server_config);
@@ -915,6 +945,7 @@ async fn gateway_handle_connect(
                     upstream,
                     pool,
                     cert_manager,
+                    connector,
                 )
                 .await
                 {
@@ -936,6 +967,7 @@ async fn gateway_handle_connect(
 ///
 /// [upstream] 是回 200 之前已连好的上游（h1 MITM）；None 表示 h2 MITM，
 /// 上游按请求从池里取。
+#[allow(clippy::too_many_arguments)]
 async fn gateway_mitm_upgraded<I, S>(
     client_io: I,
     host: &str,
@@ -943,11 +975,13 @@ async fn gateway_mitm_upgraded<I, S>(
     upstream: Option<S>,
     pool: Arc<UpstreamPool>,
     cert_manager: Arc<CertManager>,
+    connector: Arc<DohTlsConnector>,
 ) -> Result<()>
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let client_io = sniff_client_hello(client_io, &connector).await;
     // h2 MITM：accept client TLS（ALPN 含 h2）后交给 hyper 转发，上游按需连（带 ECH）
     let Some(server_tls) = upstream else {
         let server_config = cert_manager.get_server_config(host)?;
@@ -956,6 +990,7 @@ where
             .accept(client_io)
             .await
             .map_err(DohProxyError::Io)?;
+        let client_tls = sniff_h2_preface(client_tls, &connector).await;
         return mitm_serve(client_tls, host.to_string(), port, pool).await;
     };
 
@@ -1056,6 +1091,53 @@ fn parse_host_port(target: &str) -> Result<(String, u16)> {
     } else {
         Ok((target.to_string(), 443))
     }
+}
+
+/// MITM 入站等 WebView 发来 ClientHello 的上限
+#[cfg(feature = "browser-tls")]
+const CLIENT_HELLO_PEEK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// MITM 入站：接受 TLS 之前窥探 WebView 的 ClientHello，记作浏览器指纹模板；读到的字节
+/// 原样放回流前面，再交给 rustls 接受
+async fn sniff_client_hello<S>(stream: S, connector: &DohTlsConnector) -> PrefixedStream<S>
+where
+    S: AsyncRead + Unpin,
+{
+    #[cfg(feature = "browser-tls")]
+    if let Some(browser) = connector.browser_tls() {
+        let mut stream = stream;
+        let (consumed, hello) =
+            crate::browser_tls::peek_client_hello(&mut stream, CLIENT_HELLO_PEEK_TIMEOUT).await;
+        if let Some(hello) = hello {
+            browser.templates().record_hello(&hello);
+        }
+        return PrefixedStream::new(stream, consumed);
+    }
+    let _ = connector;
+    PrefixedStream::new(stream, Vec::new())
+}
+
+/// h2 MITM 入站：TLS 谈成 h2 时读出 WebView 的 h2 连接前言（初始 SETTINGS、连接窗口），
+/// 记进指纹模板；读到的字节放回流前面再交给 hyper。已经采到过就不再读
+async fn sniff_h2_preface<S>(
+    stream: tokio_rustls::server::TlsStream<S>,
+    connector: &DohTlsConnector,
+) -> PrefixedStream<tokio_rustls::server::TlsStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    #[cfg(feature = "browser-tls")]
+    if let Some(browser) = connector.browser_tls() {
+        let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2");
+        if h2 && !browser.templates().has_sampled_h2() {
+            let mut stream = stream;
+            let buffered =
+                crate::browser_tls::read_h2_preface(&mut stream, browser.templates()).await;
+            return PrefixedStream::new(stream, buffered);
+        }
+    }
+    let _ = connector;
+    PrefixedStream::new(stream, Vec::new())
 }
 
 struct PrefixedStream<S> {

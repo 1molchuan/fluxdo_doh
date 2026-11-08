@@ -85,6 +85,39 @@ pub struct DialedIo {
     pub h2: bool,
     /// 对端地址（经上游代理时不知道）
     pub peer: Option<SocketAddr>,
+    /// 按浏览器指纹握手的连接：h2 初始设置也照浏览器发（None 用池的默认设置）
+    pub h2_profile: Option<H2Profile>,
+}
+
+/// 浏览器的 HTTP/2 初始设置：SETTINGS 按发送顺序（id, 值），加连接级 WINDOW_UPDATE 的增量
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct H2Profile {
+    pub settings: Vec<(u16, u32)>,
+    pub connection_window_increment: Option<u32>,
+}
+
+impl H2Profile {
+    fn setting(&self, id: u16) -> Option<u32> {
+        self.settings
+            .iter()
+            .find(|(setting, _)| *setting == id)
+            .map(|(_, value)| *value)
+    }
+
+    /// 照浏览器的值配 hyper。h2 库按 id 升序发 SETTINGS，与 Chromium 的顺序一致；
+    /// 浏览器没发的项（如 MAX_FRAME_SIZE）就不发。ENABLE_PUSH=0 hyper 总会发
+    fn apply(&self, builder: &mut http2::Builder<TokioExecutor>) {
+        builder
+            .header_table_size(self.setting(1))
+            .initial_stream_window_size(self.setting(4))
+            .max_frame_size(self.setting(5));
+        if let Some(max) = self.setting(6) {
+            builder.max_header_list_size(max);
+        }
+        if let Some(increment) = self.connection_window_increment {
+            builder.initial_connection_window_size(increment.saturating_add(65_535));
+        }
+    }
 }
 
 pub type DialFuture<'a> =
@@ -96,6 +129,10 @@ pub trait Dialer: Send + Sync + 'static {
     /// 只谈 http/1.1 的连接（WebSocket 等协议升级用）
     fn dial_h1<'a>(&'a self, host: &'a str, port: u16) -> DialFuture<'a>;
     fn edge(&self) -> Option<&EdgePin>;
+    /// 浏览器指纹模板的代数：模板变了（采到 WebView 的真实握手）旧指纹的连接不再复用
+    fn fingerprint_generation(&self) -> u64 {
+        0
+    }
 }
 
 struct H2Conn {
@@ -105,6 +142,8 @@ struct H2Conn {
     in_flight: AtomicUsize,
     last_used: Mutex<Instant>,
     dead: AtomicBool,
+    /// 按浏览器指纹握手的连接：请求的 HEADERS 帧也照 Chromium 带优先级
+    chromium_priority: bool,
 }
 
 impl H2Conn {
@@ -211,9 +250,11 @@ impl UpstreamPool {
         })
     }
 
-    /// 当前代数：EdgePin 的（换网 / 亲和切换 / 赢家变化）加上池自己的
+    /// 当前代数：EdgePin 的（换网 / 亲和切换 / 赢家变化）、指纹模板的，加上池自己的
     fn epoch(&self) -> u64 {
-        self.dialer.edge().map(EdgePin::epoch).unwrap_or(0) + self.local_epoch.load(Ordering::Acquire)
+        self.dialer.edge().map(EdgePin::epoch).unwrap_or(0)
+            + self.dialer.fingerprint_generation()
+            + self.local_epoch.load(Ordering::Acquire)
     }
 
     /// 只算换网的代数（EdgePin 的换网 / 清缓存，加上池自己的）
@@ -542,15 +583,27 @@ impl UpstreamPool {
     async fn dial(&self, key: &Key) -> Result<Lease, String> {
         let epoch_before = self.epoch();
         let net_before = self.net_epoch();
-        let DialedIo { io, h2, peer } = self
+        let DialedIo {
+            io,
+            h2,
+            peer,
+            h2_profile,
+        } = self
             .dialer
             .dial(&key.host, key.port)
             .await
             .map_err(|e| format!("Connect failed: {}", e))?;
         let io = TokioIo::new(io);
         if h2 {
-            let (sender, conn) = self
-                .h2_builder
+            let builder = match &h2_profile {
+                Some(profile) => {
+                    let mut builder = self.h2_builder.clone();
+                    profile.apply(&mut builder);
+                    builder
+                }
+                None => self.h2_builder.clone(),
+            };
+            let (sender, conn) = builder
                 .handshake::<_, PoolBody>(io)
                 .await
                 .map_err(|e| format!("H2 handshake failed: {}", e))?;
@@ -569,6 +622,7 @@ impl UpstreamPool {
                 in_flight: AtomicUsize::new(0),
                 last_used: Mutex::new(Instant::now()),
                 dead: AtomicBool::new(false),
+                chromium_priority: h2_profile.is_some(),
             });
             // 建连期间换过网（或连接对当前地址族不合格）就只给这一次用，不入池
             if !self.closed.load(Ordering::Acquire) && self.usable(&key.host, epoch, peer) {
@@ -660,7 +714,12 @@ impl UpstreamPool {
                 // 先拿到守卫：无论成功、失败还是被取消，在途计数都会扣回
                 let guard = StreamGuard::H2(conn.clone());
                 let mut sender = conn.sender.clone();
-                let req = into_h2_form(req);
+                let mut req = into_h2_form(req);
+                if conn.chromium_priority {
+                    let weight = chromium_weight(&req);
+                    req.extensions_mut()
+                        .insert(h2::ext::RequestPriority { weight });
+                }
                 match sender.try_send_request(req).await {
                     Ok(response) => Ok(response.map(|body| PooledBody::wrap(body, guard))),
                     Err(mut error) => {
@@ -887,6 +946,24 @@ fn into_h2_form(mut req: Request<PoolBody>) -> Request<PoolBody> {
     req
 }
 
+/// Chromium 给请求的 HTTP/2 权重（由 Blink 资源优先级换算：HIGHEST 256、MEDIUM 220、
+/// LOWEST 147）。WebView 的请求按 `sec-fetch-dest` 推；Dart 的请求没有这个头，图片按
+/// LOWEST、其余按 fetch / XHR 的 MEDIUM 算
+fn chromium_weight<B>(req: &Request<B>) -> u16 {
+    let header = |name: &str| {
+        req.headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+    };
+    match header("sec-fetch-dest") {
+        "document" | "iframe" | "frame" | "style" | "font" => 256,
+        "image" => 147,
+        "" if header("accept").starts_with("image/") => 147,
+        _ => 220,
+    }
+}
+
 /// 发往 h1 连接：补上 Host（h2 入站请求只有 :authority），请求行改用 origin-form
 /// （浏览器直连源站时的写法）
 fn into_h1_form(mut req: Request<PoolBody>) -> Request<PoolBody> {
@@ -1037,11 +1114,13 @@ impl Dialer for crate::ech::DohTlsConnector {
     fn dial<'a>(&'a self, host: &'a str, port: u16) -> DialFuture<'a> {
         Box::pin(async move {
             let (tls, peer) = self.connect_h2_with_peer(host, port).await?;
-            let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
+            let h2 = tls.is_h2();
+            let h2_profile = tls.h2_profile();
             Ok(DialedIo {
                 io: Box::new(tls),
                 h2,
                 peer,
+                h2_profile,
             })
         })
     }
@@ -1053,12 +1132,17 @@ impl Dialer for crate::ech::DohTlsConnector {
                 io: Box::new(tls),
                 h2: false,
                 peer: None,
+                h2_profile: None,
             })
         })
     }
 
     fn edge(&self) -> Option<&EdgePin> {
         self.dns_resolver().map(|resolver| resolver.edge_pin().as_ref())
+    }
+
+    fn fingerprint_generation(&self) -> u64 {
+        crate::ech::DohTlsConnector::fingerprint_generation(self)
     }
 }
 
@@ -1199,6 +1283,7 @@ mod tests {
                     io: Box::new(tcp),
                     h2: self.h2,
                     peer: Some(self.addr),
+                    h2_profile: None,
                 })
             })
         }
@@ -1210,6 +1295,7 @@ mod tests {
                     io: Box::new(tcp),
                     h2: false,
                     peer: Some(self.addr),
+                    h2_profile: None,
                 })
             })
         }

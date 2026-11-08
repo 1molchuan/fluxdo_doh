@@ -8,6 +8,8 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 
+#[cfg(feature = "browser-tls")]
+pub mod browser_tls;
 pub mod cert;
 pub mod cfnet;
 pub mod dns;
@@ -193,7 +195,7 @@ pub struct ProxyConfig {
     #[serde(default = "default_true")]
     pub mitm_connect: bool,
     /// WebView MITM 是否启用 HTTP/2：client 协商 h2 时用 hyper 转发实现多路复用；
-    /// 关闭则保持裸字节拷贝（锁 http/1.1）。默认关闭，需实测 CF 指纹后再开。
+    /// 关闭则保持裸字节拷贝（锁 http/1.1）。默认关闭（安卓 App 默认传 true）。
     #[serde(default)]
     pub h2_mitm: bool,
     /// WebView 的 CONNECT 里哪些主机做 MITM（后缀匹配：`linux.do` 同时覆盖 `*.linux.do`）。
@@ -250,6 +252,15 @@ pub struct ProxyConfig {
     /// 启动后预建上游连接的主机（网关道、443 端口），优选出结果后才连
     #[serde(default)]
     pub preconnect_hosts: Vec<String>,
+    /// 上游 h2 握手照 WebView 的 ClientHello 复刻（编译时开了 browser-tls 特性才生效）
+    #[serde(default)]
+    pub browser_tls: bool,
+    /// 采到的指纹模板落盘位置（冷启动直接用，不必等 WebView 再连一次）
+    #[serde(default)]
+    pub fingerprint_cache_path: Option<String>,
+    /// WebView 当前的 User-Agent：挑预置模板（Chrome 大版本）、判断缓存是否过期
+    #[serde(default)]
+    pub webview_user_agent: Option<String>,
 }
 
 impl Default for ProxyConfig {
@@ -289,6 +300,9 @@ impl Default for ProxyConfig {
             app_version: None,
             network_sig: None,
             preconnect_hosts: Vec::new(),
+            browser_tls: false,
+            fingerprint_cache_path: None,
+            webview_user_agent: None,
         }
     }
 }

@@ -782,9 +782,15 @@ pub extern "C" fn doh_proxy_accel_request(
 /// 进程级累计，代理重启不清零。返回的字符串需要调用 doh_proxy_free_string 释放
 #[no_mangle]
 pub extern "C" fn doh_proxy_net_stats() -> *mut c_char {
+    let fingerprint = get_runtime().block_on(async {
+        let server_holder = get_server_holder();
+        let guard = server_holder.read().await;
+        guard.as_ref().map(|server| server.fingerprint_status())
+    });
     json_to_c_string(serde_json::json!({
         "ok": true,
         "stats": crate::stats::snapshot(),
+        "fingerprint": fingerprint,
     }))
 }
 

@@ -9,12 +9,18 @@ use crate::error::{DohProxyError, Result};
 use crate::stats::STATS;
 use crate::upstream::connect_tunnel;
 use crate::{BoxStream, UpstreamProxyConfig};
-use rustls::{pki_types::ServerName, ClientConfig, RootCertStore};
+use rustls::{
+    pki_types::{EchConfigListBytes, ServerName},
+    ClientConfig, RootCertStore,
+};
 use std::{
     net::{IpAddr, SocketAddr},
+    pin::Pin as StdPin,
     sync::Arc,
+    task::{Context, Poll},
     time::Duration,
 };
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::{client::TlsStream, TlsConnector};
 use tracing::{debug, info, warn};
@@ -22,8 +28,236 @@ use tracing::{debug, info, warn};
 #[cfg(feature = "ech")]
 use rustls::client::EchConfig;
 
+#[cfg(feature = "browser-tls")]
+use crate::browser_tls::{BrowserHandshakeError, BrowserStream, BrowserTls, FingerprintTemplate};
+
 /// 服务端 retry_configs 给的新钥匙在 resolver 里覆盖多久（FFI 采纳钥匙也用它，不随 ech 特性开关）
 pub(crate) const ECH_OVERRIDE_TTL_SECS: u64 = 21600;
+
+/// 上游 TLS 连接：rustls，或按浏览器指纹握手的 BoringSSL
+pub enum UpstreamTls {
+    Rustls(TlsStream<BoxStream>),
+    #[cfg(feature = "browser-tls")]
+    Browser {
+        stream: BrowserStream,
+        /// 同一模板的 HTTP/2 初始设置，连接池照它配 h2
+        h2: Option<crate::upstream_pool::H2Profile>,
+    },
+}
+
+impl UpstreamTls {
+    /// ALPN 谈成 h2
+    pub fn is_h2(&self) -> bool {
+        match self {
+            Self::Rustls(stream) => stream.get_ref().1.alpn_protocol() == Some(b"h2"),
+            #[cfg(feature = "browser-tls")]
+            Self::Browser { stream, .. } => crate::browser_tls::negotiated_h2(stream),
+        }
+    }
+
+    /// 浏览器指纹连接的 h2 初始设置
+    pub fn h2_profile(&self) -> Option<crate::upstream_pool::H2Profile> {
+        match self {
+            Self::Rustls(_) => None,
+            #[cfg(feature = "browser-tls")]
+            Self::Browser { h2, .. } => h2.clone(),
+        }
+    }
+
+    /// 日志用：ECH 状态
+    fn ech_status(&self) -> String {
+        match self {
+            #[cfg(feature = "ech")]
+            Self::Rustls(stream) => format!("{:?}", stream.get_ref().1.ech_status()),
+            #[cfg(not(feature = "ech"))]
+            Self::Rustls(_) => "n/a".to_string(),
+            #[cfg(feature = "browser-tls")]
+            Self::Browser { stream, .. } => format!(
+                "{} (browser fingerprint)",
+                if stream.ssl().ech_accepted() {
+                    "Accepted"
+                } else {
+                    "NotAccepted"
+                }
+            ),
+        }
+    }
+}
+
+impl AsyncRead for UpstreamTls {
+    fn poll_read(
+        self: StdPin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Rustls(stream) => StdPin::new(stream).poll_read(cx, buf),
+            #[cfg(feature = "browser-tls")]
+            Self::Browser { stream, .. } => StdPin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for UpstreamTls {
+    fn poll_write(
+        self: StdPin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Rustls(stream) => StdPin::new(stream).poll_write(cx, buf),
+            #[cfg(feature = "browser-tls")]
+            Self::Browser { stream, .. } => StdPin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: StdPin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Rustls(stream) => StdPin::new(stream).poll_write_vectored(cx, bufs),
+            #[cfg(feature = "browser-tls")]
+            Self::Browser { stream, .. } => StdPin::new(stream).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Rustls(stream) => stream.is_write_vectored(),
+            #[cfg(feature = "browser-tls")]
+            Self::Browser { stream, .. } => stream.is_write_vectored(),
+        }
+    }
+
+    fn poll_flush(self: StdPin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Rustls(stream) => StdPin::new(stream).poll_flush(cx),
+            #[cfg(feature = "browser-tls")]
+            Self::Browser { stream, .. } => StdPin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: StdPin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Rustls(stream) => StdPin::new(stream).poll_shutdown(cx),
+            #[cfg(feature = "browser-tls")]
+            Self::Browser { stream, .. } => StdPin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
+/// 一次 TLS 握手怎么做：rustls（原来的路径），或按浏览器指纹模板（BoringSSL）
+#[derive(Clone)]
+enum Handshake {
+    Rustls {
+        connector: TlsConnector,
+        server_name: ServerName<'static>,
+    },
+    #[cfg(feature = "browser-tls")]
+    Browser {
+        tls: Arc<BrowserTls>,
+        template: Arc<FingerprintTemplate>,
+        host: Arc<str>,
+        ech: Option<Arc<[u8]>>,
+    },
+}
+
+impl Handshake {
+    /// 在连好的流上握手；ECH 被拒且带 retry_configs 时返回 [`DohProxyError::EchRetry`]
+    /// （`addr` 只用于报错，经上游代理时没有）
+    async fn run(
+        self,
+        stream: BoxStream,
+        addr: Option<SocketAddr>,
+        timeout: Duration,
+    ) -> Result<UpstreamTls> {
+        let start = std::time::Instant::now();
+        let label = addr.map(|addr| addr.to_string()).unwrap_or_else(|| "upstream proxy".to_string());
+        match self {
+            Handshake::Rustls {
+                connector,
+                server_name,
+            } => match tokio::time::timeout(timeout, connector.connect(server_name, stream)).await {
+                Ok(Ok(stream)) => {
+                    crate::stats::record_handshake(stream.get_ref().1, start.elapsed());
+                    Ok(UpstreamTls::Rustls(stream))
+                }
+                Ok(Err(e)) => {
+                    STATS.tls_fail.inc();
+                    match (addr, crate::probe::ech_retry_configs(&e).filter(|c| !c.is_empty())) {
+                        (Some(addr), Some(configs)) => {
+                            warn!(
+                                "ECH rejected by {} with retry_configs (public_name {:?})",
+                                addr,
+                                crate::probe::ech_public_names(&configs)
+                            );
+                            Err(DohProxyError::EchRetry {
+                                addr,
+                                configs: crate::probe::encode_ech_config_list(&configs)
+                                    .as_ref()
+                                    .to_vec(),
+                            })
+                        }
+                        _ => {
+                            warn!("TLS handshake failed to {}: {}", label, e);
+                            Err(DohProxyError::Io(e))
+                        }
+                    }
+                }
+                Err(_) => {
+                    STATS.tls_fail.inc();
+                    warn!("TLS handshake timed out to {}", label);
+                    Err(DohProxyError::Timeout)
+                }
+            },
+            #[cfg(feature = "browser-tls")]
+            Handshake::Browser {
+                tls,
+                template,
+                host,
+                ech,
+            } => match tokio::time::timeout(
+                timeout,
+                tls.handshake(&template, &host, stream, ech.as_deref()),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => {
+                    crate::stats::record_browser_handshake(stream.ssl(), start.elapsed());
+                    Ok(UpstreamTls::Browser {
+                        stream,
+                        h2: template.h2.clone(),
+                    })
+                }
+                Ok(Err(BrowserHandshakeError::EchRetry(configs))) => {
+                    STATS.tls_fail.inc();
+                    match addr {
+                        Some(addr) => {
+                            warn!("ECH rejected by {} with retry_configs (browser fingerprint)", addr);
+                            Err(DohProxyError::EchRetry { addr, configs })
+                        }
+                        None => Err(DohProxyError::Proxy(format!(
+                            "ECH rejected by {} with retry_configs",
+                            label
+                        ))),
+                    }
+                }
+                Ok(Err(BrowserHandshakeError::Failed(message))) => {
+                    STATS.tls_fail.inc();
+                    warn!("Browser TLS handshake failed to {}: {}", label, message);
+                    Err(DohProxyError::Io(std::io::Error::other(message)))
+                }
+                Err(_) => {
+                    STATS.tls_fail.inc();
+                    warn!("TLS handshake timed out to {}", label);
+                    Err(DohProxyError::Timeout)
+                }
+            },
+        }
+    }
+}
 
 /// ECH-enabled TLS connector
 pub struct DohTlsConnector {
@@ -37,6 +271,9 @@ pub struct DohTlsConnector {
     server_ip: Option<std::net::IpAddr>,
     /// TLS ClientConfig 缓存，复用以启用 TLS 会话恢复
     tls_config_cache: Arc<tokio::sync::Mutex<std::collections::HashMap<String, Arc<ClientConfig>>>>,
+    /// 按 WebView 指纹握手（h2 连接：网关道与 h2 MITM 道）；None = 一律 rustls
+    #[cfg(feature = "browser-tls")]
+    browser: Option<Arc<BrowserTls>>,
 }
 
 impl DohTlsConnector {
@@ -72,7 +309,31 @@ impl DohTlsConnector {
             crypto_provider,
             server_ip: parsed_ip,
             tls_config_cache: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            #[cfg(feature = "browser-tls")]
+            browser: None,
         }
+    }
+
+    /// 打开浏览器指纹握手
+    #[cfg(feature = "browser-tls")]
+    pub fn with_browser_tls(mut self, browser: Arc<BrowserTls>) -> Self {
+        self.browser = Some(browser);
+        self
+    }
+
+    /// 浏览器指纹出口（MITM 入站据此记下 WebView 的握手）
+    #[cfg(feature = "browser-tls")]
+    pub fn browser_tls(&self) -> Option<&Arc<BrowserTls>> {
+        self.browser.as_ref()
+    }
+
+    /// 指纹模板的代数：模板变了（采到 WebView 的真实握手）旧连接不再复用
+    pub fn fingerprint_generation(&self) -> u64 {
+        #[cfg(feature = "browser-tls")]
+        if let Some(browser) = &self.browser {
+            return browser.templates().generation();
+        }
+        0
     }
 
     /// 建连用的 resolver（DoH 关闭时为 None）
@@ -279,16 +540,17 @@ impl DohTlsConnector {
         timed_tcp_connect(addr, self.timeout).await
     }
 
-    /// Connect to a server using ECH if available
+    /// Connect to a server using ECH if available（不带 ALPN、只谈 http/1.1：原样字节拷贝的
+    /// h1 MITM 与 WebSocket 用；仍走 rustls）
     /// Returns a TLS stream that can be used for bidirectional I/O
-    pub async fn connect(&self, host: &str, port: u16) -> Result<TlsStream<BoxStream>> {
+    pub async fn connect(&self, host: &str, port: u16) -> Result<UpstreamTls> {
         Self::counted(self.connect_inner(host, port, false))
             .await
             .map(|(stream, _)| stream)
     }
 
     /// Connect with HTTP/2 ALPN negotiation (for gateway reverse proxy)
-    pub async fn connect_h2(&self, host: &str, port: u16) -> Result<TlsStream<BoxStream>> {
+    pub async fn connect_h2(&self, host: &str, port: u16) -> Result<UpstreamTls> {
         Self::counted(self.connect_inner(host, port, true))
             .await
             .map(|(stream, _)| stream)
@@ -299,8 +561,44 @@ impl DohTlsConnector {
         &self,
         host: &str,
         port: u16,
-    ) -> Result<(TlsStream<BoxStream>, Option<SocketAddr>)> {
+    ) -> Result<(UpstreamTls, Option<SocketAddr>)> {
         Self::counted(self.connect_inner(host, port, true)).await
+    }
+
+    /// 这次建连怎么握手：h2 连接有指纹模板就按模板（BoringSSL），否则 rustls
+    async fn handshake_for(
+        &self,
+        host: &str,
+        server_name: &ServerName<'static>,
+        h2_alpn: bool,
+        ech_config: Option<&EchConfigListBytes<'static>>,
+    ) -> Result<Handshake> {
+        #[cfg(feature = "browser-tls")]
+        if h2_alpn {
+            if let Some(browser) = &self.browser {
+                if let Some(template) = browser.templates().snapshot() {
+                    return Ok(Handshake::Browser {
+                        tls: browser.clone(),
+                        template,
+                        host: Arc::from(host),
+                        ech: ech_config.map(|key| Arc::from(key.as_ref())),
+                    });
+                }
+            }
+        }
+        let _ = host;
+        #[cfg(not(feature = "ech"))]
+        let _ = ech_config;
+        let tls_config = self
+            .get_or_build_tls_config(
+                #[cfg(feature = "ech")]
+                ech_config,
+            )
+            .await?;
+        Ok(Handshake::Rustls {
+            connector: TlsConnector::from(Self::apply_alpn(tls_config, h2_alpn)),
+            server_name: server_name.clone(),
+        })
     }
 
     async fn counted<T>(connect: impl std::future::Future<Output = Result<T>>) -> Result<T> {
@@ -365,7 +663,7 @@ impl DohTlsConnector {
         host: &str,
         port: u16,
         h2_alpn: bool,
-    ) -> Result<(TlsStream<BoxStream>, Option<SocketAddr>)> {
+    ) -> Result<(UpstreamTls, Option<SocketAddr>)> {
         let start = std::time::Instant::now();
         let server_name = ServerName::try_from(host.to_string())
             .map_err(|_| DohProxyError::InvalidUrl(format!("Invalid server name: {}", host)))?;
@@ -375,17 +673,9 @@ impl DohTlsConnector {
                 "DoH disabled for {}, using upstream/direct tunnel only",
                 host
             );
-            let tls_config = self
-                .get_or_build_tls_config(
-                    #[cfg(feature = "ech")]
-                    None,
-                )
-                .await?;
-            let connector = TlsConnector::from(Self::apply_alpn(tls_config, h2_alpn));
+            let handshake = self.handshake_for(host, &server_name, h2_alpn, None).await?;
             let tcp_stream = self.connect_tcp(host, port).await?;
-            let tls_stream = self
-                .finish_tls(&connector, server_name, tcp_stream, host, port)
-                .await?;
+            let tls_stream = self.finish_tls(handshake, tcp_stream, host, port).await?;
             debug!(
                 "TLS connect to {}:{} completed in {} ms",
                 host,
@@ -431,13 +721,9 @@ impl DohTlsConnector {
         }
 
         // Build TLS config (with or without ECH), 使用缓存以启用 TLS 会话恢复
-        let tls_config = self
-            .get_or_build_tls_config(
-                #[cfg(feature = "ech")]
-                ech_config.as_ref(),
-            )
+        let handshake = self
+            .handshake_for(host, &server_name, h2_alpn, ech_config.as_ref())
             .await?;
-        let connector = TlsConnector::from(Self::apply_alpn(tls_config, h2_alpn));
 
         if self
             .upstream_proxy
@@ -446,9 +732,7 @@ impl DohTlsConnector {
             .is_some()
         {
             let tcp_stream = self.connect_tcp(host, port).await?;
-            let tls_stream = self
-                .finish_tls(&connector, server_name, tcp_stream, host, port)
-                .await?;
+            let tls_stream = self.finish_tls(handshake, tcp_stream, host, port).await?;
             debug!(
                 "TLS connect to {}:{} via upstream proxy completed in {} ms",
                 host,
@@ -468,20 +752,12 @@ impl DohTlsConnector {
             Err(e) => (Vec::new(), Some(e)),
         };
         #[allow(unused_mut)]
-        let mut connector = connector;
+        let mut handshake = handshake;
         #[cfg(feature = "ech")]
         let mut ech_retried = false;
         loop {
             let result = self
-                .race_route(
-                    &connector,
-                    &server_name,
-                    host,
-                    port,
-                    edge,
-                    &resolved,
-                    &mut resolve_error,
-                )
+                .race_route(&handshake, host, port, edge, &resolved, &mut resolve_error)
                 .await;
             match result {
                 Ok(won) => {
@@ -493,21 +769,13 @@ impl DohTlsConnector {
                             took_over: won.took_over,
                         },
                     );
-                    #[cfg(feature = "ech")]
-                    {
-                        let (_, conn) = won.stream.get_ref();
-                        info!(
-                            "Connected to {}:{} via {} (ECH status: {:?})",
-                            host,
-                            port,
-                            won.addr,
-                            conn.ech_status()
-                        );
-                    }
-                    #[cfg(not(feature = "ech"))]
-                    {
-                        info!("Connected to {}:{} via {}", host, port, won.addr);
-                    }
+                    info!(
+                        "Connected to {}:{} via {} (ECH status: {})",
+                        host,
+                        port,
+                        won.addr,
+                        won.stream.ech_status()
+                    );
                     debug!(
                         "TLS connect to {}:{} completed in {} ms",
                         host,
@@ -520,8 +788,9 @@ impl DohTlsConnector {
                 Err(DohProxyError::EchRetry { configs, .. }) if !ech_retried => {
                     ech_retried = true;
                     let key = self.adopt_retry_key(host, configs);
-                    let tls_config = self.get_or_build_tls_config(Some(&key)).await?;
-                    connector = TlsConnector::from(Self::apply_alpn(tls_config, h2_alpn));
+                    handshake = self
+                        .handshake_for(host, &server_name, h2_alpn, Some(&key))
+                        .await?;
                 }
                 Err(e) => return Err(e),
             }
@@ -530,11 +799,9 @@ impl DohTlsConnector {
 
     /// 一次建连的赛跑计划与执行（见 [`Self::connect_inner`] 第 2 步）。首选地址失败回报 EdgePin
     /// 一次（被别人赢下而中止的不算），成功由调用方回报
-    #[allow(clippy::too_many_arguments)]
     async fn race_route(
         &self,
-        connector: &TlsConnector,
-        server_name: &ServerName<'static>,
+        handshake: &Handshake,
         host: &str,
         port: u16,
         edge: &EdgePin,
@@ -586,13 +853,12 @@ impl DohTlsConnector {
             .unwrap_or(RACE_STAGGER);
         let family_name = |is_ipv6: bool| if is_ipv6 { "IPv6" } else { "IPv4" };
         let tls_race = |plan: Vec<IpAddr>, head_start: Duration| {
-            let connector = connector.clone();
-            let server_name = server_name.clone();
+            let handshake = handshake.clone();
             race_staggered(
                 plan.into_iter().map(|ip| SocketAddr::new(ip, port)).collect(),
                 head_start,
                 RACE_STAGGER,
-                move |addr| attempt_tls(connector.clone(), addr, server_name.clone()),
+                move |addr| attempt_tls(handshake.clone(), addr),
             )
         };
 
@@ -798,31 +1064,21 @@ impl DohTlsConnector {
         Ok(config)
     }
 
+    /// 经上游代理（或 DoH 关闭时）在已连好的流上握手；没有赛跑，也不按地址重试
     async fn finish_tls(
         &self,
-        connector: &TlsConnector,
-        server_name: ServerName<'static>,
+        handshake: Handshake,
         tcp_stream: BoxStream,
         host: &str,
         port: u16,
-    ) -> Result<TlsStream<BoxStream>> {
-        let start = std::time::Instant::now();
-        let tls_stream =
-            tokio::time::timeout(self.timeout, connector.connect(server_name, tcp_stream))
-                .await
-                .map_err(|_| DohProxyError::Timeout)
-                .and_then(|result| result.map_err(DohProxyError::Io))
-                .inspect_err(|_| STATS.tls_fail.inc())?;
-
-        let (_, conn) = tls_stream.get_ref();
-        crate::stats::record_handshake(conn, start.elapsed());
+    ) -> Result<UpstreamTls> {
+        let tls_stream = handshake.run(tcp_stream, None, self.timeout).await?;
         debug!(
-            "TLS connection established for {}:{}, protocol: {:?}",
+            "TLS connection established for {}:{} (ECH status: {})",
             host,
             port,
-            conn.protocol_version()
+            tls_stream.ech_status()
         );
-
         Ok(tls_stream)
     }
 }
@@ -846,7 +1102,7 @@ fn race_head_start(rtt: Option<Duration>) -> Duration {
 
 /// 赛跑赢下的连接
 struct Won {
-    stream: TlsStream<BoxStream>,
+    stream: UpstreamTls,
     addr: SocketAddr,
     /// 这次尝试本身的耗时（TCP + TLS），进 EdgePin 的 RTT 表
     rtt: Duration,
@@ -951,11 +1207,7 @@ where
 }
 
 /// 单个地址：TCP（5 s）+ TLS（10 s）。ECH 被拒且带 retry_configs 时返回 [`DohProxyError::EchRetry`]
-async fn attempt_tls(
-    connector: TlsConnector,
-    addr: SocketAddr,
-    server_name: ServerName<'static>,
-) -> Result<TlsStream<BoxStream>> {
+async fn attempt_tls(handshake: Handshake, addr: SocketAddr) -> Result<UpstreamTls> {
     let tcp = match timed_tcp_connect(addr, ATTEMPT_TCP_TIMEOUT).await {
         Ok(tcp) => tcp,
         Err(e) => {
@@ -963,46 +1215,11 @@ async fn attempt_tls(
             return Err(e);
         }
     };
-    let start = std::time::Instant::now();
-    match tokio::time::timeout(
-        ATTEMPT_TLS_TIMEOUT,
-        connector.connect(server_name, Box::new(tcp) as BoxStream),
-    )
-    .await
-    {
-        Ok(Ok(stream)) => {
-            crate::stats::record_handshake(stream.get_ref().1, start.elapsed());
-            STATS.race_handshake_ok.inc();
-            Ok(stream)
-        }
-        Ok(Err(e)) => {
-            STATS.tls_fail.inc();
-            match crate::probe::ech_retry_configs(&e).filter(|c| !c.is_empty()) {
-                Some(configs) => {
-                    warn!(
-                        "ECH rejected by {} with retry_configs (public_name {:?})",
-                        addr,
-                        crate::probe::ech_public_names(&configs)
-                    );
-                    Err(DohProxyError::EchRetry {
-                        addr,
-                        configs: crate::probe::encode_ech_config_list(&configs)
-                            .as_ref()
-                            .to_vec(),
-                    })
-                }
-                None => {
-                    warn!("TLS handshake failed to {}: {}", addr, e);
-                    Err(DohProxyError::Io(e))
-                }
-            }
-        }
-        Err(_) => {
-            STATS.tls_fail.inc();
-            warn!("TLS handshake timed out to {}", addr);
-            Err(DohProxyError::Timeout)
-        }
-    }
+    let stream = handshake
+        .run(Box::new(tcp) as BoxStream, Some(addr), ATTEMPT_TLS_TIMEOUT)
+        .await?;
+    STATS.race_handshake_ok.inc();
+    Ok(stream)
 }
 
 /// 带超时的 TCP 连接（TCP_NODELAY），计入连通耗时 / 失败数

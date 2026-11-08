@@ -27,10 +27,24 @@ name = "gateway_bench"
 path = "examples/gateway_bench.rs"
 required-features = ["ech"]
 
+[[example]]
+name = "fingerprint_probe"
+path = "examples/fingerprint_probe.rs"
+required-features = ["browser-tls"]
+
 [features]
 default = []
 # Enable ECH support (requires cmake, NASM on Windows)
 ech = ["rustls/aws_lc_rs", "dep:aws-lc-rs"]
+# 上游握手按 WebView 的 ClientHello 复刻（BoringSSL，经 rama）。构建要 cmake 与 libclang
+# （bindgen；LIBCLANG_PATH 指向 NDK 的 lib 目录即可）
+browser-tls = [
+    "ech",
+    "dep:rama-tls-boring",
+    "dep:rama-tls",
+    "dep:rama-net",
+    "dep:rama-core",
+]
 
 [dependencies]
 # TLS with ECH support
@@ -44,6 +58,12 @@ rustls-pki-types = "1"
 # Optional ECH crypto provider
 aws-lc-rs = { version = "1", optional = true }
 
+# 浏览器 TLS 指纹（browser-tls 特性）：固定到上游 net_core 实测验证过的 rama 提交
+rama-tls-boring = { git = "https://github.com/plabayo/rama", rev = "23d59722e125fb6f2de66df588f772205318e555", default-features = false, features = ["compression"], optional = true }
+rama-tls = { git = "https://github.com/plabayo/rama", rev = "23d59722e125fb6f2de66df588f772205318e555", default-features = false, optional = true }
+rama-net = { git = "https://github.com/plabayo/rama", rev = "23d59722e125fb6f2de66df588f772205318e555", default-features = false, features = ["std"], optional = true }
+rama-core = { git = "https://github.com/plabayo/rama", rev = "23d59722e125fb6f2de66df588f772205318e555", default-features = false, features = ["std"], optional = true }
+
 # Certificate generation for MITM
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 pem = "3"
@@ -55,6 +75,8 @@ tokio = { version = "1", features = ["full"] }
 # HTTP proxy
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
+# 只为 h2::ext::RequestPriority（vendor/h2 的补丁：HEADERS 帧按 Chromium 带优先级）
+h2 = "0.4"
 http-body-util = "0.1"
 bytes = "1"
 http = "1"
@@ -82,6 +104,10 @@ tokio = { version = "1", features = ["full", "test-util"] }
 # Android logging
 [target.'cfg(target_os = "android")'.dependencies]
 tracing-android = "0.2"
+
+[patch.crates-io]
+# 请求伪头按 Chromium 顺序编码（见 vendor/h2/CFLUXDO_PATCH.md）
+h2 = { path = "vendor/h2" }
 
 [profile.release]
 lto = true
