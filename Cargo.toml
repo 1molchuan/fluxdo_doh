@@ -44,6 +44,9 @@ browser-tls = [
     "dep:rama-tls",
     "dep:rama-net",
     "dep:rama-core",
+    "dep:brotli",
+    "dep:zstd",
+    "dep:flate2",
 ]
 
 [dependencies]
@@ -63,6 +66,11 @@ rama-tls-boring = { git = "https://github.com/plabayo/rama", rev = "23d59722e125
 rama-tls = { git = "https://github.com/plabayo/rama", rev = "23d59722e125fb6f2de66df588f772205318e555", default-features = false, optional = true }
 rama-net = { git = "https://github.com/plabayo/rama", rev = "23d59722e125fb6f2de66df588f772205318e555", default-features = false, features = ["std"], optional = true }
 rama-core = { git = "https://github.com/plabayo/rama", rev = "23d59722e125fb6f2de66df588f772205318e555", default-features = false, features = ["std"], optional = true }
+# 网关道把 Accept-Encoding 换成浏览器的值后，解开回来的 br / zstd / deflate（rama-tls-boring
+# 解证书压缩已经带上这三个库，版本与特性同它一致，不多编译单元）
+brotli = { version = "9", optional = true }
+zstd = { version = "0.14", optional = true }
+flate2 = { version = "1.1", optional = true }
 
 # Certificate generation for MITM
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }

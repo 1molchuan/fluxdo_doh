@@ -763,7 +763,9 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
+ "brotli",
  "bytes",
+ "flate2",
  "h2 0.4.13",
  "hickory-resolver",
  "http 1.4.0",
@@ -793,6 +795,7 @@ dependencies = [
  "tracing-android",
  "tracing-subscriber",
  "webpki-roots 0.26.11",
+ "zstd",
 ]
 
 [[package]]

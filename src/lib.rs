@@ -16,6 +16,7 @@ pub mod dns;
 pub mod ech;
 pub mod edge_pin;
 pub mod error;
+pub mod fetch_shape;
 pub mod ffi;
 pub mod probe;
 pub mod proxy;

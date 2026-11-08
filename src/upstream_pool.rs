@@ -16,6 +16,7 @@
 //! GOAWAY 不会连带 Dart 的请求。
 
 use crate::edge_pin::{EdgePin, Pin};
+use crate::fetch_shape::FetchShape;
 use crate::stats::STATS;
 use crate::BoxStream;
 use bytes::Bytes;
@@ -133,6 +134,12 @@ pub trait Dialer: Send + Sync + 'static {
     fn fingerprint_generation(&self) -> u64 {
         0
     }
+    /// 网关道请求按 WebView fetch 整形的依据（没有浏览器指纹时为 None）
+    fn fetch_shape(&self) -> Option<Arc<FetchShape>> {
+        None
+    }
+    /// WebView 经 h2 MITM 发来的请求（采它的头顺序）
+    fn observe_webview_request(&self, _headers: &hyper::HeaderMap) {}
 }
 
 struct H2Conn {
@@ -261,6 +268,16 @@ impl UpstreamPool {
     fn net_epoch(&self) -> u64 {
         self.dialer.edge().map(EdgePin::net_epoch).unwrap_or(0)
             + self.local_epoch.load(Ordering::Acquire)
+    }
+
+    /// 网关道请求的整形依据
+    pub fn fetch_shape(&self) -> Option<Arc<FetchShape>> {
+        self.dialer.fetch_shape()
+    }
+
+    /// 交给建连方记下 WebView 的请求头顺序
+    pub fn observe_webview_request(&self, headers: &hyper::HeaderMap) {
+        self.dialer.observe_webview_request(headers);
     }
 
     /// 让现有连接全部不再复用（在途请求照常读完）
@@ -1160,6 +1177,14 @@ impl Dialer for crate::ech::DohTlsConnector {
 
     fn fingerprint_generation(&self) -> u64 {
         crate::ech::DohTlsConnector::fingerprint_generation(self)
+    }
+
+    fn fetch_shape(&self) -> Option<Arc<FetchShape>> {
+        crate::ech::DohTlsConnector::fetch_shape(self)
+    }
+
+    fn observe_webview_request(&self, headers: &hyper::HeaderMap) {
+        crate::ech::DohTlsConnector::observe_webview_request(self, headers)
     }
 }
 

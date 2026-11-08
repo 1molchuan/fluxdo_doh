@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::{debug, info, warn};
 
+use crate::fetch_shape::FetchShape;
 use crate::upstream_pool::H2Profile;
 use crate::BoxStream;
 
@@ -82,6 +83,16 @@ pub struct FingerprintTemplate {
     /// HTTP/2 初始 SETTINGS 与连接窗口（采自 WebView 的 h2 连接前言，或预置）
     #[serde(default)]
     pub h2: Option<H2Profile>,
+    /// WebView fetch 请求（`sec-fetch-mode: cors`）的头名顺序，小写：没有同一组头名的采样时
+    /// 网关道的请求照这个排（最近一次采样，或预置）
+    #[serde(default)]
+    pub fetch_header_order: Vec<String>,
+    /// 采到的 WebView fetch 头顺序，每组头名集合一份，新的在前（见 [`crate::fetch_shape`]）
+    #[serde(default)]
+    pub fetch_header_orders: Vec<Vec<String>>,
+    /// WebView fetch 请求的 Accept-Encoding
+    #[serde(default)]
+    pub accept_encoding: Option<String>,
     /// 采样时 WebView 的 User-Agent（WebView 升级后 UA 变化，缓存随之作废）
     #[serde(default)]
     pub user_agent: Option<String>,
@@ -198,9 +209,20 @@ fn parse_preset(preset: &Preset) -> Option<FingerprintTemplate> {
         .get("early_frames")
         .and_then(|frames| frames.as_array())
         .map(|frames| h2_profile_from_early_frames(frames));
+    let fetch_header_order = value
+        .get("fetch_header_order")
+        .and_then(|order| serde_json::from_value(order.clone()).ok())
+        .unwrap_or_default();
+    let accept_encoding = value
+        .get("accept_encoding")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
     Some(FingerprintTemplate {
         hello,
         h2,
+        fetch_header_order,
+        fetch_header_orders: Vec::new(),
+        accept_encoding,
         user_agent: None,
         source: TemplateSource::Builtin(preset.id),
         generation: 0,
@@ -268,12 +290,15 @@ pub struct FingerprintTemplates {
     source: RwLock<TemplateSource>,
     hello: RwLock<Option<ClientHello>>,
     h2: RwLock<Option<H2Profile>>,
+    fetch_orders: RwLock<Vec<Vec<String>>>,
+    accept_encoding: RwLock<Option<String>>,
     hello_hash: Mutex<Option<u64>>,
     generation: AtomicU64,
     cache_path: Option<PathBuf>,
     user_agent: Option<String>,
     last_persist: Mutex<Option<Instant>>,
     snapshot: RwLock<Option<Arc<FingerprintTemplate>>>,
+    fetch_shape: RwLock<Option<Arc<FetchShape>>>,
 }
 
 impl FingerprintTemplates {
@@ -285,12 +310,15 @@ impl FingerprintTemplates {
             source: RwLock::new(TemplateSource::Sampled),
             hello: RwLock::new(None),
             h2: RwLock::new(None),
+            fetch_orders: RwLock::new(Vec::new()),
+            accept_encoding: RwLock::new(None),
             hello_hash: Mutex::new(None),
             generation: AtomicU64::new(0),
             cache_path,
             user_agent,
             last_persist: Mutex::new(None),
             snapshot: RwLock::new(None),
+            fetch_shape: RwLock::new(None),
         };
         if let Some(cached) = templates.load_cache() {
             info!("Loaded fingerprint template from cache");
@@ -298,6 +326,8 @@ impl FingerprintTemplates {
             *templates.hello_hash.lock() = Some(profile_hash(&cached.hello));
             *templates.hello.write() = Some(cached.hello);
             *templates.h2.write() = cached.h2;
+            *templates.fetch_orders.write() = cached.fetch_header_orders;
+            *templates.accept_encoding.write() = cached.accept_encoding;
             templates.generation.store(1, Ordering::Release);
         }
         templates.refresh_snapshot();
@@ -373,6 +403,52 @@ impl FingerprintTemplates {
         }
     }
 
+    /// 记下 WebView 经 h2 MITM 发来的 fetch 请求（`sec-fetch-mode: cors`）的头名顺序与
+    /// Accept-Encoding；只影响网关道的请求头怎么排，不改握手，所以不递增代数
+    pub fn observe_fetch_request(&self, headers: &http::HeaderMap) {
+        if headers
+            .get("sec-fetch-mode")
+            .is_none_or(|mode| mode.as_bytes() != b"cors")
+        {
+            return;
+        }
+        let order = crate::fetch_shape::header_names(headers);
+        if order.is_empty() {
+            return;
+        }
+        let mut changed = {
+            let mut orders = self.fetch_orders.write();
+            if orders.first() == Some(&order) {
+                false
+            } else {
+                orders.retain(|known| !crate::fetch_shape::same_name_set(known, &order));
+                orders.insert(0, order);
+                orders.truncate(crate::fetch_shape::MAX_ORDERS);
+                true
+            }
+        };
+        if let Some(value) = headers
+            .get(http::header::ACCEPT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+        {
+            let mut current = self.accept_encoding.write();
+            if current.as_deref() != Some(value) {
+                *current = Some(value.to_owned());
+                changed = true;
+            }
+        }
+        if changed {
+            debug!("Fetch header order captured from WebView");
+            self.refresh_snapshot();
+            self.maybe_persist(false);
+        }
+    }
+
+    /// 网关道请求的整形依据
+    pub fn fetch_shape(&self) -> Option<Arc<FetchShape>> {
+        self.fetch_shape.read().clone()
+    }
+
     /// 当前模板：采样（或缓存）齐全就用它，否则用预置；H2 只采到 TLS 时借预置的
     pub fn snapshot(&self) -> Option<Arc<FingerprintTemplate>> {
         self.snapshot.read().clone()
@@ -397,6 +473,9 @@ impl FingerprintTemplates {
                     .read()
                     .clone()
                     .or_else(|| self.preset.as_ref().and_then(|p| p.h2.clone())),
+                fetch_header_order: Vec::new(),
+                fetch_header_orders: Vec::new(),
+                accept_encoding: None,
                 user_agent: self.user_agent.clone(),
                 source: *self.source.read(),
                 generation,
@@ -406,6 +485,30 @@ impl FingerprintTemplates {
                 preset
             }),
         };
+        // 头顺序与 Accept-Encoding：采到的优先，没有就用预置的
+        let next = next.map(|mut template| {
+            let orders = self.fetch_orders.read().clone();
+            let preset = self.preset.as_ref();
+            template.fetch_header_order = orders.first().cloned().unwrap_or_else(|| {
+                preset
+                    .map(|p| p.fetch_header_order.clone())
+                    .unwrap_or_default()
+            });
+            template.fetch_header_orders = orders;
+            template.accept_encoding = self
+                .accept_encoding
+                .read()
+                .clone()
+                .or_else(|| preset.and_then(|p| p.accept_encoding.clone()));
+            template
+        });
+        *self.fetch_shape.write() = next.as_ref().map(|template| {
+            Arc::new(FetchShape::new(
+                &template.fetch_header_orders,
+                &template.fetch_header_order,
+                template.accept_encoding.as_deref(),
+            ))
+        });
         *self.snapshot.write() = next.map(Arc::new);
     }
 
@@ -424,6 +527,9 @@ impl FingerprintTemplates {
         let template = FingerprintTemplate {
             hello,
             h2: self.h2.read().clone(),
+            fetch_header_order: Vec::new(),
+            fetch_header_orders: self.fetch_orders.read().clone(),
+            accept_encoding: self.accept_encoding.read().clone(),
             user_agent: self.user_agent.clone(),
             source: TemplateSource::Sampled,
             generation: 0,
@@ -455,6 +561,7 @@ impl FingerprintTemplates {
             }),
             "generation": self.generation(),
             "h2": snapshot.as_ref().map(|t| t.h2.is_some()),
+            "fetch_orders": self.fetch_orders.read().len(),
         })
     }
 }
@@ -979,6 +1086,77 @@ mod tests {
             TemplateSource::Builtin(_)
         ));
         let _ = std::fs::remove_file(path);
+    }
+
+    /// WebView 的 fetch 头顺序按头名集合各记一份（同集合以新的为准），随模板落盘；
+    /// 没采到之前用预置的顺序与 Accept-Encoding
+    #[test]
+    fn fetch_orders_are_kept_per_name_set_and_persisted() {
+        let path = std::env::temp_dir().join(format!(
+            "doh-proxy-fetch-orders-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let request = |names: &[&str]| {
+            let mut headers = http::HeaderMap::new();
+            for name in names {
+                let value = match *name {
+                    "sec-fetch-mode" => "cors",
+                    "accept-encoding" => "gzip, deflate, br, zstd",
+                    _ => "1",
+                };
+                headers.append(
+                    http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    http::HeaderValue::from_static(value),
+                );
+            }
+            headers
+        };
+        let ua = Some("Chrome/156.0".to_string());
+        let templates = FingerprintTemplates::new(Some(path.clone()), ua.clone());
+        let preset = templates.snapshot().unwrap();
+        assert!(!preset.fetch_header_order.is_empty());
+        assert_eq!(preset.accept_encoding.as_deref(), Some("gzip, deflate, br, zstd"));
+        templates.record_hello(&chrome156());
+        // 导航请求（不是 fetch）不记
+        templates.observe_fetch_request(&request(&["user-agent", "accept", "sec-fetch-mode"]).tap_mode("navigate"));
+        assert!(templates.snapshot().unwrap().fetch_header_orders.is_empty());
+        templates.observe_fetch_request(&request(&["user-agent", "accept", "sec-fetch-mode", "accept-encoding"]));
+        templates.observe_fetch_request(&request(&["x-csrf-token", "accept", "sec-fetch-mode"]));
+        // 与第一组同集合、顺序不同：替换掉旧的那份并排到最前
+        templates.observe_fetch_request(&request(&["accept", "user-agent", "sec-fetch-mode", "accept-encoding"]));
+        let snapshot = templates.snapshot().unwrap();
+        assert_eq!(
+            snapshot.fetch_header_orders,
+            vec![
+                vec!["accept", "user-agent", "sec-fetch-mode", "accept-encoding"],
+                vec!["x-csrf-token", "accept", "sec-fetch-mode"],
+            ]
+        );
+        assert_eq!(snapshot.fetch_header_order, snapshot.fetch_header_orders[0]);
+        assert!(templates.fetch_shape().is_some());
+        // 首次采到握手时立即写过盘；之后的头顺序按节流写，这里强制写一次再读回
+        templates.maybe_persist(true);
+        let reloaded = FingerprintTemplates::new(Some(path.clone()), ua);
+        assert_eq!(
+            reloaded.snapshot().unwrap().fetch_header_orders,
+            snapshot.fetch_header_orders
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    trait TapMode {
+        fn tap_mode(self, mode: &'static str) -> Self;
+    }
+
+    impl TapMode for http::HeaderMap {
+        fn tap_mode(mut self, mode: &'static str) -> Self {
+            self.insert("sec-fetch-mode", http::HeaderValue::from_static(mode));
+            self
+        }
     }
 
     #[tokio::test]

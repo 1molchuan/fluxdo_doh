@@ -336,6 +336,23 @@ impl DohTlsConnector {
         0
     }
 
+    /// 网关道请求按 WebView fetch 整形的依据（没开浏览器指纹时为 None）
+    pub fn fetch_shape(&self) -> Option<Arc<crate::fetch_shape::FetchShape>> {
+        #[cfg(feature = "browser-tls")]
+        if let Some(browser) = &self.browser {
+            return browser.templates().fetch_shape();
+        }
+        None
+    }
+
+    /// WebView 经 h2 MITM 发来的请求：记下 fetch 请求的头顺序
+    pub fn observe_webview_request(&self, _headers: &http::HeaderMap) {
+        #[cfg(feature = "browser-tls")]
+        if let Some(browser) = &self.browser {
+            browser.templates().observe_fetch_request(_headers);
+        }
+    }
+
     /// 建连用的 resolver（DoH 关闭时为 None）
     pub fn dns_resolver(&self) -> Option<&Arc<DnsResolver>> {
         self.dns_resolver.as_ref()

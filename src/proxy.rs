@@ -13,7 +13,7 @@ use crate::stats::STATS;
 use crate::upstream_pool::{Lane, Replay, UpstreamPool};
 use crate::ProxyConfig;
 use bytes::Bytes;
-use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1 as hyper_http1;
 use hyper::service::service_fn;
@@ -649,7 +649,7 @@ async fn handle_gateway_connection(
         .map_err(|e| DohProxyError::Proxy(format!("Gateway hyper error: {}", e)))
 }
 
-type GatewayBody = BoxBody<Bytes, hyper::Error>;
+type GatewayBody = crate::fetch_shape::ClientBody;
 type GatewayResponse = std::result::Result<Response<GatewayBody>, Infallible>;
 
 /// 网关自己生成的错误响应带上这个头：调用方据此区分「网关连不上上游」与
@@ -738,6 +738,18 @@ async fn gateway_forward_request(
         *req.uri_mut() = new_uri;
     }
 
+    // Dart 的请求照 WebView 的 fetch 请求整形；WebView 的请求反过来记下它的头顺序
+    let decode = match lane {
+        Lane::Gateway => pool
+            .fetch_shape()
+            .is_some_and(|shape| shape.apply(req.headers_mut())),
+        Lane::Mitm => {
+            if req.version() == hyper::Version::HTTP_2 {
+                pool.observe_webview_request(req.headers());
+            }
+            false
+        }
+    };
     let replay = Replay::capture(&req);
     match pool
         .forward(lane, &host, port, req.map(|body| body.boxed()), replay)
@@ -745,7 +757,11 @@ async fn gateway_forward_request(
     {
         Ok(resp) => {
             STATS.gw_ttfb.record(started.elapsed());
-            Ok(resp)
+            Ok(if decode {
+                crate::fetch_shape::decode_response(resp)
+            } else {
+                crate::fetch_shape::passthrough(resp)
+            })
         }
         Err(e) => {
             warn!("Gateway forward failed for {}: {}", host_key, e);
@@ -793,7 +809,7 @@ async fn gateway_forward_upgrade(
         .forward_upgrade(&host, port, req.map(|body| body.boxed()), client)
         .await
     {
-        Ok(response) => Ok(response),
+        Ok(response) => Ok(crate::fetch_shape::passthrough(response)),
         Err(e) => {
             warn!("MITM upgrade failed for {}:{}: {}", host, port, e);
             STATS.gw_502.inc();
