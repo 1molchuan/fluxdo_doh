@@ -103,15 +103,20 @@ pub struct FingerprintTemplate {
     pub generation: u64,
 }
 
+/// 有没有要看这一条连接的扩展：padding（ClientHello 长度落在 256~511 字节才补）、
+/// pre_shared_key 与 early_data（恢复会话才带）。这几个 BoringSSL 都是自己按连接写的
+const PER_CONNECTION_EXTENSIONS: [u16; 3] = [21, 41, 42];
+
 /// 连接身份只比较稳定的浏览器能力：SNI、ECH 密文、会话票据、key share 公钥和 GREASE 值
-/// 每条连接都不一样，不代表浏览器升级（上游 mirror.rs 的 profile_hash）
+/// 每条连接都不一样，不代表浏览器升级（上游 mirror.rs 的 profile_hash）。按连接才有的扩展
+/// 也不算：不然 WebView 的连接一会儿带 padding 一会儿不带，代数来回跳，池里的连接跟着作废
 fn profile_hash(hello: &ClientHello) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut extensions: Vec<_> = hello
         .extensions()
         .iter()
         .filter_map(|ext| {
-            if ext.id().is_grease() {
+            if ext.id().is_grease() || PER_CONNECTION_EXTENSIONS.contains(&u16::from(ext.id())) {
                 return None;
             }
             let mut ext = ext.clone();
@@ -372,6 +377,16 @@ impl FingerprintTemplates {
             let old = previous.replace(hash);
             old != Some(hash)
         };
+        // 同一浏览器：随机部分与按连接变的扩展不影响回放，留着已有的模板
+        if !changed && self.hello.read().is_some() {
+            let mut source = self.source.write();
+            if *source != TemplateSource::Sampled {
+                *source = TemplateSource::Sampled;
+                drop(source);
+                self.refresh_snapshot();
+            }
+            return;
+        }
         if changed {
             let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
             info!(
@@ -1062,6 +1077,50 @@ mod tests {
         let generation = templates.generation();
         templates.record_hello(&chrome156());
         assert_eq!(templates.generation(), generation);
+    }
+
+    /// 按连接才有的扩展（padding、恢复会话的 pre_shared_key）不算换了浏览器：代数不变，
+    /// 模板留着先采到的那份
+    #[test]
+    fn per_connection_extensions_do_not_bump_the_generation() {
+        let full = chrome156();
+        let variant = |edit: &dyn Fn(&mut Vec<ClientHelloExtension>)| {
+            let mut extensions = full.extensions().to_vec();
+            edit(&mut extensions);
+            ClientHello::new(
+                full.protocol_version(),
+                full.cipher_suites().to_vec(),
+                full.compression_algorithms().to_vec(),
+                extensions,
+            )
+        };
+        let resumed = variant(&|extensions| {
+            extensions.push(ClientHelloExtension::Opaque {
+                id: ExtensionId::from(41u16),
+                data: vec![0, 1, 2, 3],
+            })
+        });
+        let padding_toggled = variant(&|extensions| {
+            match extensions.iter().position(|ext| u16::from(ext.id()) == 21) {
+                Some(index) => {
+                    extensions.remove(index);
+                }
+                None => extensions.push(ClientHelloExtension::Opaque {
+                    id: ExtensionId::from(21u16),
+                    data: vec![0; 17],
+                }),
+            }
+        });
+        for other in [&resumed, &padding_toggled] {
+            assert_eq!(profile_hash(&full), profile_hash(other));
+        }
+        let templates = FingerprintTemplates::new(None, Some("Chrome/156.0".into()));
+        templates.record_hello(&full);
+        let generation = templates.generation();
+        templates.record_hello(&resumed);
+        templates.record_hello(&padding_toggled);
+        assert_eq!(templates.generation(), generation);
+        assert!(!has_extension(&templates.snapshot().unwrap().hello, 41));
     }
 
     #[test]
