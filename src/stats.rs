@@ -133,6 +133,8 @@ net_stats! {
         gw_h1_reuse: "网关复用池里的空闲 h1 连接",
         gw_h1_new: "网关新建 h1 连接",
         gw_502: "网关因建连 / 握手 / 转发失败回 502",
+        gw_order_exact: "网关道请求的头名组合在 WebView 采样簿里有，照它原样排",
+        gw_order_fallback: "网关道请求的头名组合没采到过，按最近一次采样近似排",
         pool_dial_joined: "冷 key 并发请求等同一次建连（单飞）",
         pool_preconnect: "启动预连成功",
         pool_stale_dropped: "取连接时因代数 / 地址族不符丢弃",

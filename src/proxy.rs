@@ -536,7 +536,7 @@ async fn handle_connect_mitm(
         };
         info!("Client TLS handshake complete for {} (h2 MITM)", host);
         let client_tls = sniff_h2_preface(client_tls, &doh_tls_connector).await;
-        return mitm_serve(client_tls, host, port, pool).await;
+        return mitm_serve(client_tls, host, port, pool, doh_tls_connector).await;
     }
 
     let server_tls = match doh_tls_connector.connect(&host, port).await {
@@ -742,10 +742,10 @@ async fn gateway_forward_request(
     let decode = match lane {
         Lane::Gateway => pool
             .fetch_shape()
-            .is_some_and(|shape| shape.apply(req.headers_mut())),
+            .is_some_and(|shape| shape.apply(req.headers_mut(), &host)),
         Lane::Mitm => {
             if req.version() == hyper::Version::HTTP_2 {
-                pool.observe_webview_request(req.headers());
+                pool.observe_webview_request(&host, req.headers());
             }
             false
         }
@@ -825,6 +825,7 @@ async fn mitm_serve<I>(
     host: String,
     port: u16,
     pool: Arc<UpstreamPool>,
+    connector: Arc<DohTlsConnector>,
 ) -> Result<()>
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -834,7 +835,15 @@ where
     let service = service_fn(move |req: Request<Incoming>| {
         let pool = pool.clone();
         let target = (host.clone(), port);
+        let _connector = connector.clone();
         async move {
+            // WebView 主动采样头顺序：页面与采样请求由核心直接应答，不出本机
+            #[cfg(feature = "browser-tls")]
+            if let Some(browser) = _connector.browser_tls() {
+                if let Some(response) = crate::fetch_probe::respond(&req, browser.templates()) {
+                    return Ok(response);
+                }
+            }
             if is_upgrade_request(&req) {
                 return gateway_forward_upgrade(req, pool, target).await;
             }
@@ -1007,7 +1016,7 @@ where
             .await
             .map_err(DohProxyError::Io)?;
         let client_tls = sniff_h2_preface(client_tls, &connector).await;
-        return mitm_serve(client_tls, host.to_string(), port, pool).await;
+        return mitm_serve(client_tls, host.to_string(), port, pool, connector).await;
     };
 
     // TLS handshake with client (MITM)

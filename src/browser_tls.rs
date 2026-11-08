@@ -11,6 +11,7 @@
 //! - 证书按内置的 Mozilla 根证书校验，与原来的 rustls 路径一致（不依赖系统 / JNI）。
 //! - 还没采到真实握手时按 UA 里 Chrome 大版本最接近的预置模板回放（见 `presets/`）。
 
+use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -36,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::{debug, info, warn};
 
-use crate::fetch_shape::FetchShape;
+use crate::fetch_shape::{FetchMisses, FetchShape};
 use crate::upstream_pool::H2Profile;
 use crate::BoxStream;
 
@@ -51,6 +52,8 @@ const SERVER_PADDING_REQUEST: u16 = 0x12e0;
 const PERSIST_INTERVAL: Duration = Duration::from_secs(60);
 /// 窥探 ClientHello 时最多读多少字节（一个 TLS 记录的上限再加头）
 const PEEK_LIMIT: usize = 16 * 1024 + 5;
+/// Client Hints 最多记几个主机（MITM 范围本来就只有论坛几个域名）
+const MAX_HINT_HOSTS: usize = 16;
 
 // ---------------------------------------------------------------------------
 // 模板
@@ -93,6 +96,10 @@ pub struct FingerprintTemplate {
     /// WebView fetch 请求的 Accept-Encoding
     #[serde(default)]
     pub accept_encoding: Option<String>,
+    /// WebView 采样页的 fetch 发给各主机时带的 Client Hints（`sec-ch-*`，按主机、按名字排）：
+    /// 站点（如 CF 验证页）用 Accept-CH 要过高熵提示后真页面里的 fetch 都带，网关道的请求照着带
+    #[serde(default)]
+    pub client_hints: BTreeMap<String, Vec<(String, String)>>,
     /// 采样时 WebView 的 User-Agent（WebView 升级后 UA 变化，缓存随之作废）
     #[serde(default)]
     pub user_agent: Option<String>,
@@ -228,6 +235,7 @@ fn parse_preset(preset: &Preset) -> Option<FingerprintTemplate> {
         fetch_header_order,
         fetch_header_orders: Vec::new(),
         accept_encoding,
+        client_hints: BTreeMap::new(),
         user_agent: None,
         source: TemplateSource::Builtin(preset.id),
         generation: 0,
@@ -297,6 +305,7 @@ pub struct FingerprintTemplates {
     h2: RwLock<Option<H2Profile>>,
     fetch_orders: RwLock<Vec<Vec<String>>>,
     accept_encoding: RwLock<Option<String>>,
+    client_hints: RwLock<BTreeMap<String, Vec<(String, String)>>>,
     hello_hash: Mutex<Option<u64>>,
     generation: AtomicU64,
     cache_path: Option<PathBuf>,
@@ -304,6 +313,8 @@ pub struct FingerprintTemplates {
     last_persist: Mutex<Option<Instant>>,
     snapshot: RwLock<Option<Arc<FingerprintTemplate>>>,
     fetch_shape: RwLock<Option<Arc<FetchShape>>>,
+    /// 网关道没对上的头名组合，等 WebView 主动采样（见 `fetch_probe`）
+    misses: Arc<FetchMisses>,
 }
 
 impl FingerprintTemplates {
@@ -317,6 +328,7 @@ impl FingerprintTemplates {
             h2: RwLock::new(None),
             fetch_orders: RwLock::new(Vec::new()),
             accept_encoding: RwLock::new(None),
+            client_hints: RwLock::new(BTreeMap::new()),
             hello_hash: Mutex::new(None),
             generation: AtomicU64::new(0),
             cache_path,
@@ -324,6 +336,7 @@ impl FingerprintTemplates {
             last_persist: Mutex::new(None),
             snapshot: RwLock::new(None),
             fetch_shape: RwLock::new(None),
+            misses: Arc::default(),
         };
         if let Some(cached) = templates.load_cache() {
             info!("Loaded fingerprint template from cache");
@@ -333,6 +346,7 @@ impl FingerprintTemplates {
             *templates.h2.write() = cached.h2;
             *templates.fetch_orders.write() = cached.fetch_header_orders;
             *templates.accept_encoding.write() = cached.accept_encoding;
+            *templates.client_hints.write() = cached.client_hints;
             templates.generation.store(1, Ordering::Release);
         }
         templates.refresh_snapshot();
@@ -419,18 +433,75 @@ impl FingerprintTemplates {
     }
 
     /// 记下 WebView 经 h2 MITM 发来的 fetch 请求（`sec-fetch-mode: cors`）的头名顺序与
-    /// Accept-Encoding；只影响网关道的请求头怎么排，不改握手，所以不递增代数
-    pub fn observe_fetch_request(&self, headers: &http::HeaderMap) {
+    /// Accept-Encoding。只影响网关道的请求头，不改握手，所以不递增代数
+    pub fn observe_webview_request(&self, _host: &str, headers: &http::HeaderMap) {
+        let (changed, filled) = self.record_fetch_order(headers);
+        if changed {
+            debug!("Fetch header order captured from WebView");
+            self.refresh_snapshot();
+            // 补上了网关道缺的组合：立即落盘，别等节流
+            self.maybe_persist(filled);
+        }
+    }
+
+    /// 采样页（真导航打开的论坛页面）里的 fetch：除了头顺序，再记下它带的 Client Hints，
+    /// 网关道发给同一主机的请求照着带。只认采样页：用 loadData 灌进去的页面（启动时的几个
+    /// 后台 WebView）只带低熵三件套，导航请求本身也只带低熵的，而真页面里的 fetch 会带上
+    /// 站点（CF 验证页）用 Accept-CH 要过的高熵提示——原生请求冒充的就是这种 fetch
+    pub fn observe_probe_fetch(&self, host: &str, headers: &http::HeaderMap) {
+        let hints_changed = self.record_client_hints(host, headers);
+        let (order_changed, filled) = self.record_fetch_order(headers);
+        if hints_changed || order_changed {
+            debug!("Probe fetch captured from WebView");
+            self.refresh_snapshot();
+            self.maybe_persist(hints_changed || filled);
+        }
+    }
+
+    /// 换了一组就清掉没对上的头名组合（它们是按旧的一组记的）
+    fn record_client_hints(&self, host: &str, headers: &http::HeaderMap) -> bool {
+        // 按名字排：同一组提示在不同头名组合的请求里顺序不同（Chromium 的哈希表），不算变化
+        let mut hints: Vec<(String, String)> = headers
+            .iter()
+            .filter(|(name, _)| name.as_str().starts_with("sec-ch-"))
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_owned(), value.to_owned()))
+            })
+            .collect();
+        hints.sort();
+        let host = host.to_ascii_lowercase();
+        let mut current = self.client_hints.write();
+        if current.get(&host) == Some(&hints)
+            || (!current.contains_key(&host) && current.len() >= MAX_HINT_HOSTS)
+        {
+            return false;
+        }
+        info!(
+            "Client hints for {} follow the WebView: {:?}",
+            host,
+            hints.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>()
+        );
+        current.insert(host, hints);
+        self.misses.clear();
+        true
+    }
+
+    /// 返回（采样簿或 Accept-Encoding 变了，补上了网关道缺的组合）
+    fn record_fetch_order(&self, headers: &http::HeaderMap) -> (bool, bool) {
         if headers
             .get("sec-fetch-mode")
             .is_none_or(|mode| mode.as_bytes() != b"cors")
         {
-            return;
+            return (false, false);
         }
         let order = crate::fetch_shape::header_names(headers);
         if order.is_empty() {
-            return;
+            return (false, false);
         }
+        let filled = self.misses.resolve(&order);
         let mut changed = {
             let mut orders = self.fetch_orders.write();
             if orders.first() == Some(&order) {
@@ -452,11 +523,12 @@ impl FingerprintTemplates {
                 changed = true;
             }
         }
-        if changed {
-            debug!("Fetch header order captured from WebView");
-            self.refresh_snapshot();
-            self.maybe_persist(false);
-        }
+        (changed, filled)
+    }
+
+    /// 网关道没对上的头名组合
+    pub fn fetch_misses(&self) -> &Arc<FetchMisses> {
+        &self.misses
     }
 
     /// 网关道请求的整形依据
@@ -491,6 +563,7 @@ impl FingerprintTemplates {
                 fetch_header_order: Vec::new(),
                 fetch_header_orders: Vec::new(),
                 accept_encoding: None,
+                client_hints: BTreeMap::new(),
                 user_agent: self.user_agent.clone(),
                 source: *self.source.read(),
                 generation,
@@ -510,6 +583,7 @@ impl FingerprintTemplates {
                     .unwrap_or_default()
             });
             template.fetch_header_orders = orders;
+            template.client_hints = self.client_hints.read().clone();
             template.accept_encoding = self
                 .accept_encoding
                 .read()
@@ -522,6 +596,8 @@ impl FingerprintTemplates {
                 &template.fetch_header_orders,
                 &template.fetch_header_order,
                 template.accept_encoding.as_deref(),
+                &template.client_hints,
+                Some(self.misses.clone()),
             ))
         });
         *self.snapshot.write() = next.map(Arc::new);
@@ -545,6 +621,7 @@ impl FingerprintTemplates {
             fetch_header_order: Vec::new(),
             fetch_header_orders: self.fetch_orders.read().clone(),
             accept_encoding: self.accept_encoding.read().clone(),
+            client_hints: self.client_hints.read().clone(),
             user_agent: self.user_agent.clone(),
             source: TemplateSource::Sampled,
             generation: 0,
@@ -577,6 +654,7 @@ impl FingerprintTemplates {
             "generation": self.generation(),
             "h2": snapshot.as_ref().map(|t| t.h2.is_some()),
             "fetch_orders": self.fetch_orders.read().len(),
+            "probe_pending": self.misses.pending(),
         })
     }
 }
@@ -1181,12 +1259,12 @@ mod tests {
         assert_eq!(preset.accept_encoding.as_deref(), Some("gzip, deflate, br, zstd"));
         templates.record_hello(&chrome156());
         // 导航请求（不是 fetch）不记
-        templates.observe_fetch_request(&request(&["user-agent", "accept", "sec-fetch-mode"]).tap_mode("navigate"));
+        templates.observe_webview_request("linux.do", &request(&["user-agent", "accept", "sec-fetch-mode"]).tap_mode("navigate"));
         assert!(templates.snapshot().unwrap().fetch_header_orders.is_empty());
-        templates.observe_fetch_request(&request(&["user-agent", "accept", "sec-fetch-mode", "accept-encoding"]));
-        templates.observe_fetch_request(&request(&["x-csrf-token", "accept", "sec-fetch-mode"]));
+        templates.observe_webview_request("linux.do", &request(&["user-agent", "accept", "sec-fetch-mode", "accept-encoding"]));
+        templates.observe_webview_request("linux.do", &request(&["x-csrf-token", "accept", "sec-fetch-mode"]));
         // 与第一组同集合、顺序不同：替换掉旧的那份并排到最前
-        templates.observe_fetch_request(&request(&["accept", "user-agent", "sec-fetch-mode", "accept-encoding"]));
+        templates.observe_webview_request("linux.do", &request(&["accept", "user-agent", "sec-fetch-mode", "accept-encoding"]));
         let snapshot = templates.snapshot().unwrap();
         assert_eq!(
             snapshot.fetch_header_orders,
@@ -1205,6 +1283,49 @@ mod tests {
             snapshot.fetch_header_orders
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    /// 采样页 fetch 带的 Client Hints 按主机记下，进网关道的整形；别的 WebView 请求不改它；
+    /// 换了一组，按旧一组记的没对上的组合作废
+    #[test]
+    fn client_hints_follow_probe_fetches_per_host() {
+        let templates = FingerprintTemplates::new(None, Some("Chrome/124.0".into()));
+        let mut probe = http::HeaderMap::new();
+        probe.insert("sec-ch-ua", http::HeaderValue::from_static("\"Android WebView\";v=\"124\""));
+        probe.insert("sec-ch-ua-model", http::HeaderValue::from_static("\"Pixel\""));
+        probe.insert("sec-fetch-mode", http::HeaderValue::from_static("cors"));
+        probe.insert("sec-fetch-site", http::HeaderValue::from_static("same-origin"));
+        // 启动时那几个 loadData 页面的 fetch 只采头顺序
+        templates.observe_webview_request("linux.do", &probe);
+        assert!(templates.snapshot().unwrap().client_hints.is_empty());
+
+        templates.observe_probe_fetch("linux.do", &probe);
+        let recorded = templates.snapshot().unwrap().client_hints.clone();
+        assert_eq!(
+            recorded.get("linux.do"),
+            Some(&vec![
+                ("sec-ch-ua".to_string(), "\"Android WebView\";v=\"124\"".to_string()),
+                ("sec-ch-ua-model".to_string(), "\"Pixel\"".to_string()),
+            ])
+        );
+        let mut dart = http::HeaderMap::new();
+        dart.insert("sec-fetch-mode", http::HeaderValue::from_static("cors"));
+        templates.fetch_shape().unwrap().apply(&mut dart, "linux.do");
+        assert_eq!(dart["sec-ch-ua-model"], "\"Pixel\"");
+
+        templates.fetch_misses().note(
+            [
+                "user-agent", "accept", "x-requested-with", "sec-fetch-site", "sec-fetch-mode",
+                "sec-fetch-dest", "referer", "accept-encoding", "accept-language",
+            ]
+            .iter()
+            .map(|name| name.to_string())
+            .collect(),
+        );
+        assert_eq!(templates.fetch_misses().pending(), 1);
+        probe.remove("sec-ch-ua-model");
+        templates.observe_probe_fetch("linux.do", &probe);
+        assert_eq!(templates.fetch_misses().pending(), 0);
     }
 
     trait TapMode {

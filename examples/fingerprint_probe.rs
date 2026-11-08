@@ -39,7 +39,7 @@ async fn main() {
             .unwrap();
         let decode = pool
             .fetch_shape()
-            .is_some_and(|shape| shape.apply(req.headers_mut()));
+            .is_some_and(|shape| shape.apply(req.headers_mut(), &host));
         let response = pool
             .forward(Lane::Gateway, &host, 443, req, None)
             .await
@@ -87,7 +87,7 @@ async fn main() {
             .unwrap();
         let decode = pool
             .fetch_shape()
-            .is_some_and(|shape| shape.apply(req.headers_mut()));
+            .is_some_and(|shape| shape.apply(req.headers_mut(), "tls.peet.ws"));
         let response = pool
             .forward(Lane::Gateway, "tls.peet.ws", 443, req, None)
             .await

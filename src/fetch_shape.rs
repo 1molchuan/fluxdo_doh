@@ -6,9 +6,17 @@
 //!   （或预置）排，模板里没有的头插在网络栈那几个之前；
 //! - Accept-Encoding：dart:io 只发 `gzip`，Chrome 发 `gzip, deflate, br, zstd`。换成浏览器的值，
 //!   回来的 br / zstd / deflate 由 [`decode_response`] 解开再交给 Dart（gzip 仍由 Dart 自己解）；
-//! - `priority`：Chrome 给 fetch 请求带 `priority: u=1, i`（RFC 9218），Dart 的没有就补上。
+//! - `priority`：Chrome 给 fetch 请求带 `priority: u=1, i`（RFC 9218），Dart 的没有就补上；
+//! - Client Hints：站点（CF 验证页）用 Accept-CH 要过高熵提示后，真页面里的 fetch 都带
+//!   `sec-ch-ua-arch`、`sec-ch-ua-model` 等，Dart 只有低熵三件套。网关道发给同一主机的 fetch 请求
+//!   照 WebView 采样页里的 fetch 带的那组 `sec-ch-*`（名字和值）带。
+//!
+//! 采样簿里没有同集合的头名组合记进 [`FetchMisses`]，由 WebView 主动采样补上（见 `fetch_probe`）。
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use bytes::Bytes;
 use http::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT_ENCODING, HOST, RANGE};
@@ -46,7 +54,7 @@ const HOP_BY_HOP: &[&str] = &[
     "te",
 ];
 /// 最多记几组头名集合各自的顺序
-pub const MAX_ORDERS: usize = 24;
+pub const MAX_ORDERS: usize = 48;
 
 /// 排序与比较时跳过的头：Host（h2 上游不发，h1 放最前）与逐跳头
 fn skipped(name: &HeaderName) -> bool {
@@ -70,6 +78,133 @@ pub fn same_name_set(a: &[String], b: &[String]) -> bool {
     }
 }
 
+/// WebView 的 fetch 一定会带、Dart 请求也带齐了才值得让 WebView 去采的头。WebView 的请求
+/// 一律带 X-Requested-With（页面没设就是包名），所以 Dart 那边没有它的组合采不到
+const PROBE_REQUIRED: &[&str] = &[
+    "user-agent",
+    "accept",
+    "x-requested-with",
+    "sec-fetch-site",
+    "sec-fetch-mode",
+    "sec-fetch-dest",
+    "referer",
+    "accept-encoding",
+    "accept-language",
+];
+/// 最多记几组没对上的头名组合
+const MAX_MISSES: usize = 32;
+/// 一组头名最多让 WebView 采几次（采回来的集合对不上就不再试）
+const MAX_PROBE_ATTEMPTS: u8 = 2;
+/// 一页最多采几组
+pub const MAX_PROBES_PER_PAGE: usize = 8;
+
+/// 采样请求用的方法：GET 或带请求体的 POST（浏览器给 POST 加 origin 与 content-length）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeMethod {
+    Get,
+    Post,
+}
+
+#[derive(Debug, Clone)]
+pub struct MissedSet {
+    /// 头名（小写，Dart 发出时的顺序）
+    pub names: Vec<String>,
+    pub method: ProbeMethod,
+    pub count: u32,
+    pub attempts: u8,
+}
+
+/// 网关道请求的头名组合在采样簿里找不到时记一笔，等 WebView 主动采样
+#[derive(Debug, Default)]
+pub struct FetchMisses {
+    entries: Mutex<Vec<MissedSet>>,
+}
+
+impl FetchMisses {
+    /// WebView 能不能发出同一组头名：浏览器自己加的头 Dart 也得带齐；带请求体的只认 POST
+    fn probe_method(names: &[String]) -> Option<ProbeMethod> {
+        let has = |name: &str| names.iter().any(|n| n == name);
+        if !PROBE_REQUIRED.iter().all(|name| has(name)) {
+            return None;
+        }
+        match (has("content-length"), has("origin")) {
+            (true, true) => Some(ProbeMethod::Post),
+            (false, false) => Some(ProbeMethod::Get),
+            _ => None,
+        }
+    }
+
+    pub fn note(&self, names: Vec<String>) {
+        let Some(method) = Self::probe_method(&names) else {
+            return;
+        };
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries
+            .iter_mut()
+            .find(|entry| same_name_set(&entry.names, &names))
+        {
+            entry.count = entry.count.saturating_add(1);
+            return;
+        }
+        if entries.len() >= MAX_MISSES {
+            if let Some(index) = entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.count)
+                .map(|(index, _)| index)
+            {
+                entries.remove(index);
+            }
+        }
+        entries.push(MissedSet {
+            names,
+            method,
+            count: 1,
+            attempts: 0,
+        });
+    }
+
+    /// 网关道的头名组合整体变了（换了一组 Client Hints），之前记的都不作数
+    pub fn clear(&self) {
+        self.entries.lock().clear();
+    }
+
+    /// WebView 采到了这组头名：不再缺
+    pub fn resolve(&self, names: &[String]) -> bool {
+        let mut entries = self.entries.lock();
+        let before = entries.len();
+        entries.retain(|entry| !same_name_set(&entry.names, names));
+        entries.len() != before
+    }
+
+    /// 还值得采的组数
+    pub fn pending(&self) -> usize {
+        self.entries
+            .lock()
+            .iter()
+            .filter(|entry| entry.attempts < MAX_PROBE_ATTEMPTS)
+            .count()
+    }
+
+    /// 取出这一页要采的组（出现最多的在前），并记一次尝试
+    pub fn take_for_probe(&self) -> Vec<MissedSet> {
+        let mut entries = self.entries.lock();
+        let mut picked: Vec<&mut MissedSet> = entries
+            .iter_mut()
+            .filter(|entry| entry.attempts < MAX_PROBE_ATTEMPTS)
+            .collect();
+        picked.sort_by(|a, b| b.count.cmp(&a.count));
+        picked
+            .into_iter()
+            .take(MAX_PROBES_PER_PAGE)
+            .map(|entry| {
+                entry.attempts += 1;
+                entry.clone()
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct FetchShape {
     /// 采到的 WebView fetch 头顺序，每组头名集合一份，新的在前
@@ -79,6 +214,10 @@ pub struct FetchShape {
     accept_encoding: Option<HeaderValue>,
     /// 模板里有 priority 头（Chrome 124 起才发）
     send_priority: bool,
+    /// WebView 采样页的 fetch 发给各主机时带的 `sec-ch-*`
+    client_hints: HashMap<String, Vec<(HeaderName, HeaderValue)>>,
+    /// 没对上的头名组合记到这里（与模板仓库共用一份）
+    misses: Option<Arc<FetchMisses>>,
 }
 
 fn parse_names(names: &[String]) -> Vec<HeaderName> {
@@ -89,7 +228,13 @@ fn parse_names(names: &[String]) -> Vec<HeaderName> {
 }
 
 impl FetchShape {
-    pub fn new(orders: &[Vec<String>], fallback: &[String], accept_encoding: Option<&str>) -> Self {
+    pub fn new(
+        orders: &[Vec<String>],
+        fallback: &[String],
+        accept_encoding: Option<&str>,
+        client_hints: &BTreeMap<String, Vec<(String, String)>>,
+        misses: Option<Arc<FetchMisses>>,
+    ) -> Self {
         let orders: Vec<Vec<HeaderName>> = orders
             .iter()
             .take(MAX_ORDERS)
@@ -105,11 +250,44 @@ impl FetchShape {
             fallback,
             accept_encoding: accept_encoding.and_then(|value| HeaderValue::from_str(value).ok()),
             send_priority,
+            client_hints: client_hints
+                .iter()
+                .map(|(host, hints)| {
+                    let hints = hints
+                        .iter()
+                        .filter_map(|(name, value)| {
+                            Some((
+                                HeaderName::from_bytes(name.as_bytes()).ok()?,
+                                HeaderValue::from_str(value).ok()?,
+                            ))
+                        })
+                        .collect();
+                    (host.clone(), hints)
+                })
+                .collect(),
+            misses,
         }
     }
 
-    /// 整形；返回 true 表示 Accept-Encoding 换成了浏览器的值，响应要交给 [`decode_response`]
-    pub fn apply(&self, headers: &mut HeaderMap) -> bool {
+    /// 整形发往 `host` 的请求；返回 true 表示 Accept-Encoding 换成了浏览器的值，响应要交给
+    /// [`decode_response`]
+    pub fn apply(&self, headers: &mut HeaderMap, host: &str) -> bool {
+        // 冒充浏览器 fetch 的请求（带 sec-fetch-*）才照 WebView 带 Client Hints
+        if headers.contains_key("sec-fetch-mode") {
+            if let Some(hints) = self.client_hints.get(&host.to_ascii_lowercase()) {
+                let dart_hints: Vec<HeaderName> = headers
+                    .keys()
+                    .filter(|name| name.as_str().starts_with("sec-ch-"))
+                    .cloned()
+                    .collect();
+                for name in dart_hints {
+                    headers.remove(name);
+                }
+                for (name, value) in hints {
+                    headers.append(name.clone(), value.clone());
+                }
+            }
+        }
         let is_fetch = headers
             .get("sec-fetch-mode")
             .is_some_and(|mode| mode.as_bytes() == b"cors");
@@ -145,7 +323,12 @@ impl FetchShape {
             .iter()
             .find(|order| order.len() == present.len() && order.iter().all(|n| present.contains(n)))
         {
+            crate::stats::STATS.gw_order_exact.inc();
             return order.clone();
+        }
+        crate::stats::STATS.gw_order_fallback.inc();
+        if let Some(misses) = &self.misses {
+            misses.note(names.iter().map(|name| name.as_str().to_owned()).collect());
         }
         let base = if self.fallback.is_empty() {
             self.orders.first().map(Vec::as_slice).unwrap_or_default()
@@ -504,9 +687,9 @@ mod tests {
 
     #[test]
     fn same_name_set_follows_the_sampled_order_exactly() {
-        let shape = FetchShape::new(&[names(CHROME_FETCH)], &[], Some("gzip, deflate, br, zstd"));
+        let shape = FetchShape::new(&[names(CHROME_FETCH)], &[], Some("gzip, deflate, br, zstd"), &BTreeMap::new(), None);
         let mut map = dart_request();
-        assert!(shape.apply(&mut map));
+        assert!(shape.apply(&mut map, "linux.do"));
         let mut expected = vec!["host"];
         expected.extend_from_slice(CHROME_FETCH);
         expected.push("connection");
@@ -536,9 +719,9 @@ mod tests {
             "cookie",
             "priority",
         ]);
-        let shape = FetchShape::new(&[], &preset, Some("gzip, deflate, br, zstd"));
+        let shape = FetchShape::new(&[], &preset, Some("gzip, deflate, br, zstd"), &BTreeMap::new(), None);
         let mut map = dart_request();
-        shape.apply(&mut map);
+        shape.apply(&mut map, "linux.do");
         assert_eq!(
             order_of(&map),
             vec![
@@ -572,6 +755,8 @@ mod tests {
             &[],
             &names(&["sec-ch-ua", "x-rama-custom-header-marker", "user-agent", "sec-fetch-mode"]),
             None,
+            &BTreeMap::new(),
+            None,
         );
         let mut map = headers(&[
             ("sec-fetch-mode", "cors"),
@@ -579,7 +764,7 @@ mod tests {
             ("user-agent", "UA"),
             ("sec-ch-ua", "x"),
         ]);
-        assert!(!shape.apply(&mut map));
+        assert!(!shape.apply(&mut map, "linux.do"));
         assert_eq!(
             order_of(&map),
             vec!["sec-ch-ua", "x-custom", "user-agent", "sec-fetch-mode"]
@@ -590,20 +775,56 @@ mod tests {
 
     #[test]
     fn explicit_encodings_and_ranges_are_left_alone() {
-        let shape = FetchShape::new(&[], &names(CHROME_FETCH), Some("gzip, deflate, br, zstd"));
+        let shape = FetchShape::new(&[], &names(CHROME_FETCH), Some("gzip, deflate, br, zstd"), &BTreeMap::new(), None);
         let mut identity = headers(&[("accept-encoding", "identity")]);
-        assert!(!shape.apply(&mut identity));
+        assert!(!shape.apply(&mut identity, "linux.do"));
         assert_eq!(identity["accept-encoding"], "identity");
         let mut range = headers(&[("accept-encoding", "gzip"), ("range", "bytes=0-")]);
-        assert!(!shape.apply(&mut range));
+        assert!(!shape.apply(&mut range, "linux.do"));
         assert_eq!(range["accept-encoding"], "gzip");
+    }
+
+    /// 冒充 fetch 的请求照 WebView 发给同一主机的那组 Client Hints 带（名字和值都换成它的）
+    #[test]
+    fn client_hints_follow_the_webview_for_the_same_host() {
+        let mut hints = BTreeMap::new();
+        hints.insert(
+            "linux.do".to_string(),
+            vec![
+                ("sec-ch-ua".to_string(), "\"Android WebView\";v=\"124\"".to_string()),
+                ("sec-ch-ua-mobile".to_string(), "?1".to_string()),
+                ("sec-ch-ua-model".to_string(), "\"Pixel\"".to_string()),
+                ("sec-ch-ua-arch".to_string(), "\"\"".to_string()),
+            ],
+        );
+        let shape = FetchShape::new(&[], &names(CHROME_FETCH), None, &hints, None);
+        let mut fetch = headers(&[
+            ("sec-ch-ua", "dart"),
+            ("sec-ch-ua-mobile", "?1"),
+            ("sec-ch-ua-platform", "\"Android\""),
+            ("sec-fetch-mode", "cors"),
+        ]);
+        shape.apply(&mut fetch, "LINUX.DO");
+        assert_eq!(fetch["sec-ch-ua"], "\"Android WebView\";v=\"124\"");
+        assert_eq!(fetch["sec-ch-ua-model"], "\"Pixel\"");
+        assert!(fetch.contains_key("sec-ch-ua-arch"));
+        // WebView 这一组里没有的就不带
+        assert!(!fetch.contains_key("sec-ch-ua-platform"));
+
+        let mut other_host = headers(&[("sec-ch-ua", "dart"), ("sec-fetch-mode", "cors")]);
+        shape.apply(&mut other_host, "tls.peet.ws");
+        assert_eq!(other_host["sec-ch-ua"], "dart");
+        let mut image = headers(&[("sec-ch-ua", "dart"), ("accept", "image/webp")]);
+        shape.apply(&mut image, "linux.do");
+        assert_eq!(image["sec-ch-ua"], "dart");
+        assert!(!image.contains_key("sec-ch-ua-model"));
     }
 
     #[test]
     fn repeated_values_keep_their_order() {
-        let shape = FetchShape::new(&[], &names(&["accept", "cookie"]), None);
+        let shape = FetchShape::new(&[], &names(&["accept", "cookie"]), None, &BTreeMap::new(), None);
         let mut map = headers(&[("cookie", "a=1"), ("accept", "*/*"), ("cookie", "b=2")]);
-        shape.apply(&mut map);
+        shape.apply(&mut map, "linux.do");
         let cookies: Vec<_> = map.get_all("cookie").iter().collect();
         assert_eq!(cookies, vec!["a=1", "b=2"]);
         assert_eq!(order_of(&map), vec!["accept", "cookie"]);

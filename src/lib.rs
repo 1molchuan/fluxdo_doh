@@ -16,6 +16,8 @@ pub mod dns;
 pub mod ech;
 pub mod edge_pin;
 pub mod error;
+#[cfg(feature = "browser-tls")]
+pub mod fetch_probe;
 pub mod fetch_shape;
 pub mod ffi;
 pub mod probe;

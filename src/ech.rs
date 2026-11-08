@@ -345,11 +345,11 @@ impl DohTlsConnector {
         None
     }
 
-    /// WebView 经 h2 MITM 发来的请求：记下 fetch 请求的头顺序
-    pub fn observe_webview_request(&self, _headers: &http::HeaderMap) {
+    /// WebView 经 h2 MITM 发给 `host` 的请求：记下 fetch 请求的头顺序与 Client Hints
+    pub fn observe_webview_request(&self, _host: &str, _headers: &http::HeaderMap) {
         #[cfg(feature = "browser-tls")]
         if let Some(browser) = &self.browser {
-            browser.templates().observe_fetch_request(_headers);
+            browser.templates().observe_webview_request(_host, _headers);
         }
     }
 

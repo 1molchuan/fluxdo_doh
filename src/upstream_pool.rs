@@ -138,8 +138,8 @@ pub trait Dialer: Send + Sync + 'static {
     fn fetch_shape(&self) -> Option<Arc<FetchShape>> {
         None
     }
-    /// WebView 经 h2 MITM 发来的请求（采它的头顺序）
-    fn observe_webview_request(&self, _headers: &hyper::HeaderMap) {}
+    /// WebView 经 h2 MITM 发给 `host` 的请求（采它的头顺序与 Client Hints）
+    fn observe_webview_request(&self, _host: &str, _headers: &hyper::HeaderMap) {}
 }
 
 struct H2Conn {
@@ -276,8 +276,8 @@ impl UpstreamPool {
     }
 
     /// 交给建连方记下 WebView 的请求头顺序
-    pub fn observe_webview_request(&self, headers: &hyper::HeaderMap) {
-        self.dialer.observe_webview_request(headers);
+    pub fn observe_webview_request(&self, host: &str, headers: &hyper::HeaderMap) {
+        self.dialer.observe_webview_request(host, headers);
     }
 
     /// 让现有连接全部不再复用（在途请求照常读完）
@@ -1183,8 +1183,8 @@ impl Dialer for crate::ech::DohTlsConnector {
         crate::ech::DohTlsConnector::fetch_shape(self)
     }
 
-    fn observe_webview_request(&self, headers: &hyper::HeaderMap) {
-        crate::ech::DohTlsConnector::observe_webview_request(self, headers)
+    fn observe_webview_request(&self, host: &str, headers: &hyper::HeaderMap) {
+        crate::ech::DohTlsConnector::observe_webview_request(self, host, headers)
     }
 }
 
