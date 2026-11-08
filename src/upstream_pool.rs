@@ -940,9 +940,26 @@ impl Replay {
 }
 
 /// 发往 h2 连接：去掉 Host 头（:authority 已由绝对 URI 给出）。浏览器在 h2 上不发 Host；
-/// 回环上的 Dart 请求与 WebView 的 h1 入站请求都带着它，原样转发会多出一个 `host` 头
+/// 回环上的 Dart 请求与 WebView 的 h1 入站请求都带着它，原样转发会多出一个 `host` 头。
+/// 不用 `HeaderMap::remove`：它把最后一个头挪到被删的位置，头顺序就乱了
 fn into_h2_form(mut req: Request<PoolBody>) -> Request<PoolBody> {
-    req.headers_mut().remove(hyper::header::HOST);
+    if req.headers().contains_key(hyper::header::HOST) {
+        let headers = std::mem::take(req.headers_mut());
+        let kept = req.headers_mut();
+        kept.reserve(headers.len());
+        let mut current: Option<hyper::header::HeaderName> = None;
+        for (name, value) in headers {
+            if name.is_some() {
+                current = name;
+            }
+            match &current {
+                Some(name) if name != hyper::header::HOST => {
+                    kept.append(name.clone(), value);
+                }
+                _ => {}
+            }
+        }
+    }
     req
 }
 
@@ -1569,17 +1586,20 @@ mod tests {
     }
 
     /// 记下每个请求有没有 Host 头、请求目标长什么样的服务端
-    async fn spawn_recording_server(h2: bool) -> (SocketAddr, Arc<Mutex<Vec<(bool, String)>>>) {
+    /// 记下每个请求的头名（按收到的顺序）与请求目标
+    type Seen = Arc<Mutex<Vec<(Vec<String>, String)>>>;
+
+    async fn spawn_recording_server(h2: bool) -> (SocketAddr, Seen) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let seen: Arc<Mutex<Vec<(bool, String)>>> = Arc::default();
+        let seen: Seen = Arc::default();
         let record = seen.clone();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let record = record.clone();
                 let service = service_fn(move |req: Request<Incoming>| {
                     record.lock().push((
-                        req.headers().contains_key(hyper::header::HOST),
+                        req.headers().keys().map(|name| name.to_string()).collect(),
                         req.uri().to_string(),
                     ));
                     async { Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok")))) }
@@ -1613,14 +1633,29 @@ mod tests {
         }
     }
 
-    /// h2 上游不带 Host 头（浏览器在 h2 上只发 :authority）
+    /// h2 上游不带 Host 头（浏览器在 h2 上只发 :authority），其余头的顺序不变
     #[tokio::test]
     async fn h2_upstream_requests_carry_no_host_header() {
         let (addr, seen) = spawn_recording_server(true).await;
         let (pool, _dialer) = pool_with(recording_dialer(addr, true));
-        assert_eq!(get(&pool, "/ok").await.unwrap(), 200);
+        let mut req = request(hyper::Method::GET, "/ok", b"");
+        for name in ["user-agent", "accept", "sec-fetch-mode", "cookie"] {
+            req.headers_mut().append(name, "1".parse().unwrap());
+        }
+        let response = pool
+            .forward(Lane::Gateway, "example.test", 443, req, None)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
         let seen = seen.lock().clone();
-        assert_eq!(seen, vec![(false, "https://example.test/ok".to_string())]);
+        let names = |list: &[&str]| list.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            seen,
+            vec![(
+                names(&["user-agent", "accept", "sec-fetch-mode", "cookie"]),
+                "https://example.test/ok".to_string()
+            )]
+        );
     }
 
     /// h1 上游用 origin-form 请求行，没有 Host 时按 URI 补上（h2 入站请求只有 :authority）
@@ -1636,7 +1671,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), 200);
         let seen = seen.lock().clone();
-        assert_eq!(seen, vec![(true, "/ok?x=1".to_string())]);
+        assert_eq!(seen, vec![(vec!["host".to_string()], "/ok?x=1".to_string())]);
     }
 
     /// WebSocket 升级：另建 h1 上游连接转发升级请求，101 之后两侧字节对接
