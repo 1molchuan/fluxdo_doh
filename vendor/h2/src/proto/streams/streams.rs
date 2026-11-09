@@ -279,8 +279,10 @@ where
         let mut headers =
             client::Peer::convert_send_message(stream_id, request, protocol, end_of_stream)?;
 
-        // cfluxdo 补丁：Chromium 的 HTTP/2 优先级——独占依赖最近一个还开着、权重不低于自己的流
+        // cfluxdo 补丁：Chromium 的 HTTP/2 优先级——独占依赖最近一个还开着、权重不低于自己的流。
+        // 带优先级的请求走的是按浏览器指纹握手的连接，伪头顺序也照 Chromium
         if let Some(priority) = priority {
+            headers.set_chromium_pseudo_order();
             let weight = priority.weight.clamp(1, 256);
             let mut parent = StreamId::zero();
             me.store.for_each(|existing| {

@@ -731,8 +731,12 @@ impl UpstreamPool {
                 // 先拿到守卫：无论成功、失败还是被取消，在途计数都会扣回
                 let guard = StreamGuard::H2(conn.clone());
                 let mut sender = conn.sender.clone();
-                let mut req = into_h2_form(req);
+                let mut req = req;
+                // 去 Host、带优先级（连带 Chromium 的伪头顺序）只给按浏览器指纹握手的连接；
+                // rustls 握手的连接（桌面端、关掉浏览器指纹的安卓）照旧发，免得 HTTP/2 层像
+                // Chromium、TLS 层却是 rustls
                 if conn.chromium_priority {
+                    req = into_h2_form(req);
                     let weight = chromium_weight(&req);
                     req.extensions_mut()
                         .insert(h2::ext::RequestPriority { weight });
@@ -956,9 +960,9 @@ impl Replay {
     }
 }
 
-/// 发往 h2 连接：去掉 Host 头（:authority 已由绝对 URI 给出）。浏览器在 h2 上不发 Host；
-/// 回环上的 Dart 请求与 WebView 的 h1 入站请求都带着它，原样转发会多出一个 `host` 头。
-/// 不用 `HeaderMap::remove`：它把最后一个头挪到被删的位置，头顺序就乱了
+/// 发往按浏览器指纹握手的 h2 连接：去掉 Host 头（:authority 已由绝对 URI 给出）。浏览器在
+/// h2 上不发 Host；回环上的 Dart 请求与 WebView 的 h1 入站请求都带着它，原样转发会多出一个
+/// `host` 头。不用 `HeaderMap::remove`：它把最后一个头挪到被删的位置，头顺序就乱了
 fn into_h2_form(mut req: Request<PoolBody>) -> Request<PoolBody> {
     if req.headers().contains_key(hyper::header::HOST) {
         let headers = std::mem::take(req.headers_mut());
@@ -1307,6 +1311,8 @@ mod tests {
         /// 前几次之后的建连都失败
         succeed_first: Option<usize>,
         delay: Duration,
+        /// Some = 冒充按浏览器指纹握手的连接
+        h2_profile: Option<H2Profile>,
     }
 
     impl Dialer for TestDialer {
@@ -1325,7 +1331,7 @@ mod tests {
                     io: Box::new(tcp),
                     h2: self.h2,
                     peer: Some(self.addr),
-                    h2_profile: None,
+                    h2_profile: self.h2_profile.clone(),
                 })
             })
         }
@@ -1356,6 +1362,7 @@ mod tests {
             panic_on: None,
             succeed_first: None,
             delay: Duration::ZERO,
+            h2_profile: None,
         })
     }
 
@@ -1373,6 +1380,7 @@ mod tests {
             panic_on: None,
             succeed_first: None,
             delay: Duration::ZERO,
+            h2_profile: None,
         }
     }
 
@@ -1655,14 +1663,14 @@ mod tests {
             panic_on: None,
             succeed_first: None,
             delay: Duration::ZERO,
+            h2_profile: None,
         }
     }
 
-    /// h2 上游不带 Host 头（浏览器在 h2 上只发 :authority），其余头的顺序不变
-    #[tokio::test]
-    async fn h2_upstream_requests_carry_no_host_header() {
-        let (addr, seen) = spawn_recording_server(true).await;
-        let (pool, _dialer) = pool_with(recording_dialer(addr, true));
+    /// 经 h2 上游发一个带 user-agent / accept / sec-fetch-mode / cookie 的请求，返回服务端收到的
+    /// （头名顺序, 请求目标）
+    async fn forward_recorded_h2(dialer: TestDialer, seen: Seen) -> Vec<(Vec<String>, String)> {
+        let (pool, _dialer) = pool_with(dialer);
         let mut req = request(hyper::Method::GET, "/ok", b"");
         for name in ["user-agent", "accept", "sec-fetch-mode", "cookie"] {
             req.headers_mut().append(name, "1".parse().unwrap());
@@ -1672,12 +1680,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
-        let seen = seen.lock().clone();
-        let names = |list: &[&str]| list.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+        let recorded = seen.lock().clone();
+        recorded
+    }
+
+    fn header_names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// 按浏览器指纹握手的 h2 上游不带 Host 头（浏览器在 h2 上只发 :authority），其余头的顺序不变
+    #[tokio::test]
+    async fn browser_h2_upstream_requests_carry_no_host_header() {
+        let (addr, seen) = spawn_recording_server(true).await;
+        let dialer = TestDialer {
+            h2_profile: Some(H2Profile::default()),
+            ..recording_dialer(addr, true)
+        };
         assert_eq!(
-            seen,
+            forward_recorded_h2(dialer, seen).await,
             vec![(
-                names(&["user-agent", "accept", "sec-fetch-mode", "cookie"]),
+                header_names(&["user-agent", "accept", "sec-fetch-mode", "cookie"]),
+                "https://example.test/ok".to_string()
+            )]
+        );
+    }
+
+    /// rustls 握手的 h2 上游（桌面端等）照旧带着 Host 发，和 1.2.2-beta.10 及以前一致
+    #[tokio::test]
+    async fn plain_h2_upstream_requests_keep_host_header() {
+        let (addr, seen) = spawn_recording_server(true).await;
+        assert_eq!(
+            forward_recorded_h2(recording_dialer(addr, true), seen).await,
+            vec![(
+                header_names(&["host", "user-agent", "accept", "sec-fetch-mode", "cookie"]),
                 "https://example.test/ok".to_string()
             )]
         );

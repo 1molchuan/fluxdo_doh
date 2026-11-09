@@ -72,6 +72,11 @@ pub struct Pseudo {
 
     // Response
     pub status: Option<StatusCode>,
+
+    /// cfluxdo 补丁：按 Chromium 的顺序编码请求伪头（`:method, :authority, :scheme, :path`）。
+    /// 只有按浏览器指纹握手的连接才打开；其余连接保持原版的 `:method, :scheme, :authority, :path`，
+    /// 免得 rustls 的握手配上 Chromium 的伪头顺序，成了哪种客户端都不像的组合
+    pub chromium_order: bool,
 }
 
 #[derive(Debug)]
@@ -245,6 +250,11 @@ impl Headers {
     pub fn set_stream_dep(&mut self, dep: StreamDependency) {
         self.stream_dep = Some(dep);
         self.flags.set_priority();
+    }
+
+    /// cfluxdo 补丁：请求伪头按 Chromium 的顺序编码（见 [`Pseudo::chromium_order`]）
+    pub(crate) fn set_chromium_pseudo_order(&mut self) {
+        self.header_block.pseudo.chromium_order = true;
     }
 
     pub fn is_over_size(&self) -> bool {
@@ -596,6 +606,7 @@ impl Pseudo {
             path,
             protocol,
             status: None,
+            chromium_order: false,
         };
 
         // If the URI includes a scheme component, add it to the pseudo headers
@@ -620,6 +631,7 @@ impl Pseudo {
             path: None,
             protocol: None,
             status: Some(status),
+            chromium_order: false,
         }
     }
 
@@ -718,14 +730,21 @@ impl Iterator for Iter {
                 return Some(Method(method));
             }
 
-            // cfluxdo 补丁：伪头按 Chromium 的顺序发（:method, :authority, :scheme, :path），
-            // 原版是 :method, :scheme, :authority, :path。见 vendor/h2/CFLUXDO_PATCH.md
-            if let Some(authority) = pseudo.authority.take() {
-                return Some(Authority(authority));
+            // cfluxdo 补丁：按浏览器指纹握手的连接，伪头按 Chromium 的顺序发
+            // （:method, :authority, :scheme, :path）；其余连接保持原版的
+            // :method, :scheme, :authority, :path。见 vendor/h2/CFLUXDO_PATCH.md
+            if pseudo.chromium_order {
+                if let Some(authority) = pseudo.authority.take() {
+                    return Some(Authority(authority));
+                }
             }
 
             if let Some(scheme) = pseudo.scheme.take() {
                 return Some(Scheme(scheme));
+            }
+
+            if let Some(authority) = pseudo.authority.take() {
+                return Some(Authority(authority));
             }
 
             if let Some(path) = pseudo.path.take() {
@@ -1014,6 +1033,40 @@ mod test {
     use super::*;
     use crate::frame;
     use crate::hpack::{huffman, Encoder};
+
+    /// cfluxdo 补丁：只有打开 chromium_order 的请求才按 Chromium 的顺序编码伪头
+    #[test]
+    fn test_pseudo_order_follows_chromium_only_when_requested() {
+        fn pseudo_names(chromium_order: bool) -> Vec<&'static str> {
+            let mut pseudo = Pseudo::request(
+                Method::GET,
+                Uri::from_static("https://example.com/x"),
+                None,
+            );
+            pseudo.chromium_order = chromium_order;
+            Iter {
+                pseudo: Some(pseudo),
+                fields: HeaderMap::new().into_iter(),
+            }
+            .map(|header| match header {
+                hpack::Header::Method(_) => ":method",
+                hpack::Header::Authority(_) => ":authority",
+                hpack::Header::Scheme(_) => ":scheme",
+                hpack::Header::Path(_) => ":path",
+                _ => "other",
+            })
+            .collect()
+        }
+
+        assert_eq!(
+            pseudo_names(false),
+            [":method", ":scheme", ":authority", ":path"]
+        );
+        assert_eq!(
+            pseudo_names(true),
+            [":method", ":authority", ":scheme", ":path"]
+        );
+    }
 
     #[test]
     fn test_nameless_header_at_resume() {
