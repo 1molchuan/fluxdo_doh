@@ -639,13 +639,22 @@ impl DohTlsConnector {
         self.crypto_provider.clone()
     }
 
-    /// 采纳服务端给的新钥匙：写进 resolver 覆盖（6 h）并交给 Selector，返回钥匙
+    /// 采纳服务端给的新钥匙：写进 resolver 覆盖（6 h）并交给 Selector，返回钥匙。
+    /// 解析不了的不采纳（返回 None）：覆盖 6 h、进了钥匙池就会让之后的握手全部失败
     #[cfg(feature = "ech")]
     fn adopt_retry_key(
         &self,
         host: &str,
         configs: Vec<u8>,
-    ) -> rustls::pki_types::EchConfigListBytes<'static> {
+    ) -> Option<rustls::pki_types::EchConfigListBytes<'static>> {
+        if !crate::select::ech_key_usable(&configs) {
+            warn!(
+                "ECH retry_configs for {} unusable ({} bytes), not adopted",
+                host,
+                configs.len()
+            );
+            return None;
+        }
         STATS.ech_retry_adopted.inc();
         let key = rustls::pki_types::EchConfigListBytes::from(configs);
         if let Some(resolver) = &self.dns_resolver {
@@ -663,7 +672,7 @@ impl DohTlsConnector {
             host,
             key.as_ref().len()
         );
-        key
+        Some(key)
     }
 
     fn apply_alpn(config: Arc<ClientConfig>, h2: bool) -> Arc<ClientConfig> {
@@ -802,9 +811,14 @@ impl DohTlsConnector {
                     return Ok((won.stream, Some(won.addr)));
                 }
                 #[cfg(feature = "ech")]
-                Err(DohProxyError::EchRetry { configs, .. }) if !ech_retried => {
+                Err(DohProxyError::EchRetry { addr, configs }) if !ech_retried => {
                     ech_retried = true;
-                    let key = self.adopt_retry_key(host, configs);
+                    let Some(key) = self.adopt_retry_key(host, configs) else {
+                        return Err(DohProxyError::Proxy(format!(
+                            "ECH rejected by {} without usable retry_configs",
+                            addr
+                        )));
+                    };
                     handshake = self
                         .handshake_for(host, &server_name, h2_alpn, Some(&key))
                         .await?;

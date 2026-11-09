@@ -779,17 +779,35 @@ impl BrowserTls {
                 Ok(stream)
             }
             Err(error) => {
-                if let Some(configs) = error
-                    .ssl()
-                    .and_then(SslRef::get_ech_retry_configs)
-                    .filter(|configs| !configs.is_empty())
-                {
-                    return Err(BrowserHandshakeError::EchRetry(configs.to_vec()));
+                // retry_configs 只有握手以 ECH_REJECTED 收场时才是服务端（证书已按公开名验过）
+                // 给的；别的失败去取，BoringSSL 会故意给一段解析不了的占位（fe0d ffffff），
+                // 以前把它当新钥匙采纳，此后到这个站的握手全部失败
+                if is_ech_rejected(&error) {
+                    if let Some(configs) = error
+                        .ssl()
+                        .and_then(SslRef::get_ech_retry_configs)
+                        .filter(|configs| !configs.is_empty())
+                    {
+                        return Err(BrowserHandshakeError::EchRetry(configs.to_vec()));
+                    }
                 }
                 Err(BrowserHandshakeError::Failed(describe_handshake_error(&error)))
             }
         }
     }
+}
+
+/// BoringSSL 的 `ERR_LIB_SSL` 与 `SSL_R_ECH_REJECTED`（include/openssl/err.h、ssl.h；rama 没有导出）
+const ERR_LIB_SSL: i32 = 16;
+const SSL_R_ECH_REJECTED: i32 = 319;
+
+/// 握手是不是因为服务端拒绝了 ECH 而失败（只有这时 retry_configs 可信）
+fn is_ech_rejected<S>(error: &rama_tls_boring::core::tokio::HandshakeError<S>) -> bool {
+    error.as_ssl_error_stack().is_some_and(|stack| {
+        stack.iter().any(|error| {
+            error.library_code() == ERR_LIB_SSL && error.reason_code() == SSL_R_ECH_REJECTED
+        })
+    })
 }
 
 fn describe_handshake_error<S>(error: &rama_tls_boring::core::tokio::HandshakeError<S>) -> String {
@@ -823,8 +841,16 @@ fn build(
         config.set_permute_extensions(true);
     }
 
-    // 标准套件串为空（参考握手没有 BoringSSL 认识的 TLS 1.2 套件）时无法安全注入 ECH
+    // 标准套件串为空（参考握手没有 BoringSSL 认识的 TLS 1.2 套件）时无法安全注入 ECH；
+    // 钥匙本身解析不了时也不注入（BoringSSL 会直接拒绝整份配置），和 rustls 一样退回普通 TLS
     let ech = ech_config_list.and_then(|list| {
+        if !crate::select::ech_key_usable(list) {
+            warn!(
+                "ECH config list unusable ({} bytes), not injecting ECH",
+                list.len()
+            );
+            return None;
+        }
         let suites = standard_cipher_list(hello);
         if suites.is_none() {
             warn!("Reference ClientHello has no standard TLS 1.2 suites, not injecting ECH");
@@ -1097,6 +1123,31 @@ mod tests {
         );
         assert_eq!(extension_ids(&outer), extension_ids(&reference));
         assert_eq!(ja4(&outer), ja4(&reference));
+    }
+
+    /// 钥匙解析不了（比如 BoringSSL 的 retry_configs 占位）时不注入 ECH、照常构造，
+    /// 和 rustls 路径一样退回普通 TLS；以前在这里直接报 INVALID_ECH_CONFIG_LIST
+    #[test]
+    fn unusable_ech_list_falls_back_to_plain_handshake() {
+        let reference = chrome156();
+        let placeholder = [0xfe, 0x0d, 0xff, 0xff, 0xff];
+        let (_, ech_applied) = build(
+            &reference,
+            Host::from_static("linux.do"),
+            Some(&placeholder),
+            None,
+        )
+        .unwrap();
+        assert!(!ech_applied);
+        assert_eq!(ja4(&emitted(&reference, Some(&placeholder))), ja4(&reference));
+        let (_, ech_applied) = build(
+            &reference,
+            Host::from_static("linux.do"),
+            Some(&ech_config_list()),
+            None,
+        )
+        .unwrap();
+        assert!(ech_applied);
     }
 
     #[test]

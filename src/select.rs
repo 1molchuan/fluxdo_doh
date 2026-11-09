@@ -329,9 +329,11 @@ impl SelectState {
             return None;
         }
         let now = now_unix();
-        state
-            .ech_keys
-            .retain(|key| now.saturating_sub(key.seen_at) < ECH_KEY_MAX_AGE_SECS);
+        // 用不了的钥匙（旧版把握手失败的占位当新钥匙存了下来）读回时就丢掉
+        state.ech_keys.retain(|key| {
+            now.saturating_sub(key.seen_at) < ECH_KEY_MAX_AGE_SECS
+                && key.bytes().is_some_and(|bytes| ech_key_usable(bytes.as_ref()))
+        });
         Some(state)
     }
 }
@@ -489,6 +491,26 @@ fn now_unix() -> u64 {
 
 fn holder() -> &'static parking_lot::RwLock<Option<Arc<Selector>>> {
     SELECTOR.get_or_init(|| parking_lot::RwLock::new(None))
+}
+
+/// 这串字节能不能当 ECH 钥匙用：ECHConfigList 语法完整（不多不少），且至少有一份认识的版本。
+///
+/// 服务端给的新钥匙、落盘读回的钥匙都先过这一关。BoringSSL 在握手不是因 ECH 被拒而失败时
+/// 去取 retry_configs，会故意拿到一段解析不了的占位（fe0d ffffff）；这种东西进了钥匙池，
+/// 之后每次按浏览器指纹握手都在构造阶段就失败（INVALID_ECH_CONFIG_LIST）
+pub(crate) fn ech_key_usable(key: &[u8]) -> bool {
+    use rustls::internal::msgs::codec::{Codec, Reader};
+    use rustls::internal::msgs::handshake::EchConfigPayload;
+    let mut reader = Reader::init(key);
+    match Vec::<EchConfigPayload>::read(&mut reader) {
+        Ok(configs) => {
+            !reader.any_left()
+                && configs
+                    .iter()
+                    .any(|config| matches!(config, EchConfigPayload::V18(_)))
+        }
+        Err(_) => false,
+    }
 }
 
 /// 钥匙的可记日志描述：各条目的 config_id 与 public_name（不含钥匙字节）
@@ -1011,8 +1033,17 @@ impl Selector {
             .collect()
     }
 
-    /// 把一把钥匙放到池首（去重、截断），并通知 App 落盘
+    /// 把一把钥匙放到池首（去重、截断），并通知 App 落盘；用不了的钥匙不收
     pub fn adopt_ech_key(&self, key: &EchConfigListBytes<'static>, source: EchKeySource) {
+        if !ech_key_usable(key.as_ref()) {
+            warn!(
+                "select: ech key not adopted ({} bytes, source {:?}, {})",
+                key.as_ref().len(),
+                source,
+                describe_key(key)
+            );
+            return;
+        }
         let changed = {
             let mut inner = self.inner.lock();
             let b64 = STANDARD.encode(key.as_ref());
@@ -2026,8 +2057,16 @@ impl Selector {
         (candidates, self.key_pool())
     }
 
-    /// 把钥匙追加到池尾（持久化的在前），去重、截断
+    /// 把钥匙追加到池尾（持久化的在前），去重、截断；用不了的钥匙不收
     fn append_ech_key(&self, key: &EchConfigListBytes<'static>, source: EchKeySource) {
+        if !ech_key_usable(key.as_ref()) {
+            warn!(
+                "select: ech key not added (source {:?}, {})",
+                source,
+                describe_key(key)
+            );
+            return;
+        }
         let mut inner = self.inner.lock();
         let b64 = STANDARD.encode(key.as_ref());
         if inner.state.ech_keys.iter().any(|k| k.b64 == b64) {
@@ -2648,8 +2687,34 @@ mod tests {
         text.parse().unwrap()
     }
 
+    /// 一份结构完整的 ECHConfigList（V18，X25519 + HKDF-SHA256 / AES-128-GCM）；
+    /// config_id 与公钥都取 `byte`，不同的 byte 是不同的钥匙
     fn key(byte: u8) -> EchConfigListBytes<'static> {
-        EchConfigListBytes::from(vec![0, 3, byte, byte, byte])
+        let public_name = b"cloudflare-ech.com";
+        let mut contents = vec![byte];
+        contents.extend_from_slice(&0x0020u16.to_be_bytes());
+        contents.extend_from_slice(&32u16.to_be_bytes());
+        contents.extend_from_slice(&[byte; 32]);
+        contents.extend_from_slice(&4u16.to_be_bytes());
+        contents.extend_from_slice(&0x0001u16.to_be_bytes());
+        contents.extend_from_slice(&0x0001u16.to_be_bytes());
+        contents.push(0);
+        contents.push(public_name.len() as u8);
+        contents.extend_from_slice(public_name);
+        contents.extend_from_slice(&0u16.to_be_bytes());
+        let mut config = 0xfe0du16.to_be_bytes().to_vec();
+        config.extend_from_slice(&(contents.len() as u16).to_be_bytes());
+        config.extend_from_slice(&contents);
+        let mut list = (config.len() as u16).to_be_bytes().to_vec();
+        list.extend_from_slice(&config);
+        EchConfigListBytes::from(list)
+    }
+
+    /// BoringSSL 在握手不是因 ECH 被拒而失败时，SSL_get0_ech_retry_configs 给的占位
+    const BORINGSSL_RETRY_PLACEHOLDER: [u8; 5] = [0xfe, 0x0d, 0xff, 0xff, 0xff];
+
+    fn placeholder_key() -> EchConfigListBytes<'static> {
+        EchConfigListBytes::from(BORINGSSL_RETRY_PLACEHOLDER.to_vec())
     }
 
     fn outcome(ip: IpAddr, ok: bool, ms: u64, failure: Option<ProbeFailure>) -> ProbeOutcome {
@@ -2842,6 +2907,44 @@ mod tests {
         // 版本不对的状态丢弃
         assert!(SelectState::from_json(r#"{"v":2}"#).is_none());
         assert!(SelectState::from_json("not json").is_none());
+    }
+
+    #[test]
+    fn ech_key_usable_only_accepts_complete_lists() {
+        assert!(ech_key_usable(key(1).as_ref()));
+        assert!(!ech_key_usable(&BORINGSSL_RETRY_PLACEHOLDER));
+        assert!(!ech_key_usable(&[]));
+        // 空列表、长度对但内容不是 ECHConfig、末尾多出字节
+        assert!(!ech_key_usable(&[0, 0]));
+        assert!(!ech_key_usable(&[0, 3, 1, 1, 1]));
+        let mut trailing = key(1).as_ref().to_vec();
+        trailing.push(0);
+        assert!(!ech_key_usable(&trailing));
+    }
+
+    #[test]
+    fn unusable_persisted_keys_are_dropped_on_load() {
+        // 旧版把握手失败的占位当新钥匙采纳并落了盘
+        let mut state = state_with_key(1);
+        state
+            .ech_keys
+            .insert(0, EchKey::new(&placeholder_key(), EchKeySource::RetryConfigs));
+        let back = SelectState::from_json(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(back.ech_keys.len(), 1);
+        assert_eq!(back.ech_keys[0].bytes().unwrap().as_ref(), key(1).as_ref());
+    }
+
+    #[tokio::test]
+    async fn unusable_key_is_never_adopted() {
+        let selector = fake_selector(
+            SelectMode::LocalAtlas,
+            state_with_key(1),
+            Arc::new(|ip, _| outcome(ip, true, 50, None)),
+        );
+        selector.adopt_ech_key(&placeholder_key(), EchKeySource::RetryConfigs);
+        selector.append_ech_key(&placeholder_key(), EchKeySource::Table);
+        assert_eq!(selector.key_pool().len(), 1);
+        assert_eq!(selector.current_ech_key().unwrap().as_ref(), key(1).as_ref());
     }
 
     #[tokio::test]

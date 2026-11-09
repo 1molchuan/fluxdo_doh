@@ -534,9 +534,9 @@ pub extern "C" fn doh_proxy_adopt_ech_config(
                 .decode(value.trim())
                 .map_err(|e| e.to_string())
         }) {
-        Ok(bytes) if !bytes.is_empty() => bytes,
-        Ok(_) => {
-            tracing::warn!("adopt_ech_config: empty key");
+        Ok(bytes) if crate::select::ech_key_usable(&bytes) => bytes,
+        Ok(bytes) => {
+            tracing::warn!("adopt_ech_config: unusable key ({} bytes)", bytes.len());
             return 0;
         }
         Err(message) => {
