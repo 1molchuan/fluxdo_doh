@@ -435,12 +435,20 @@ impl DohTlsConnector {
             }
         }
 
-        // 回退系统 DNS（enable_doh=false 或 DoH 不可用）
-        let stream = tokio::time::timeout(self.timeout, TcpStream::connect((host, port)))
-            .await
-            .map_err(|_| DohProxyError::Timeout)?
-            .map_err(DohProxyError::Io)?;
-        let _ = stream.set_nodelay(true);
+        // 回退系统 DNS（enable_doh=false 或 DoH 不可用）：解析出的地址两族交替赛跑，
+        // 不让一个连不通的地址（典型是坏掉的 IPv6）把整条连接拖到超时
+        let addrs = self.system_lookup_ip(host, port).await?;
+        let plan = interleave_ip_families(addrs)
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect();
+        let outcome = race_staggered(plan, RACE_STAGGER, RACE_STAGGER, |addr| async move {
+            timed_tcp_connect(addr, ATTEMPT_TCP_TIMEOUT)
+                .await
+                .inspect_err(|e| debug!("TCP connect to {} failed: {}", addr, e))
+        })
+        .await;
+        let (stream, _, _) = outcome.result?;
         Ok(Box::new(stream))
     }
 
@@ -695,7 +703,8 @@ impl DohTlsConnector {
             .map_err(|_| DohProxyError::InvalidUrl(format!("Invalid server name: {}", host)))?;
 
         if !self.enable_doh {
-            info!(
+            // 不开 DoH 的网关每条上游连接都走这里，按连接打 info 太吵
+            debug!(
                 "DoH disabled for {}, using upstream/direct tunnel only",
                 host
             );
@@ -1131,6 +1140,23 @@ fn race_head_start(rtt: Option<Duration>) -> Duration {
         .unwrap_or(HEAD_START_DEFAULT)
 }
 
+/// 系统解析结果按 Happy Eyeballs 排：保持解析器给的顺序，从第一个地址的地址族起两族交替
+fn interleave_ip_families(addrs: Vec<IpAddr>) -> Vec<IpAddr> {
+    let Some(lead_v6) = addrs.first().map(IpAddr::is_ipv6) else {
+        return addrs;
+    };
+    let (lead, other): (Vec<IpAddr>, Vec<IpAddr>) =
+        addrs.into_iter().partition(|ip| ip.is_ipv6() == lead_v6);
+    let (mut lead, mut other) = (lead.into_iter(), other.into_iter());
+    let mut plan = Vec::new();
+    loop {
+        match (lead.next(), other.next()) {
+            (None, None) => return plan,
+            (a, b) => plan.extend(a.into_iter().chain(b)),
+        }
+    }
+}
+
 /// 赛跑赢下的连接
 struct Won {
     stream: UpstreamTls,
@@ -1294,6 +1320,38 @@ mod tests {
 
     fn race_addr(n: u8) -> SocketAddr {
         SocketAddr::new(IpAddr::from([192, 0, 2, n]), 443)
+    }
+
+    /// 系统解析结果从第一个地址的族起两族交替，同族内保持解析器给的顺序
+    #[test]
+    fn system_dns_plan_alternates_families_from_the_first() {
+        let v4 = |n: u8| IpAddr::from([192, 0, 2, n]);
+        let v6 = |n: u16| IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, n]);
+        assert_eq!(
+            interleave_ip_families(vec![v6(1), v6(2), v6(3), v4(1)]),
+            vec![v6(1), v4(1), v6(2), v6(3)]
+        );
+        assert_eq!(
+            interleave_ip_families(vec![v4(1), v4(2), v6(1), v6(2)]),
+            vec![v4(1), v6(1), v4(2), v6(2)]
+        );
+        assert_eq!(interleave_ip_families(vec![v4(1), v4(2)]), vec![v4(1), v4(2)]);
+        assert!(interleave_ip_families(Vec::new()).is_empty());
+    }
+
+    /// 不开 DoH 时按系统 DNS 连：解析出多个地址，连不通的不挡住能连的
+    #[tokio::test]
+    async fn system_dns_fallback_skips_unreachable_addresses() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((_stream, _)) = listener.accept().await {}
+        });
+        let connector = DohTlsConnector::new(None, false, Duration::from_secs(2), None, None);
+        let started = std::time::Instant::now();
+        assert!(connector.connect_tcp("localhost", port).await.is_ok());
+        // localhost 常解析出 ::1 与 127.0.0.1，监听只在 IPv4：不能等满单个地址的超时
+        assert!(started.elapsed() < ATTEMPT_TCP_TIMEOUT);
     }
 
     /// 尝试被中止（future 被丢弃）时计数
