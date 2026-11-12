@@ -61,7 +61,10 @@ impl DohProxyServer {
                 config.doh_server
             );
         } else if config.gateway_mode {
-            info!("Creating local proxy in gateway mode without DoH (system DNS, no ECH)");
+            info!(
+                "Creating local proxy in gateway mode without DoH (system DNS, no ECH, WebView MITM: {})",
+                config.mitm_connect
+            );
         } else {
             info!("Creating local proxy in pure upstream tunnel mode");
         }
@@ -158,8 +161,10 @@ impl DohProxyServer {
             None => info!("select: disabled (mode {})", config.select_mode),
         }
 
-        // gateway 模式下仍需要 cert_manager：WebView 通过 CONNECT 走 MITM
-        let cert_manager = if config.enable_doh {
+        // gateway 模式下仍需要 cert_manager：WebView 通过 CONNECT 走 MITM。不开 DoH 的网关
+        // （VPN 让路时为浏览器指纹起的）要中转内置网页时也要：WebView 的 ClientHello、h2 前言、
+        // fetch 头顺序只有 MITM 才采得到，CF 看到的内置网页和原生请求才是同一个指纹
+        let cert_manager = if config.enable_doh || (config.gateway_mode && config.mitm_connect) {
             let cm = if let (Some(cert), Some(key)) = (&config.ca_cert_pem, &config.ca_key_pem) {
                 CertManager::from_pem(cert, key, config.h2_mitm)? // 运行时 CA（per-device）
             } else {
@@ -1295,14 +1300,28 @@ mod tests {
         assert_eq!(gateway_parse_host("[::1]:8080"), Some(("::1".to_string(), 8080)));
     }
 
-    /// 不开 DoH 的网关（App 在 VPN 让路时只为指纹起的那种）照样按浏览器指纹握手；
-    /// 没有证书管理器，内置网页的 CONNECT 一律走隧道
+    /// 不开 DoH 的网关（App 在 VPN 让路时为浏览器指纹起的那种）照样按浏览器指纹握手；
+    /// 要中转内置网页（mitm_connect）才建证书管理器，否则内置网页的 CONNECT 一律走隧道
     #[cfg(feature = "browser-tls")]
     #[tokio::test]
     async fn gateway_without_doh_keeps_browser_fingerprint() {
+        let relay = super::DohProxyServer::new(crate::ProxyConfig {
+            enable_doh: false,
+            gateway_mode: true,
+            mitm_connect: true,
+            browser_tls: true,
+            select_mode: "off".to_string(),
+            ..crate::ProxyConfig::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(relay.fingerprint_status()["enabled"], true);
+        assert!(relay.cert_manager().is_some());
+
         let server = super::DohProxyServer::new(crate::ProxyConfig {
             enable_doh: false,
             gateway_mode: true,
+            mitm_connect: false,
             browser_tls: true,
             select_mode: "off".to_string(),
             ..crate::ProxyConfig::default()
