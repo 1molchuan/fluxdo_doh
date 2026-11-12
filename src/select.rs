@@ -59,6 +59,12 @@ const VENDOR_MAX_PER_DOMAIN: usize = 4;
 /// 大厂域名 / 社区域名各自的总配额，给随机抽样留位置
 const VENDOR_MAX_TOTAL: usize = 10;
 const COMMUNITY_MAX_TOTAL: usize = 4;
+/// 自定义节点：清单最多收几条
+pub const CUSTOM_MAX_ENTRIES: usize = 8;
+/// 自定义节点一轮最多几个候选（不超过探测并发：全在首批里起跑，都不通也只多等一次建连超时）
+const CUSTOM_MAX_CANDIDATES: usize = 8;
+/// 自定义节点在这个网络上都没通过、或被实际流量打掉之后，隔多久再给它们优先
+const CUSTOM_RETRY_SECS: u64 = 3600;
 /// 随机抽样的 v4 / v6 个数；首选 IPv6 时 v6 多抽些
 const RANDOM_V4_SAMPLES: usize = 12;
 const RANDOM_V6_SAMPLES: usize = 4;
@@ -247,6 +253,8 @@ pub enum EchKeySource {
 #[serde(rename_all = "snake_case")]
 pub enum CandidateSource {
     Sticky,
+    /// 用户自己填的节点：有通过的就只在它们里挑赢家（见 [`Selector::race_with`]）
+    Custom,
     Atlas,
     Vendor,
     Community,
@@ -320,6 +328,15 @@ pub struct SelectState {
     /// 自动 / IPv6 优先：最近一次不受亲和约束、按 IPv6 偏好跑完的竞速结论
     #[serde(default)]
     pub family_check: Option<FamilyCheck>,
+    /// 自定义节点最近一次参与竞速的结论
+    #[serde(default)]
+    pub custom_check: Option<CustomCheck>,
+    /// 被实际流量打掉的自定义节点（见 [`PinListener::winner_failed`]）
+    #[serde(default)]
+    pub custom_demoted: Vec<CustomDemotion>,
+    /// 赢家是自定义节点时，它出自清单里的哪一条（原文）：那一条被拿掉了就不再用它
+    #[serde(default)]
+    pub custom_entry: Option<String>,
 }
 
 impl SelectState {
@@ -343,6 +360,209 @@ impl SelectState {
 pub struct Candidate {
     pub ip: IpAddr,
     pub source: CandidateSource,
+}
+
+/// 自定义节点清单里的一条
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CustomEntry {
+    Ip(IpAddr),
+    /// 优选域名（小写），竞速前经公共 DoH 解析
+    Domain(String),
+}
+
+/// 用户自己填的 Cloudflare 节点（IP 或优选域名）。随启动配置来，运行期不变——清单改了
+/// 由 App 重启网关。只收 Cloudflare 网段里的地址：别的地址是第三方中转，论坛看到的出口
+/// 就不是本机了，那是上游代理的事
+#[derive(Clone, Debug, Default)]
+pub struct CustomNodes {
+    /// (原文, 解析结果)，已去重、截断到 [`CUSTOM_MAX_ENTRIES`]
+    entries: Vec<(String, CustomEntry)>,
+    /// 写法不对（既不是 IP 也不是域名）的原文
+    invalid: Vec<String>,
+}
+
+impl CustomNodes {
+    pub fn parse(raw: &[String]) -> Self {
+        let mut out = Self::default();
+        for text in raw {
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            let Some(entry) = Self::parse_entry(text) else {
+                if !out.invalid.iter().any(|seen| seen == text) {
+                    out.invalid.push(text.to_string());
+                }
+                continue;
+            };
+            if out.entries.iter().any(|(_, seen)| *seen == entry) {
+                continue;
+            }
+            if out.entries.len() < CUSTOM_MAX_ENTRIES {
+                out.entries.push((text.to_string(), entry));
+            }
+        }
+        out
+    }
+
+    /// 认 `1.2.3.4`、`2606:4700::1`、`[2606:4700::1]`、`cf.example.com`，以及它们带 `:443` 的写法。
+    /// 别的端口网关用不上（只连 443），算写错
+    fn parse_entry(text: &str) -> Option<CustomEntry> {
+        let unbracket = |s: &str| {
+            s.strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .and_then(|s| s.parse::<std::net::Ipv6Addr>().ok())
+                .map(|ip| CustomEntry::Ip(IpAddr::V6(ip)))
+        };
+        if let Ok(ip) = text.parse::<IpAddr>() {
+            return Some(CustomEntry::Ip(ip));
+        }
+        if text.starts_with('[') {
+            return unbracket(text).or_else(|| text.strip_suffix(":443").and_then(unbracket));
+        }
+        let host = text.strip_suffix(":443").unwrap_or(text);
+        if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+            return Some(CustomEntry::Ip(IpAddr::V4(ip)));
+        }
+        let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+        Self::valid_domain(&host).then_some(CustomEntry::Domain(host))
+    }
+
+    fn valid_domain(host: &str) -> bool {
+        let labels: Vec<&str> = host.split('.').collect();
+        host.len() <= 253
+            && labels.len() >= 2
+            && labels.iter().all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+            // 末段全是数字的是写坏了的 IP（如 `1.2.3`、`300.1.1.1`），不当域名去查
+            && labels
+                .last()
+                .is_some_and(|tld| !tld.bytes().all(|b| b.is_ascii_digit()))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn domains(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter_map(|(_, entry)| match entry {
+                CustomEntry::Domain(name) => Some(name.clone()),
+                CustomEntry::Ip(_) => None,
+            })
+            .collect()
+    }
+
+    /// 清单里在 Cloudflare 网段内的字面 IP
+    fn cloudflare_ips(&self) -> impl Iterator<Item = IpAddr> + '_ {
+        self.entries.iter().filter_map(|(_, entry)| match entry {
+            CustomEntry::Ip(ip) if cfnet::is_cloudflare(*ip) => Some(*ip),
+            _ => None,
+        })
+    }
+
+    /// 清单 + IP 协议偏好的指纹：两者任一变了，之前的结论就不算数
+    fn fingerprint(&self, family: FamilyPref) -> String {
+        let items: Vec<String> = self
+            .entries
+            .iter()
+            .map(|(_, entry)| match entry {
+                CustomEntry::Ip(ip) => ip.to_string(),
+                CustomEntry::Domain(name) => name.clone(),
+            })
+            .collect();
+        format!("{}|{}", family.wire(), items.join(","))
+    }
+}
+
+/// 一条自定义节点的结论
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CustomState {
+    /// 探测通过
+    Ok,
+    /// 探了，没通过（`detail` 是失败类型）
+    Failed,
+    /// 不在 Cloudflare 网段，不用
+    NotCloudflare,
+    /// 本机没有这一族的出口（如只有 IPv4 的网络上填了 IPv6）
+    NoFamily,
+    /// 用着的时候连不上被换掉了，暂时不再优先
+    Demoted,
+    /// 域名没解析出 Cloudflare 地址
+    Unresolved,
+    /// 写法不对
+    Invalid,
+    /// 还没测过
+    Pending,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomResult {
+    /// 清单里的原文
+    pub entry: String,
+    pub state: CustomState,
+    /// 通过的（域名取最快的那个）或探过的地址
+    #[serde(default)]
+    pub ip: Option<IpAddr>,
+    #[serde(default)]
+    pub latency_ms: Option<u32>,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+/// 自定义节点最近一次参与竞速的结论
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomCheck {
+    /// 那时的清单指纹（见 [`CustomNodes::fingerprint`]）
+    pub list: String,
+    /// 那次竞速时的网络签名
+    #[serde(default)]
+    pub sig: Option<String>,
+    pub at: u64,
+    /// 那次有自定义节点通过
+    pub ok: bool,
+    #[serde(default)]
+    pub results: Vec<CustomResult>,
+}
+
+/// 被实际流量打掉的自定义节点：[`CUSTOM_RETRY_SECS`] 内不再进候选
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomDemotion {
+    pub ip: IpAddr,
+    pub at: u64,
+}
+
+/// 一轮竞速里某条自定义节点对应哪些候选；`skip` 是没进候选的原因
+#[derive(Clone, Debug)]
+struct CustomPlanItem {
+    entry: String,
+    ips: Vec<IpAddr>,
+    skip: Option<CustomState>,
+}
+
+/// 探测失败的类型（日志汇总、自定义节点的结论里用）
+fn failure_kind(failure: Option<&ProbeFailure>) -> String {
+    match failure {
+        Some(ProbeFailure::Tls(_)) => "tls".to_string(),
+        Some(ProbeFailure::Http(_)) => "http".to_string(),
+        Some(ProbeFailure::HttpStatus(code)) => format!("http_{}", code),
+        Some(ProbeFailure::EchRejected { retry_configs }) => {
+            if retry_configs.is_some() {
+                "ech_rejected_retry".to_string()
+            } else {
+                "ech_rejected".to_string()
+            }
+        }
+        Some(other) => other.to_string().replace(' ', "_"),
+        None => "unknown".to_string(),
+    }
 }
 
 /// 公共 DoH 竞速里对单个答案的裁定
@@ -411,8 +631,10 @@ pub enum RaceTrigger {
     Network,
     Manual,
     Failed,
-    /// 赢家能用但地址族不是这里该用的：后台竞速，期间赢家照常钉住（见 spawn_family_race）
+    /// 赢家能用但地址族不是这里该用的：后台竞速，期间赢家照常钉住（见 spawn_background_race）
     Family,
+    /// 赢家能用但不是按现在的自定义节点清单挑的：同样后台竞速，自定义节点没通过就不动赢家
+    Custom,
 }
 
 struct AtlasEndpoint {
@@ -478,6 +700,11 @@ pub struct Selector {
     resolver: Option<Arc<DnsResolver>>,
     tasks: Mutex<Vec<AbortHandle>>,
     generation: AtomicU64,
+    /// 用户自己填的节点
+    custom: CustomNodes,
+    custom_fp: String,
+    /// 最近一次收集候选时，每条自定义节点对应哪些候选
+    custom_plan: Mutex<Vec<CustomPlanItem>>,
 }
 
 static SELECTOR: OnceLock<parking_lot::RwLock<Option<Arc<Selector>>>> = OnceLock::new();
@@ -548,13 +775,15 @@ fn split_url(url: &str) -> Option<(String, String)> {
     Some((host, path))
 }
 
-/// 两族交替排（首选族先），族内保持原顺序；排在最前的粘性赢家不动。
+/// 两族交替排（首选族先），族内保持原顺序；排在最前的粘性赢家和自定义节点不动。
 /// 并发探测按顺序领号，交替后首批里就有首选族，不用等另一族探完一批才轮到
 fn interleave_families(candidates: Vec<Candidate>, prefer_v6: bool) -> Vec<Candidate> {
     let mut rest = candidates.into_iter().peekable();
     let mut out = Vec::new();
-    if let Some(sticky) = rest.next_if(|c| c.source == CandidateSource::Sticky) {
-        out.push(sticky);
+    while let Some(head) = rest.next_if(|c| {
+        matches!(c.source, CandidateSource::Sticky | CandidateSource::Custom)
+    }) {
+        out.push(head);
     }
     let (preferred, other): (Vec<Candidate>, Vec<Candidate>) =
         rest.partition(|c| c.ip.is_ipv6() == prefer_v6);
@@ -676,6 +905,7 @@ impl Selector {
             report,
             resolver,
             edge,
+            CustomNodes::parse(&config.custom_nodes),
             Prober::Real,
         );
         if config.share_measurements {
@@ -691,6 +921,18 @@ impl Selector {
         atlas_routes_url: Option<&str>,
         state_json: Option<&str>,
         network_sig: Option<&str>,
+    ) -> Arc<Self> {
+        Self::standalone_custom(mode, family_pref, atlas_routes_url, state_json, network_sig, &[])
+    }
+
+    /// 同 [`Self::standalone`]，带自定义节点清单
+    pub fn standalone_custom(
+        mode: SelectMode,
+        family_pref: FamilyPref,
+        atlas_routes_url: Option<&str>,
+        state_json: Option<&str>,
+        network_sig: Option<&str>,
+        custom_nodes: &[String],
     ) -> Arc<Self> {
         let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let provider = Arc::new(crate::tls_crypto::build_provider());
@@ -713,6 +955,7 @@ impl Selector {
             None,
             None,
             Arc::new(EdgePin::new(family_pref == FamilyPref::V6)),
+            CustomNodes::parse(custom_nodes),
             Prober::Real,
         )
     }
@@ -730,8 +973,10 @@ impl Selector {
         report: Option<ReportEndpoint>,
         resolver: Option<Arc<DnsResolver>>,
         edge: Arc<EdgePin>,
+        custom: CustomNodes,
         prober: Prober,
     ) -> Arc<Self> {
+        let custom_fp = custom.fingerprint(family_pref);
         let public_doh_stats = public_doh
             .iter()
             .map(|(vendor, upstream)| PublicDohStats::new(vendor, upstream.host()))
@@ -768,6 +1013,9 @@ impl Selector {
             resolver,
             tasks: Mutex::new(Vec::new()),
             generation: AtomicU64::new(0),
+            custom,
+            custom_fp,
+            custom_plan: Mutex::new(Vec::new()),
         });
         let listener: Weak<dyn PinListener> = Arc::downgrade(&selector) as Weak<dyn PinListener>;
         selector.edge.attach(listener);
@@ -879,7 +1127,7 @@ impl Selector {
         let trigger = self.inner.lock().race_trigger;
         if !matches!(
             trigger,
-            RaceTrigger::Start | RaceTrigger::Network | RaceTrigger::Family
+            RaceTrigger::Start | RaceTrigger::Network | RaceTrigger::Family | RaceTrigger::Custom
         ) {
             if let Some(v6) = self.edge.affinity() {
                 return RaceFamily {
@@ -911,12 +1159,17 @@ impl Selector {
             .is_some_and(|check| !check.v6_ok && check.fresh_for(&inner.current_sig, now_unix()))
     }
 
-    /// 赢家的地址族不是这里该用的，校验通过后在后台再竞速一轮（见 [`Self::spawn_family_race`]）：
+    /// 赢家的地址族不是这里该用的，校验通过后在后台再竞速一轮（见 [`Self::spawn_background_race`]）：
     /// - IPv4 优先而赢家是 IPv6（从自动切回来）：本机有 IPv4 就换回去；
     /// - 自动 / IPv6 优先而赢家是 IPv4（升级到自动后首次启动、换到有 IPv6 的网络）：真换到
     ///   IPv6 出口要重新过一次盾，所以同一个网络 24 小时内只折腾一次——自动模式下这个网络上
     ///   竞速过就不再来（不论那次选了哪一族）；IPv6 优先模式下只在那次 IPv6 不通时不再来
     fn family_rerace_due(&self, winner: IpAddr) -> bool {
+        // 赢家是用户自己填的节点：选它的那一轮已经在自定义节点里按 IP 协议偏好挑过了，
+        // 再跑一轮还是它（IP 协议偏好改了由 custom_rerace_due 负责）
+        if self.winner_is_custom() {
+            return false;
+        }
         let local = self.local_family();
         if self.family_pref == FamilyPref::V4 {
             return winner.is_ipv6() && local.v4;
@@ -936,18 +1189,272 @@ impl Selector {
         }
     }
 
+    // ---------- 自定义节点 ----------
+
+    fn winner_is_custom(&self) -> bool {
+        self.inner
+            .lock()
+            .state
+            .winner
+            .as_ref()
+            .is_some_and(|w| w.source == CandidateSource::Custom)
+    }
+
+    /// 还在降级期里的自定义节点
+    fn demoted_custom_ips(state: &SelectState, now: u64) -> Vec<IpAddr> {
+        state
+            .custom_demoted
+            .iter()
+            .filter(|d| now.saturating_sub(d.at) < CUSTOM_RETRY_SECS)
+            .map(|d| d.ip)
+            .collect()
+    }
+
+    /// 启动时把持久化状态和现在的清单对一遍：清单（或 IP 协议偏好）变了，旧的降级记录作废；
+    /// 赢家是自定义节点、而它出自的那一条已经从清单里拿掉了，就不再用它
+    fn reconcile_custom(&self) {
+        let mut inner = self.inner.lock();
+        let now = now_unix();
+        let same_list = inner
+            .state
+            .custom_check
+            .as_ref()
+            .is_some_and(|check| check.list == self.custom_fp);
+        if !same_list {
+            inner.state.custom_demoted.clear();
+        }
+        inner
+            .state
+            .custom_demoted
+            .retain(|d| now.saturating_sub(d.at) < CUSTOM_RETRY_SECS);
+        if self.custom.is_empty() {
+            inner.state.custom_check = None;
+        }
+        let custom_winner = inner
+            .state
+            .winner
+            .as_ref()
+            .filter(|w| w.source == CandidateSource::Custom)
+            .map(|w| w.ip);
+        let stale_winner = custom_winner.is_some_and(|ip| match &inner.state.custom_entry {
+            Some(entry) => !self.custom.entries.iter().any(|(text, _)| text == entry),
+            // 没记出处：清单里没有域名时还能按地址判断
+            None => {
+                self.custom.domains().is_empty()
+                    && !self.custom.cloudflare_ips().any(|listed| listed == ip)
+            }
+        });
+        if stale_winner {
+            info!("select: persisted winner was a custom node that is no longer listed, dropped");
+            inner.state.winner = None;
+        }
+        if stale_winner || custom_winner.is_none() {
+            inner.state.custom_entry = None;
+        }
+    }
+
+    /// 配了自定义节点、而现在的赢家不是按这份清单挑出来的：校验通过后在后台再竞速一轮
+    /// （见 [`Self::spawn_background_race`]）。清单或 IP 协议偏好变了总要重来；赢家已经是
+    /// 自定义节点就不折腾；这个网络上一小时内验过它们都不通、或者它们都在降级期里，也先不来
+    fn custom_rerace_due(&self) -> bool {
+        let has_domains = !self.custom.domains().is_empty();
+        if !has_domains && self.custom.cloudflare_ips().next().is_none() {
+            return false;
+        }
+        let now = now_unix();
+        let inner = self.inner.lock();
+        let Some(check) = inner
+            .state
+            .custom_check
+            .as_ref()
+            .filter(|check| check.list == self.custom_fp)
+        else {
+            return true;
+        };
+        if inner
+            .state
+            .winner
+            .as_ref()
+            .is_some_and(|w| w.source == CandidateSource::Custom)
+        {
+            return false;
+        }
+        if !check.ok
+            && check.sig == inner.current_sig
+            && now.saturating_sub(check.at) < CUSTOM_RETRY_SECS
+        {
+            return false;
+        }
+        let demoted = Self::demoted_custom_ips(&inner.state, now);
+        has_domains || self.custom.cloudflare_ips().any(|ip| !demoted.contains(&ip))
+    }
+
+    /// 这一轮要不要等自定义节点出结果再收敛：这个网络上一小时内刚验过它们都不通就不等
+    /// （照样探测，赶在收敛前通过仍然算数）；手动重新优选总是等
+    fn custom_worth_waiting(&self) -> bool {
+        let inner = self.inner.lock();
+        if inner.race_trigger == RaceTrigger::Manual {
+            return true;
+        }
+        !inner.state.custom_check.as_ref().is_some_and(|check| {
+            !check.ok
+                && check.list == self.custom_fp
+                && check.sig == inner.current_sig
+                && now_unix().saturating_sub(check.at) < CUSTOM_RETRY_SECS
+        })
+    }
+
+    /// 按最近一次收集候选时的对应关系，把探测结果归到清单的每一条上。`timed_out`：这一轮
+    /// 跑满了总时限——到那时还没出结果的就是超时；提前收敛时没出结果的只是没等它
+    fn custom_results(&self, outcomes: &[ProbeOutcome], timed_out: bool) -> Vec<CustomResult> {
+        let plan = self.custom_plan.lock().clone();
+        plan.into_iter()
+            .map(|item| {
+                if let Some(state) = item.skip {
+                    return CustomResult {
+                        entry: item.entry,
+                        state,
+                        ip: None,
+                        latency_ms: None,
+                        detail: None,
+                    };
+                }
+                let probed: Vec<&ProbeOutcome> = outcomes
+                    .iter()
+                    .filter(|o| item.ips.contains(&o.ip))
+                    .collect();
+                match probed.iter().filter(|o| o.ok).min_by_key(|o| o.latency) {
+                    Some(best) => CustomResult {
+                        entry: item.entry,
+                        state: CustomState::Ok,
+                        ip: Some(best.ip),
+                        latency_ms: Some(best.latency.as_millis().min(u32::MAX as u128) as u32),
+                        detail: None,
+                    },
+                    None => match probed.first() {
+                        Some(outcome) => CustomResult {
+                            entry: item.entry,
+                            state: CustomState::Failed,
+                            ip: Some(outcome.ip),
+                            latency_ms: None,
+                            detail: Some(failure_kind(outcome.failure.as_ref())),
+                        },
+                        None if timed_out => CustomResult {
+                            entry: item.entry,
+                            state: CustomState::Failed,
+                            ip: item.ips.first().copied(),
+                            latency_ms: None,
+                            detail: Some("timeout".to_string()),
+                        },
+                        // 提前收敛时还没出结果（比通过的那个慢）：不算失败，留到下次重测
+                        None => CustomResult {
+                            entry: item.entry,
+                            state: CustomState::Pending,
+                            ip: item.ips.first().copied(),
+                            latency_ms: None,
+                            detail: None,
+                        },
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// 状态里的自定义节点一节：清单每一条现在是什么情况。没配返回 null
+    fn custom_status(&self, inner: &Inner) -> serde_json::Value {
+        if self.custom.entries.is_empty() && self.custom.invalid.is_empty() {
+            return serde_json::Value::Null;
+        }
+        let now = now_unix();
+        let check = inner
+            .state
+            .custom_check
+            .as_ref()
+            .filter(|check| check.list == self.custom_fp);
+        let demoted = Self::demoted_custom_ips(&inner.state, now);
+        // 正钉着的赢家是自定义节点（校验中、网络没变时也算在用）
+        let pinned = matches!(Self::pin_of(inner), Pin::Winner(_));
+        let active = inner
+            .state
+            .winner
+            .as_ref()
+            .filter(|w| w.source == CandidateSource::Custom && pinned)
+            .map(|w| (w.ip, w.latency_ms));
+        let mut nodes: Vec<serde_json::Value> = Vec::new();
+        for (text, entry) in &self.custom.entries {
+            let tested = check.and_then(|check| check.results.iter().find(|r| r.entry == *text));
+            let mut result = match entry {
+                CustomEntry::Ip(ip) if !cfnet::is_cloudflare(*ip) => CustomResult {
+                    entry: text.clone(),
+                    state: CustomState::NotCloudflare,
+                    ip: None,
+                    latency_ms: None,
+                    detail: None,
+                },
+                CustomEntry::Ip(ip) if demoted.contains(ip) => CustomResult {
+                    entry: text.clone(),
+                    state: CustomState::Demoted,
+                    ip: Some(*ip),
+                    latency_ms: None,
+                    detail: None,
+                },
+                // 上一轮记的「暂时停用」过了降级期就不算数了，等下一轮重测
+                _ => tested
+                    .filter(|result| result.state != CustomState::Demoted)
+                    .cloned()
+                    .unwrap_or(CustomResult {
+                        entry: text.clone(),
+                        state: CustomState::Pending,
+                        ip: None,
+                        latency_ms: None,
+                        detail: None,
+                    }),
+            };
+            // 正用着的那条：延迟以赢家最近一次校验为准
+            let in_use = match (active, entry) {
+                (Some((winner, _)), CustomEntry::Ip(ip)) => winner == *ip,
+                (Some((winner, _)), CustomEntry::Domain(_)) => result.ip == Some(winner),
+                (None, _) => false,
+            };
+            if let (true, Some((winner, latency))) = (in_use, active) {
+                result.state = CustomState::Ok;
+                result.ip = Some(winner);
+                result.latency_ms = Some(latency);
+                result.detail = None;
+            }
+            let mut value = serde_json::to_value(&result).unwrap_or_default();
+            if let Some(map) = value.as_object_mut() {
+                map.insert("active".to_string(), serde_json::Value::Bool(in_use));
+            }
+            nodes.push(value);
+        }
+        for text in &self.custom.invalid {
+            nodes.push(serde_json::json!({
+                "entry": text,
+                "state": CustomState::Invalid,
+                "active": false,
+            }));
+        }
+        serde_json::json!({
+            "nodes": nodes,
+            "checked_at": check.map(|check| check.at),
+        })
+    }
+
     // ---------- 启动 / 状态 ----------
 
     /// 启动：有持久化赢家先校验，否则直接竞速
     pub fn start(self: &Arc<Self>) {
+        self.reconcile_custom();
         let (winner, sig) = {
             let inner = self.inner.lock();
             (inner.state.winner.clone(), inner.current_sig.clone())
         };
         info!(
-            "select: start mode={} family={} persisted_winner={} keys={} sig={}",
+            "select: start mode={} family={} custom_nodes={} persisted_winner={} keys={} sig={}",
             self.mode.wire(),
             self.family_pref.wire(),
+            self.custom.entries.len(),
             winner
                 .as_ref()
                 .map(|w| w.ip.to_string())
@@ -1113,6 +1620,9 @@ impl Selector {
             "share": self.share.load(Ordering::Relaxed),
             "keys": inner.state.ech_keys.len(),
             "network_sig": inner.current_sig,
+            "custom": self.custom_status(&inner),
+            // 正在竞速或校验（含不改阶段的后台竞速），界面用来显示「正在测试」
+            "busy": self.racing.load(Ordering::Acquire),
             "public_doh": self
                 .public_doh_stats
                 .iter()
@@ -1188,6 +1698,8 @@ impl Selector {
                     return false;
                 }
                 inner.last_manual_race = Some(Instant::now());
+                // 手动点的就是要重测：被换掉的自定义节点也重新给机会
+                inner.state.custom_demoted.clear();
             }
             self.spawn_race(RaceTrigger::Manual)
         } else {
@@ -1263,8 +1775,9 @@ impl Selector {
         true
     }
 
-    /// 校验持久化赢家：通过 → Ready（地址族不是这里该用的就再后台竞速一轮，见
-    /// [`Self::family_rerace_due`]），失败 → 竞速。`trigger` 是改为竞速时的发车原因
+    /// 校验持久化赢家：通过 → Ready（地址族不是这里该用的、或者配了自定义节点而赢家不是
+    /// 按这份清单挑的，就再后台竞速一轮，见 [`Self::family_rerace_due`] /
+    /// [`Self::custom_rerace_due`]），失败 → 竞速。`trigger` 是改为竞速时的发车原因
     fn spawn_verify(self: &Arc<Self>, trigger: RaceTrigger) {
         if self
             .racing
@@ -1330,7 +1843,10 @@ impl Selector {
                     }
                     if selector.family_rerace_due(winner.ip) {
                         drop(guard);
-                        selector.spawn_family_race();
+                        selector.spawn_background_race(RaceTrigger::Family);
+                    } else if selector.custom_rerace_due() {
+                        drop(guard);
+                        selector.spawn_background_race(RaceTrigger::Custom);
                     }
                 }
                 other => {
@@ -1348,10 +1864,10 @@ impl Selector {
         self.track(handle);
     }
 
-    /// 后台换族竞速：当前赢家照常钉住、阶段不变，解析不用等；出了结果再换过去，
-    /// 一个都没通过就当没发生过。先不动赢家是因为它的出口上铸着 cf_clearance——
+    /// 后台竞速（换族 / 试自定义节点）：当前赢家照常钉住、阶段不变，解析不用等；出了结果
+    /// 再换过去，一个都没通过就当没发生过。先不动赢家是因为它的出口上铸着 cf_clearance——
     /// 竞速要是还选它这一族，就不必为换族多过一次盾
-    fn spawn_family_race(self: &Arc<Self>) {
+    fn spawn_background_race(self: &Arc<Self>, trigger: RaceTrigger) {
         if self
             .racing
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1359,11 +1875,15 @@ impl Selector {
         {
             return;
         }
-        self.inner.lock().race_trigger = RaceTrigger::Family;
-        info!(
-            "select: winner's address family is not the preferred one here (family={}), racing in background",
-            self.family_pref.wire()
-        );
+        self.inner.lock().race_trigger = trigger;
+        if trigger == RaceTrigger::Custom {
+            info!("select: winner was not picked from the custom nodes, racing in background");
+        } else {
+            info!(
+                "select: winner's address family is not the preferred one here (family={}), racing in background",
+                self.family_pref.wire()
+            );
+        }
         let selector = self.clone();
         let generation = self.generation.load(Ordering::Acquire);
         let handle = tokio::spawn(async move {
@@ -1377,12 +1897,13 @@ impl Selector {
         self.track(handle);
     }
 
-    /// 一轮没出赢家：后台换族竞速当没发生过（当前赢家照常用），否则转 Failed
+    /// 一轮没出赢家：后台竞速当没发生过（当前赢家照常用），否则转 Failed
     fn race_failed(&self, reason: &str) {
-        if self.inner.lock().race_trigger == RaceTrigger::Family {
+        let trigger = self.inner.lock().race_trigger;
+        if matches!(trigger, RaceTrigger::Family | RaceTrigger::Custom) {
             warn!(
-                "select: background family race found no winner ({}), keeping the current one",
-                reason
+                "select: background race ({:?}) found no winner ({}), keeping the current one",
+                trigger, reason
             );
             return;
         }
@@ -1671,6 +2192,17 @@ impl Selector {
 
     /// 解析域名的 A/AAAA（按本机地址族），做投毒检查，返回去重后的 CF 地址
     async fn resolve_cf_domain(self: &Arc<Self>, name: &str, family: cfnet::FamilySupport) -> Vec<IpAddr> {
+        self.resolve_cf_domain_with(name, family, false).await
+    }
+
+    /// 同上；`keep_own` 为 true 时不丢 Cloudflare 自家资产段的地址（自定义节点：用户点名要的，
+    /// 能不能用交给探测）
+    async fn resolve_cf_domain_with(
+        self: &Arc<Self>,
+        name: &str,
+        family: cfnet::FamilySupport,
+        keep_own: bool,
+    ) -> Vec<IpAddr> {
         let mut types = Vec::new();
         if family.v4 {
             types.push(RecordType::A);
@@ -1717,12 +2249,33 @@ impl Selector {
                 continue;
             }
             for ip in answers {
-                if !out.contains(&ip) && !cfnet::is_skipped(ip) {
+                if !out.contains(&ip) && (keep_own || !cfnet::is_skipped(ip)) {
                     out.push(ip);
                 }
             }
         }
         out
+    }
+
+    /// 解析自定义节点里的域名，每个最多 [`VENDOR_MAX_PER_DOMAIN`] 个地址；结果边到边写进 `sink`
+    async fn resolve_custom_domains(
+        self: &Arc<Self>,
+        domains: Vec<String>,
+        family: cfnet::FamilySupport,
+        sink: Arc<Mutex<Vec<(String, Vec<IpAddr>)>>>,
+    ) {
+        let mut set = JoinSet::new();
+        for domain in domains {
+            let selector = self.clone();
+            let sink = sink.clone();
+            set.spawn(async move {
+                let mut ips = selector.resolve_cf_domain_with(&domain, family, true).await;
+                ips.truncate(VENDOR_MAX_PER_DOMAIN);
+                debug!("select: custom {} -> {} candidates", domain, ips.len());
+                sink.lock().push((domain, ips));
+            });
+        }
+        while set.join_next().await.is_some() {}
     }
 
     /// 查 HTTPS 记录拿 ECH 钥匙
@@ -1912,20 +2465,125 @@ impl Selector {
             .unwrap_or_default()
     }
 
+    /// 把自定义节点清单排成这一轮的候选：字面 IP 要在 Cloudflare 网段里、本机有这一族的出口、
+    /// 不在降级期；域名用解析结果。各条轮流出一个地址，凑到 [`CUSTOM_MAX_CANDIDATES`] 为止
+    /// （每条至少轮到一个）。顺手记下每条对应哪些候选，竞速完按它归结果。
+    /// `sticky` 是上次的赢家：它是自定义节点、而它出自的那个域名这一轮没解析出来时，仍当作
+    /// 那个域名的地址留下——多半是 DNS 一时没答上，别因此丢掉正用着的节点
+    fn plan_custom(
+        &self,
+        family: cfnet::FamilySupport,
+        resolved: &[(String, Vec<IpAddr>)],
+        sticky: Option<(IpAddr, CandidateSource)>,
+    ) -> Vec<IpAddr> {
+        let (demoted, winner_entry) = {
+            let inner = self.inner.lock();
+            (
+                Self::demoted_custom_ips(&inner.state, now_unix()),
+                inner.state.custom_entry.clone(),
+            )
+        };
+        let family_ok = |ip: &IpAddr| (ip.is_ipv4() && family.v4) || (ip.is_ipv6() && family.v6);
+        let mut plan: Vec<CustomPlanItem> = Vec::new();
+        // 每条能出的地址（还没按上限截）
+        let mut pools: Vec<Vec<IpAddr>> = Vec::new();
+        for (text, entry) in &self.custom.entries {
+            let (ips, skip) = match entry {
+                CustomEntry::Ip(ip) => {
+                    if !cfnet::is_cloudflare(*ip) {
+                        (Vec::new(), Some(CustomState::NotCloudflare))
+                    } else if !family_ok(ip) {
+                        (Vec::new(), Some(CustomState::NoFamily))
+                    } else if demoted.contains(ip) {
+                        (Vec::new(), Some(CustomState::Demoted))
+                    } else {
+                        (vec![*ip], None)
+                    }
+                }
+                CustomEntry::Domain(name) => {
+                    let ips: Vec<IpAddr> = resolved
+                        .iter()
+                        .find(|(domain, _)| domain == name)
+                        .map(|(_, ips)| ips.clone())
+                        .unwrap_or_default();
+                    if ips.is_empty() {
+                        (Vec::new(), Some(CustomState::Unresolved))
+                    } else {
+                        let usable: Vec<IpAddr> =
+                            ips.into_iter().filter(|ip| !demoted.contains(ip)).collect();
+                        if usable.is_empty() {
+                            (Vec::new(), Some(CustomState::Demoted))
+                        } else {
+                            (usable, None)
+                        }
+                    }
+                }
+            };
+            pools.push(ips);
+            plan.push(CustomPlanItem {
+                entry: text.clone(),
+                ips: Vec::new(),
+                skip,
+            });
+        }
+        if let Some((ip, CandidateSource::Custom)) = sticky {
+            let listed = pools.iter().any(|pool| pool.contains(&ip));
+            let usable = cfnet::is_cloudflare(ip) && family_ok(&ip) && !demoted.contains(&ip);
+            let unresolved = plan.iter().position(|item| {
+                item.skip == Some(CustomState::Unresolved)
+                    && winner_entry.as_deref() == Some(item.entry.as_str())
+            });
+            if let (false, true, Some(index)) = (listed, usable, unresolved) {
+                pools[index] = vec![ip];
+                plan[index].skip = None;
+            }
+        }
+        let mut out: Vec<IpAddr> = Vec::new();
+        let mut round = 0usize;
+        while out.len() < CUSTOM_MAX_CANDIDATES && pools.iter().any(|pool| pool.len() > round) {
+            for (index, pool) in pools.iter().enumerate() {
+                let Some(ip) = pool.get(round) else {
+                    continue;
+                };
+                if out.len() >= CUSTOM_MAX_CANDIDATES {
+                    break;
+                }
+                // 两条指到同一个地址（域名解析出了清单里已有的 IP）：两条都认这个候选
+                if !out.contains(ip) {
+                    out.push(*ip);
+                }
+                plan[index].ips.push(*ip);
+            }
+            round += 1;
+        }
+        *self.custom_plan.lock() = plan;
+        out
+    }
+
     /// 收集候选与钥匙（含超时）
     async fn gather(self: &Arc<Self>) -> (Vec<Candidate>, Vec<EchConfigListBytes<'static>>) {
         let family = self.local_family();
         let prefer_v6 = self.race_family().prefer_v6;
-        let sticky = self.inner.lock().state.winner.as_ref().map(|w| w.ip);
+        let sticky = self
+            .inner
+            .lock()
+            .state
+            .winner
+            .as_ref()
+            .map(|w| (w.ip, w.source));
         let vendor_sink: Arc<Mutex<Vec<IpAddr>>> = Arc::new(Mutex::new(Vec::new()));
         let community_sink: Arc<Mutex<Vec<IpAddr>>> = Arc::new(Mutex::new(Vec::new()));
+        let custom_sink: Arc<Mutex<Vec<(String, Vec<IpAddr>)>>> = Arc::new(Mutex::new(Vec::new()));
 
         // 候选和钥匙都边到边落：atlas 进 state.atlas 缓存、域名进 sink、钥匙进池；
         // 超时只是停止等待，不丢已经拿到的
         let gather_all = async {
             let atlas_task = self.fetch_atlas(family);
+            // 自定义节点里的域名，两种模式都解析
+            let custom_task =
+                self.resolve_custom_domains(self.custom.domains(), family, custom_sink.clone());
             if self.mode == SelectMode::AtlasOnly {
-                let _ = atlas_task.await;
+                let _ = tokio::join!(atlas_task, custom_task);
             } else {
                 let vendor_task = self.resolve_domains(
                     VENDOR_DOMAINS,
@@ -1951,7 +2609,7 @@ impl Selector {
                         }
                     }
                 };
-                tokio::join!(atlas_task, vendor_task, community_task, keys_task);
+                tokio::join!(atlas_task, vendor_task, community_task, keys_task, custom_task);
             }
         };
         if tokio::time::timeout(Duration::from_millis(SELECT_GATHER_TIMEOUT_MS), gather_all)
@@ -1968,17 +2626,29 @@ impl Selector {
         let mut seen: HashSet<IpAddr> = HashSet::new();
         let mut push = |ip: IpAddr, source: CandidateSource, candidates: &mut Vec<Candidate>| {
             let family_ok = (ip.is_ipv4() && family.v4) || (ip.is_ipv6() && family.v6);
+            // Cloudflare 自家资产段一般不服务别的站，池里的候选直接跳过；
+            // 用户点名要的自定义节点照探，能不能用由探测说了算
             if family_ok
                 && cfnet::is_cloudflare(ip)
-                && !cfnet::is_skipped(ip)
+                && (source == CandidateSource::Custom || !cfnet::is_skipped(ip))
                 && seen.insert(ip)
                 && candidates.len() < SELECT_MAX_CANDIDATES
             {
                 candidates.push(Candidate { ip, source });
             }
         };
-        if let Some(ip) = sticky {
-            push(ip, CandidateSource::Sticky, &mut candidates);
+        let custom_ips = self.plan_custom(family, &custom_sink.lock(), sticky);
+        match sticky {
+            Some((ip, _)) if custom_ips.contains(&ip) => {
+                push(ip, CandidateSource::Custom, &mut candidates)
+            }
+            // 上次的赢家是自定义节点、现在已经不在清单里了：不再当粘性候选
+            Some((_, CandidateSource::Custom)) => {}
+            Some((ip, _)) => push(ip, CandidateSource::Sticky, &mut candidates),
+            None => {}
+        }
+        for ip in custom_ips {
+            push(ip, CandidateSource::Custom, &mut candidates);
         }
         for ip in atlas_ips.into_iter().take(ATLAS_MAX_CANDIDATES) {
             push(ip, CandidateSource::Atlas, &mut candidates);
@@ -2018,9 +2688,10 @@ impl Selector {
             (vendor_n, community_n, candidates.len() - before)
         };
         info!(
-            "select: candidates total={} sticky={} atlas={} vendor={} community={} random={} (v4 {}, v6 {}, ipv6 candidates {}, prefer {})",
+            "select: candidates total={} sticky={} custom={} atlas={} vendor={} community={} random={} (v4 {}, v6 {}, ipv6 candidates {}, prefer {})",
             candidates.len(),
             candidates.iter().filter(|c| c.source == CandidateSource::Sticky).count(),
+            candidates.iter().filter(|c| c.source == CandidateSource::Custom).count(),
             candidates.iter().filter(|c| c.source == CandidateSource::Atlas).count(),
             vendor_n,
             community_n,
@@ -2145,6 +2816,20 @@ impl Selector {
         let start = Instant::now();
         let total = Duration::from_millis(SELECT_RACE_TOTAL_MS);
         let family = self.race_family();
+        let trigger = self.inner.lock().race_trigger;
+        // 自定义节点：有通过的就只在它们里挑赢家，池里的再快也不算；所以它们没出结果前先不收敛
+        let custom_ips: HashSet<IpAddr> = candidates
+            .iter()
+            .filter(|c| c.source == CandidateSource::Custom)
+            .map(|c| c.ip)
+            .collect();
+        let wait_custom = !custom_ips.is_empty() && self.custom_worth_waiting();
+        // 手动重测和后台竞速不赶时间：等自定义节点全出结果（清单里每一条都有个准话）；
+        // 其余是有请求在等的竞速，有一个通过后只再等一小会儿
+        let custom_thorough = matches!(
+            trigger,
+            RaceTrigger::Manual | RaceTrigger::Family | RaceTrigger::Custom
+        );
         let set_family_count = candidates
             .iter()
             .filter(|c| c.ip.is_ipv6() == family.prefer_v6)
@@ -2177,20 +2862,39 @@ impl Selector {
         let mut preferred_pending = set_family_count;
         let mut preferred_passed = false;
         let mut v6_outcomes = 0usize;
+        // 还没出结果的自定义节点数、首个自定义节点通过的时刻
+        let mut custom_pending = custom_ips.len();
+        let mut custom_pass_at: Option<Instant> = None;
         loop {
             let now = Instant::now();
             let mut deadline = start + total;
             // 首选族还没有通过、又还有探测在途：首个通过（另一族的）之后多等首选族一会儿
             let await_preferred = !preferred_passed && preferred_pending > 0;
-            if let Some(at) = first_pass_at {
-                let grace = if await_preferred {
-                    SELECT_FAMILY_GRACE_MS
-                } else {
-                    SELECT_GRACE_MS
-                };
-                deadline = deadline.min(at + Duration::from_millis(grace));
+            // 自定义节点还有在途的、又一个都没通过：先不按池里的通过收敛，最多等到总时限
+            let await_custom = wait_custom && custom_pending > 0 && custom_pass_at.is_none();
+            if let Some(at) = custom_pass_at {
+                // 赢家只在自定义节点里挑了：它们出齐就收；有请求在等时最多再等一小会儿
+                if custom_pending == 0 {
+                    break;
+                }
+                if !custom_thorough {
+                    deadline = deadline.min(at + Duration::from_millis(SELECT_GRACE_MS));
+                }
+            } else if !await_custom {
+                if let Some(at) = first_pass_at {
+                    let grace = if await_preferred {
+                        SELECT_FAMILY_GRACE_MS
+                    } else {
+                        SELECT_GRACE_MS
+                    };
+                    deadline = deadline.min(at + Duration::from_millis(grace));
+                }
             }
-            if (passes.len() >= SELECT_MAX_PASSES && !await_preferred) || now >= deadline {
+            let enough = custom_pass_at.is_none()
+                && !await_custom
+                && passes.len() >= SELECT_MAX_PASSES
+                && !await_preferred;
+            if enough || now >= deadline {
                 break;
             }
             match tokio::time::timeout(deadline - now, set.join_next()).await {
@@ -2198,6 +2902,10 @@ impl Selector {
                     let preferred = candidate.ip.is_ipv6() == family.prefer_v6;
                     if preferred {
                         preferred_pending = preferred_pending.saturating_sub(1);
+                    }
+                    let is_custom = candidate.source == CandidateSource::Custom;
+                    if is_custom {
+                        custom_pending = custom_pending.saturating_sub(1);
                     }
                     let Some(outcome) = outcome else {
                         continue;
@@ -2207,6 +2915,20 @@ impl Selector {
                     }
                     if outcome.ok && preferred {
                         preferred_passed = true;
+                    }
+                    // 安卓日志只到 info：自定义节点的结果单独记一行，「填了没用上」时看得到原因
+                    if is_custom {
+                        info!(
+                            "select: custom node {} -> {} {} ms{}",
+                            candidate.ip,
+                            if outcome.ok { "ok" } else { "fail" },
+                            outcome.latency.as_millis(),
+                            outcome
+                                .failure
+                                .as_ref()
+                                .map(|f| format!(" ({})", f))
+                                .unwrap_or_default()
+                        );
                     }
                     debug!(
                         "select: {} ({:?}) -> {} {} ms{}",
@@ -2222,6 +2944,9 @@ impl Selector {
                     );
                     if outcome.ok {
                         first_pass_at.get_or_insert(Instant::now());
+                        if is_custom {
+                            custom_pass_at.get_or_insert(Instant::now());
+                        }
                         passes.push((candidate, outcome.clone()));
                     }
                     all.push(outcome);
@@ -2232,27 +2957,39 @@ impl Selector {
             }
         }
         set.abort_all();
+        // 跑满了总时限：到这会儿还没出结果的自定义节点按超时算
+        let timed_out = start.elapsed() >= total;
 
-        // 先按地址族（见 race_family：会话中途沿用亲和，不把整个 App 翻到另一个出口 IP 上），
-        // 再按延迟；自动模式下首选族慢太多时让给另一族
-        let Some((best, outcome)) = pick_winner(&passes, family) else {
+        // 自定义节点有通过的就只在它们里挑，没有才看全部。先按地址族（见 race_family：会话中途
+        // 沿用亲和，不把整个 App 翻到另一个出口 IP 上），再按延迟；自动模式下首选族慢太多时
+        // 让给另一族
+        let custom_passes: Vec<(Candidate, ProbeOutcome)> = passes
+            .iter()
+            .filter(|(candidate, _)| candidate.source == CandidateSource::Custom)
+            .cloned()
+            .collect();
+        let custom_ok = !custom_passes.is_empty();
+        // 后台试自定义节点的那一轮：它们没通过就不动现在的赢家（换成池里别的地址只是白折腾，
+        // 还可能翻到另一族、多过一次盾），只记下这个网络上它们不通
+        if trigger == RaceTrigger::Custom && !custom_ok {
+            if !passes.is_empty() {
+                self.record_custom_check(false, &all, timed_out);
+                self.push_state();
+            }
+            info!(
+                "select: no custom node passed ({} of {} probed, {} others passed), keeping the current winner",
+                all.iter().filter(|o| custom_ips.contains(&o.ip)).count(),
+                custom_ips.len(),
+                passes.len()
+            );
+            return;
+        }
+        let picked = pick_winner(&custom_passes, family).or_else(|| pick_winner(&passes, family));
+        let Some((best, outcome)) = picked else {
             // 安卓日志只到 info，这里把失败原因按类型汇总，方便真机排障
             let mut kinds: Vec<(String, usize)> = Vec::new();
             for outcome in &all {
-                let kind = match &outcome.failure {
-                    Some(ProbeFailure::Tls(_)) => "tls".to_string(),
-                    Some(ProbeFailure::Http(_)) => "http".to_string(),
-                    Some(ProbeFailure::HttpStatus(code)) => format!("http_{}", code),
-                    Some(ProbeFailure::EchRejected { retry_configs }) => {
-                        if retry_configs.is_some() {
-                            "ech_rejected_retry".to_string()
-                        } else {
-                            "ech_rejected".to_string()
-                        }
-                    }
-                    Some(other) => other.to_string().replace(' ', "_"),
-                    None => "unknown".to_string(),
-                };
+                let kind = failure_kind(outcome.failure.as_ref());
                 match kinds.iter_mut().find(|(k, _)| *k == kind) {
                     Some((_, n)) => *n += 1,
                     None => kinds.push((kind, 1)),
@@ -2300,6 +3037,16 @@ impl Selector {
             .map(|k| k.source)
             .unwrap_or(EchKeySource::Persisted);
         let v6_passed = passes.iter().filter(|(c, _)| c.ip.is_ipv6()).count();
+        // 赢家是自定义节点：记下它出自清单的哪一条
+        let custom_entry = (best.source == CandidateSource::Custom)
+            .then(|| {
+                self.custom_plan
+                    .lock()
+                    .iter()
+                    .find(|item| item.ips.contains(&best.ip))
+                    .map(|item| item.entry.clone())
+            })
+            .flatten();
         info!(
             "select: winner {} {} ms source={:?} ech={:?} ({} passed of {} probed in {} ms; IPv6 {} passed of {}, family={} prefer={}{})",
             best.ip,
@@ -2324,14 +3071,25 @@ impl Selector {
                 source: best.source,
                 ech_source,
             });
+            inner.state.custom_entry = custom_entry;
             inner.state.network_sig = inner.current_sig.clone();
             inner.state.fail_streak = 0;
             inner.failed_at = None;
             inner.phase = Phase::Ready;
             inner.last_error = None;
-            inner.report_pending = passes.len() >= 2;
-            // 按 IPv6 偏好、不受亲和约束地探过 IPv6：记下这个网络上的结论（见 family_rerace_due）
-            if !family.bound && self.family_pref != FamilyPref::V4 && v6_outcomes > 0 {
+            // 自定义节点的测量不分享：只报池里候选的结果
+            inner.report_pending = passes
+                .iter()
+                .filter(|(candidate, _)| candidate.source != CandidateSource::Custom)
+                .count()
+                >= 2;
+            // 按 IPv6 偏好、不受亲和约束地探过 IPv6：记下这个网络上的结论（见 family_rerace_due）。
+            // 自定义节点赢的那一轮收得早，IPv6 候选多半没探完，不算数
+            if !family.bound
+                && self.family_pref != FamilyPref::V4
+                && v6_outcomes > 0
+                && !custom_ok
+            {
                 inner.state.family_check = Some(FamilyCheck {
                     sig: inner.current_sig.clone(),
                     at: now_unix(),
@@ -2339,9 +3097,30 @@ impl Selector {
                 });
             }
         }
+        if !self.custom.is_empty() {
+            self.record_custom_check(custom_ok, &all, timed_out);
+        }
         self.sync_pin();
         self.push_state();
-        self.maybe_report(&all).await;
+        let shareable: Vec<ProbeOutcome> = all
+            .iter()
+            .filter(|outcome| !custom_ips.contains(&outcome.ip))
+            .cloned()
+            .collect();
+        self.maybe_report(&shareable).await;
+    }
+
+    /// 记下自定义节点这一轮的结论（见 [`Self::custom_rerace_due`]）
+    fn record_custom_check(&self, ok: bool, outcomes: &[ProbeOutcome], timed_out: bool) {
+        let results = self.custom_results(outcomes, timed_out);
+        let mut inner = self.inner.lock();
+        inner.state.custom_check = Some(CustomCheck {
+            list: self.custom_fp.clone(),
+            sig: inner.current_sig.clone(),
+            at: now_unix(),
+            ok,
+            results,
+        });
     }
 
     /// 本轮没选出赢家。上次的赢家**留在持久化状态里**（不钉住，Failed 下
@@ -2545,6 +3324,21 @@ impl PinListener for Selector {
                     "select: winner {} failed {} times within {}s, demoting",
                     ip, WINNER_FAIL_THRESHOLD, WINNER_FAIL_WINDOW_SECS
                 );
+                // 自定义节点被实际流量打掉：一段时间内不再进候选，免得下一轮探测通过又选回来
+                if inner
+                    .state
+                    .winner
+                    .as_ref()
+                    .is_some_and(|w| w.source == CandidateSource::Custom)
+                {
+                    let now = now_unix();
+                    inner
+                        .state
+                        .custom_demoted
+                        .retain(|d| d.ip != ip && now.saturating_sub(d.at) < CUSTOM_RETRY_SECS);
+                    inner.state.custom_demoted.push(CustomDemotion { ip, at: now });
+                }
+                inner.state.custom_entry = None;
                 inner.state.winner = None;
                 inner.state.fail_streak = 0;
                 true
@@ -2756,8 +3550,22 @@ mod tests {
         f: ProbeFn,
         edge: Arc<EdgePin>,
     ) -> Arc<Selector> {
+        fake_selector_custom(mode, family_pref, state, f, edge, Vec::new(), &[])
+    }
+
+    /// 同上，带公共 DoH 列表和自定义节点清单
+    fn fake_selector_custom(
+        mode: SelectMode,
+        family_pref: FamilyPref,
+        state: SelectState,
+        f: ProbeFn,
+        edge: Arc<EdgePin>,
+        public_doh: Vec<(String, DohUpstream)>,
+        custom: &[&str],
+    ) -> Arc<Selector> {
         let roots = RootCertStore::empty();
         let provider = Arc::new(crate::tls_crypto::build_provider());
+        let custom: Vec<String> = custom.iter().map(|text| text.to_string()).collect();
         Selector::build(
             mode,
             family_pref,
@@ -2765,7 +3573,7 @@ mod tests {
             Some("wifi".to_string()),
             roots,
             provider,
-            Vec::new(),
+            public_doh,
             None,
             Some(ReportEndpoint {
                 host: "cfhub6.example".to_string(),
@@ -2774,6 +3582,7 @@ mod tests {
             }),
             None,
             edge,
+            CustomNodes::parse(&custom),
             Prober::Fake(f),
         )
     }
@@ -2792,6 +3601,7 @@ mod tests {
             None,
             None,
             Arc::new(EdgePin::new(false)),
+            CustomNodes::default(),
             Prober::Fake(Arc::new(|ip, _| outcome(ip, false, 1, None))),
         )
     }
@@ -3850,6 +4660,696 @@ mod tests {
         selector.race_failed("no candidate passed");
         assert_eq!(selector.phase(), Phase::Ready);
         assert_eq!(selector.winner_ip(), Some(ip("104.21.0.1")));
+    }
+
+    // ---------- 自定义节点 ----------
+
+    const CUSTOM_A: &str = "104.18.0.9";
+    const CUSTOM_B: &str = "172.67.0.9";
+
+    /// 自定义节点用例的 selector：IPv4 优先、本机只有 IPv4（候选里不掺随机 IPv6）
+    fn custom_selector(state: SelectState, custom: &[&str], f: ProbeFn) -> Arc<Selector> {
+        let selector = fake_selector_custom(
+            SelectMode::LocalAtlas,
+            FamilyPref::V4,
+            state,
+            f,
+            Arc::new(EdgePin::new(false)),
+            Vec::new(),
+            custom,
+        );
+        selector.set_local_family(V4_ONLY);
+        selector
+    }
+
+    /// 自定义节点按 `custom_ms` 通过（None = 连不上），其余候选一律 `pool_ms` 通过
+    fn custom_probe(custom: &'static [&'static str], custom_ms: Option<u64>, pool_ms: u64) -> ProbeFn {
+        Arc::new(move |ip, _| {
+            if custom.iter().any(|text| ip == text.parse::<IpAddr>().unwrap()) {
+                match custom_ms {
+                    Some(ms) => outcome(ip, true, ms, None),
+                    None => outcome(ip, false, 5, Some(ProbeFailure::TcpConnect)),
+                }
+            } else {
+                outcome(ip, true, pool_ms, None)
+            }
+        })
+    }
+
+    fn custom_node(selector: &Arc<Selector>, index: usize) -> serde_json::Value {
+        selector.status_json()["custom"]["nodes"][index].clone()
+    }
+
+    fn winner_of(selector: &Arc<Selector>) -> Winner {
+        selector.inner.lock().state.winner.clone().unwrap()
+    }
+
+    #[test]
+    fn custom_nodes_parsing() {
+        let raw: Vec<String> = [
+            " 104.18.0.9 ",
+            "104.18.0.9:443",     // 和上一条是同一个
+            "172.67.0.9:443",
+            "[2606:4700::1]",
+            "[2606:4700::2]:443",
+            "2606:4700::443",     // 以 :443 结尾的合法 IPv6
+            "CF.Example.com.",
+            "cf.example.com:443", // 和上一条是同一个
+            "",
+            "1.2.3",              // 写坏的 IP
+            "300.1.1.1",
+            "104.18.0.9:8443",    // 别的端口用不上
+            "http://cf.example.com",
+            "localhost",
+            "-bad.example.com",
+        ]
+        .iter()
+        .map(|text| text.to_string())
+        .collect();
+        let nodes = CustomNodes::parse(&raw);
+        let entries: Vec<CustomEntry> = nodes.entries.iter().map(|(_, entry)| entry.clone()).collect();
+        assert_eq!(
+            entries,
+            vec![
+                CustomEntry::Ip(ip("104.18.0.9")),
+                CustomEntry::Ip(ip("172.67.0.9")),
+                CustomEntry::Ip(ip("2606:4700::1")),
+                CustomEntry::Ip(ip("2606:4700::2")),
+                CustomEntry::Ip(ip("2606:4700::443")),
+                CustomEntry::Domain("cf.example.com".to_string()),
+            ]
+        );
+        assert_eq!(
+            nodes.invalid,
+            vec![
+                "1.2.3",
+                "300.1.1.1",
+                "104.18.0.9:8443",
+                "http://cf.example.com",
+                "localhost",
+                "-bad.example.com"
+            ]
+        );
+        // 指纹跟着清单和 IP 协议偏好变
+        assert_ne!(nodes.fingerprint(FamilyPref::V4), nodes.fingerprint(FamilyPref::Auto));
+        assert_ne!(
+            nodes.fingerprint(FamilyPref::V4),
+            CustomNodes::parse(&raw[..1]).fingerprint(FamilyPref::V4)
+        );
+        // 清单最多收 CUSTOM_MAX_ENTRIES 条
+        let many: Vec<String> = (1..=20).map(|n| format!("104.18.0.{}", n)).collect();
+        assert_eq!(CustomNodes::parse(&many).entries.len(), CUSTOM_MAX_ENTRIES);
+        assert!(CustomNodes::parse(&[]).is_empty());
+    }
+
+    #[test]
+    fn interleave_keeps_custom_nodes_in_front() {
+        let list = vec![
+            Candidate { ip: ip("104.21.0.1"), source: CandidateSource::Sticky },
+            Candidate { ip: ip(CUSTOM_A), source: CandidateSource::Custom },
+            Candidate { ip: ip(CUSTOM_B), source: CandidateSource::Custom },
+            Candidate { ip: ip("104.21.0.2"), source: CandidateSource::Atlas },
+            Candidate { ip: ip("2606:4700::7"), source: CandidateSource::Random },
+        ];
+        let out: Vec<IpAddr> = interleave_families(list, true).into_iter().map(|c| c.ip).collect();
+        assert_eq!(
+            out,
+            vec![
+                ip("104.21.0.1"),
+                ip(CUSTOM_A),
+                ip(CUSTOM_B),
+                ip("2606:4700::7"),
+                ip("104.21.0.2")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_node_wins_over_faster_pool_candidates() {
+        // 自定义节点 300 ms、池里的 20 ms：照样用自定义的
+        let selector = custom_selector(
+            state_with_key(1),
+            &[CUSTOM_A],
+            custom_probe(&[CUSTOM_A], Some(300), 20),
+        );
+        selector.start();
+        wait_phase(&selector, Phase::Ready).await;
+        let winner = winner_of(&selector);
+        assert_eq!(winner.ip, ip(CUSTOM_A));
+        assert_eq!(winner.source, CandidateSource::Custom);
+        assert_eq!(selector.winner_ip(), Some(ip(CUSTOM_A)));
+        let node = custom_node(&selector, 0);
+        assert_eq!(node["entry"], CUSTOM_A);
+        assert_eq!(node["state"], "ok");
+        assert_eq!(node["active"], true);
+        assert_eq!(node["latency_ms"], 300);
+        let check = selector.inner.lock().state.custom_check.clone().unwrap();
+        assert!(check.ok);
+        assert_eq!(check.sig.as_deref(), Some("wifi"));
+        assert_eq!(selector.inner.lock().state.custom_entry.as_deref(), Some(CUSTOM_A));
+        // 赢家是自定义节点：不把这一轮当成 IPv6 结论，也不为换族再折腾
+        assert!(selector.inner.lock().state.family_check.is_none());
+        assert!(!selector.family_rerace_due(ip(CUSTOM_A)));
+        assert!(!selector.custom_rerace_due());
+    }
+
+    #[tokio::test]
+    async fn race_waits_for_custom_nodes_before_converging() {
+        // 池里先出了 5 个通过（够数了），自定义节点排在最后才出结果：不能提前收敛
+        let pool = ["104.21.0.1", "104.21.0.2", "104.21.0.3", "104.21.0.4", "104.21.0.5"];
+        let order = || {
+            let mut list = candidates(&pool);
+            list.push(Candidate { ip: ip(CUSTOM_A), source: CandidateSource::Custom });
+            list
+        };
+        let selector = custom_selector(
+            state_with_key(1),
+            &[CUSTOM_A],
+            custom_probe(&[CUSTOM_A], Some(300), 20),
+        );
+        selector.race_candidates(order(), selector.key_pool()).await;
+        assert_eq!(winner_of(&selector).ip, ip(CUSTOM_A));
+
+        // 这个网络上一小时内刚验过自定义节点都不通：不等它们，池里够数就收
+        let mut state = state_with_key(1);
+        state.custom_check = Some(CustomCheck {
+            list: format!("v4|{}", CUSTOM_A),
+            sig: Some("wifi".to_string()),
+            at: now_unix(),
+            ok: false,
+            results: Vec::new(),
+        });
+        let selector = custom_selector(state.clone(), &[CUSTOM_A], custom_probe(&[CUSTOM_A], Some(300), 20));
+        assert!(!selector.custom_worth_waiting());
+        selector.race_candidates(order(), selector.key_pool()).await;
+        assert_ne!(winner_of(&selector).ip, ip(CUSTOM_A));
+
+        // 手动重新优选总是等
+        let selector = custom_selector(state, &[CUSTOM_A], custom_probe(&[CUSTOM_A], Some(300), 20));
+        selector.inner.lock().race_trigger = RaceTrigger::Manual;
+        selector.race_candidates(order(), selector.key_pool()).await;
+        assert_eq!(winner_of(&selector).ip, ip(CUSTOM_A));
+    }
+
+    #[tokio::test]
+    async fn fastest_custom_node_wins_among_several() {
+        let selector = custom_selector(
+            state_with_key(1),
+            &[CUSTOM_A, CUSTOM_B],
+            Arc::new(|ip, _| match ip.to_string().as_str() {
+                CUSTOM_A => outcome(ip, true, 180, None),
+                CUSTOM_B => outcome(ip, true, 90, None),
+                _ => outcome(ip, true, 20, None),
+            }),
+        );
+        selector.start();
+        wait_phase(&selector, Phase::Ready).await;
+        assert_eq!(winner_of(&selector).ip, ip(CUSTOM_B));
+        assert_eq!(custom_node(&selector, 0)["active"], false);
+        assert_eq!(custom_node(&selector, 0)["latency_ms"], 180);
+        assert_eq!(custom_node(&selector, 1)["active"], true);
+        // 自定义节点的测量不分享：只有它们通过算不上「够报」
+        let selector = custom_selector(
+            state_with_key(1),
+            &[CUSTOM_A, CUSTOM_B],
+            Arc::new(|ip, _| match ip.to_string().as_str() {
+                CUSTOM_A | CUSTOM_B => outcome(ip, true, 90, None),
+                _ => outcome(ip, false, 5, Some(ProbeFailure::TcpConnect)),
+            }),
+        );
+        selector.start();
+        wait_phase(&selector, Phase::Ready).await;
+        assert!(!selector.inner.lock().report_pending);
+    }
+
+    #[tokio::test]
+    async fn failing_custom_nodes_fall_back_to_the_pool() {
+        let selector = custom_selector(
+            state_with_key(1),
+            &[CUSTOM_A],
+            custom_probe(&[CUSTOM_A], None, 20),
+        );
+        selector.start();
+        wait_phase(&selector, Phase::Ready).await;
+        let winner = winner_of(&selector);
+        assert_ne!(winner.ip, ip(CUSTOM_A));
+        assert_ne!(winner.source, CandidateSource::Custom);
+        let node = custom_node(&selector, 0);
+        assert_eq!(node["state"], "failed");
+        assert_eq!(node["detail"], "tcp_connect_failed");
+        assert_eq!(node["active"], false);
+        let check = selector.inner.lock().state.custom_check.clone().unwrap();
+        assert!(!check.ok);
+        // 这个网络上刚验过不通：一小时内不为它们再后台竞速
+        assert!(!selector.custom_rerace_due());
+        selector.inner.lock().state.custom_check.as_mut().unwrap().at = now_unix() - CUSTOM_RETRY_SECS - 1;
+        assert!(selector.custom_rerace_due());
+        // 换了网络也重试
+        selector.inner.lock().state.custom_check.as_mut().unwrap().at = now_unix();
+        selector.inner.lock().current_sig = Some("cellular".to_string());
+        assert!(selector.custom_rerace_due());
+    }
+
+    #[tokio::test]
+    async fn custom_nodes_outside_cloudflare_are_never_probed() {
+        let probed: Arc<Mutex<Vec<IpAddr>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = probed.clone();
+        let selector = custom_selector(
+            state_with_key(1),
+            &["1.2.3.4", "104.16.0.9", "2606:4700::9", "bad entry"],
+            Arc::new(move |ip, _| {
+                log.lock().push(ip);
+                outcome(ip, true, 20, None)
+            }),
+        );
+        // 只有网段外的地址时，不值得为它们后台竞速
+        assert!(custom_selector(state_with_key(1), &["1.2.3.4"], by_family(20, 20)).custom.cloudflare_ips().next().is_none());
+        assert!(!custom_selector(state_with_key(1), &["1.2.3.4"], by_family(20, 20)).custom_rerace_due());
+        selector.start();
+        wait_phase(&selector, Phase::Ready).await;
+        assert!(!probed.lock().contains(&ip("1.2.3.4")));
+        assert!(!probed.lock().contains(&ip("2606:4700::9")));
+        // Cloudflare 自家资产段的地址池里不要，用户点名的照探
+        assert_eq!(winner_of(&selector).ip, ip("104.16.0.9"));
+        assert_eq!(custom_node(&selector, 0)["state"], "not_cloudflare");
+        assert_eq!(custom_node(&selector, 1)["state"], "ok");
+        // 本机只有 IPv4：IPv6 节点这一轮用不上
+        assert_eq!(custom_node(&selector, 2)["state"], "no_family");
+        assert_eq!(custom_node(&selector, 3)["state"], "invalid");
+        assert_eq!(custom_node(&selector, 3)["entry"], "bad entry");
+    }
+
+    #[tokio::test]
+    async fn verified_pool_winner_yields_to_custom_node_in_background() {
+        // 上次的赢家是池里的；这次启动配了自定义节点：先照常校验旧赢家（不让冷启动多等），
+        // 再后台竞速换到自定义节点
+        let selector = custom_selector(
+            v4_winner_state(),
+            &[CUSTOM_A],
+            custom_probe(&[CUSTOM_A], Some(300), 20),
+        );
+        selector.start();
+        assert_eq!(selector.phase(), Phase::Verifying);
+        assert_eq!(selector.winner_ip(), Some(ip("104.21.0.1")));
+        wait_phase(&selector, Phase::Ready).await;
+        wait_idle(&selector).await;
+        assert_eq!(selector.phase(), Phase::Ready);
+        assert_eq!(selector.winner_ip(), Some(ip(CUSTOM_A)));
+        let state = selector.inner.lock().state.clone();
+        assert_eq!(state.races_log.len(), 1);
+
+        // 下次启动：赢家已经是自定义节点，校验通过就完事，不再竞速
+        // （自动 + 双栈下赢家是 IPv4 也不为换族折腾）
+        let selector = fake_selector_custom(
+            SelectMode::LocalAtlas,
+            FamilyPref::Auto,
+            SelectState {
+                custom_check: Some(CustomCheck {
+                    list: format!("auto|{}", CUSTOM_A),
+                    ..state.custom_check.clone().unwrap()
+                }),
+                ..state
+            },
+            custom_probe(&[CUSTOM_A], Some(300), 20),
+            Arc::new(EdgePin::new(false)),
+            Vec::new(),
+            &[CUSTOM_A],
+        );
+        selector.set_local_family(DUAL_STACK);
+        selector.start();
+        assert_eq!(selector.phase(), Phase::Verifying);
+        wait_phase(&selector, Phase::Ready).await;
+        wait_idle(&selector).await;
+        assert_eq!(selector.winner_ip(), Some(ip(CUSTOM_A)));
+        assert_eq!(selector.inner.lock().state.races_log.len(), 1);
+        assert_eq!(custom_node(&selector, 0)["active"], true);
+    }
+
+    #[tokio::test]
+    async fn background_custom_race_keeps_the_winner_when_custom_nodes_fail() {
+        // 自定义节点不通、池里别的地址比现在的赢家还快：后台这一轮不换赢家，只记下不通
+        let selector = custom_selector(
+            v4_winner_state(),
+            &[CUSTOM_A],
+            Arc::new(|ip, _| match ip.to_string().as_str() {
+                CUSTOM_A => outcome(ip, false, 5, Some(ProbeFailure::TcpTimeout)),
+                "104.21.0.1" => outcome(ip, true, 200, None),
+                _ => outcome(ip, true, 20, None),
+            }),
+        );
+        selector.start();
+        wait_phase(&selector, Phase::Ready).await;
+        wait_idle(&selector).await;
+        assert_eq!(selector.phase(), Phase::Ready);
+        assert_eq!(selector.winner_ip(), Some(ip("104.21.0.1")));
+        let state = selector.inner.lock().state.clone();
+        assert_eq!(state.races_log.len(), 1);
+        assert!(!state.custom_check.as_ref().unwrap().ok);
+        assert_eq!(custom_node(&selector, 0)["state"], "failed");
+        assert_eq!(custom_node(&selector, 0)["detail"], "tcp_timeout");
+
+        // 同一个网络上再启动：一小时内不再为它们后台竞速
+        let selector = custom_selector(state, &[CUSTOM_A], custom_probe(&[CUSTOM_A], None, 20));
+        selector.start();
+        wait_phase(&selector, Phase::Ready).await;
+        wait_idle(&selector).await;
+        assert_eq!(selector.inner.lock().state.races_log.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn custom_winner_knocked_out_by_traffic_is_benched() {
+        let selector = custom_selector(
+            state_with_key(1),
+            &[CUSTOM_A],
+            custom_probe(&[CUSTOM_A], Some(60), 20),
+        );
+        selector.start();
+        wait_phase(&selector, Phase::Ready).await;
+        assert_eq!(selector.winner_ip(), Some(ip(CUSTOM_A)));
+        // 探测能过、实际连接连不上：连败到阈值被换掉
+        selector.inner.lock().state.last_race_at = 0;
+        for _ in 0..WINNER_FAIL_THRESHOLD {
+            selector
+                .edge
+                .report("linux.do", ip(CUSTOM_A), crate::edge_pin::Outcome::Failed);
+        }
+        wait_idle(&selector).await;
+        wait_phase(&selector, Phase::Ready).await;
+        // 重赛里它不再进候选（否则探测一过又选回来）
+        let winner = winner_of(&selector);
+        assert_ne!(winner.ip, ip(CUSTOM_A));
+        assert_eq!(selector.inner.lock().state.custom_demoted.len(), 1);
+        assert!(selector.inner.lock().state.custom_entry.is_none());
+        assert_eq!(custom_node(&selector, 0)["state"], "demoted");
+        assert!(!selector.custom_rerace_due());
+        // 降级记录跟着状态落盘：下次启动校验完池里的赢家，也不为它后台竞速
+        let state = selector.inner.lock().state.clone();
+        let restarted = custom_selector(state.clone(), &[CUSTOM_A], custom_probe(&[CUSTOM_A], Some(60), 20));
+        restarted.start();
+        wait_phase(&restarted, Phase::Ready).await;
+        wait_idle(&restarted).await;
+        assert_eq!(restarted.winner_ip(), Some(winner.ip));
+        // 过了降级期再启动：重新给它机会
+        let mut later = state;
+        later.custom_demoted[0].at = now_unix() - CUSTOM_RETRY_SECS - 1;
+        later.custom_check.as_mut().unwrap().at = now_unix() - CUSTOM_RETRY_SECS - 1;
+        let restarted = custom_selector(later, &[CUSTOM_A], custom_probe(&[CUSTOM_A], Some(60), 20));
+        restarted.start();
+        wait_phase(&restarted, Phase::Ready).await;
+        wait_idle(&restarted).await;
+        assert_eq!(restarted.winner_ip(), Some(ip(CUSTOM_A)));
+
+        // 手动重新优选：立刻重新给机会
+        assert!(selector.request_rerace(true));
+        wait_idle(&selector).await;
+        wait_phase(&selector, Phase::Ready).await;
+        assert_eq!(selector.winner_ip(), Some(ip(CUSTOM_A)));
+        assert!(selector.inner.lock().state.custom_demoted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn removed_custom_winner_is_not_used_again() {
+        let custom_winner_state = || {
+            let mut state = state_with_key(1);
+            state.winner = Some(Winner {
+                ip: ip(CUSTOM_A),
+                latency_ms: 60,
+                verified_at: 1,
+                source: CandidateSource::Custom,
+                ech_source: EchKeySource::Persisted,
+            });
+            state.network_sig = Some("wifi".to_string());
+            state.custom_check = Some(CustomCheck {
+                list: format!("v4|{}", CUSTOM_A),
+                sig: Some("wifi".to_string()),
+                at: now_unix(),
+                ok: true,
+                results: Vec::new(),
+            });
+            state
+        };
+        let probed: Arc<Mutex<Vec<IpAddr>>> = Arc::new(Mutex::new(Vec::new()));
+        let recording = |probed: &Arc<Mutex<Vec<IpAddr>>>| -> ProbeFn {
+            let log = probed.clone();
+            Arc::new(move |ip, _| {
+                log.lock().push(ip);
+                outcome(ip, true, 20, None)
+            })
+        };
+        // 清单清空了：不校验、不再用它，直接按平常的规则优选
+        let selector = custom_selector(custom_winner_state(), &[], recording(&probed));
+        selector.start();
+        assert_eq!(selector.phase(), Phase::Racing);
+        wait_phase(&selector, Phase::Ready).await;
+        assert!(!probed.lock().contains(&ip(CUSTOM_A)));
+        assert_ne!(winner_of(&selector).source, CandidateSource::Custom);
+        assert!(selector.inner.lock().state.custom_check.is_none());
+        assert!(selector.status_json()["custom"].is_null());
+
+        // 清单换成了另一个节点：换过去
+        probed.lock().clear();
+        let selector = custom_selector(custom_winner_state(), &[CUSTOM_B], recording(&probed));
+        selector.start();
+        wait_phase(&selector, Phase::Ready).await;
+        assert!(!probed.lock().contains(&ip(CUSTOM_A)));
+        assert_eq!(selector.winner_ip(), Some(ip(CUSTOM_B)));
+
+        // 清单里添了一个节点（原来的还在）：先照常用着原来的，后台重新比一轮
+        let selector = custom_selector(
+            custom_winner_state(),
+            &[CUSTOM_A, CUSTOM_B],
+            Arc::new(|ip, _| match ip.to_string().as_str() {
+                CUSTOM_A => outcome(ip, true, 60, None),
+                CUSTOM_B => outcome(ip, true, 30, None),
+                _ => outcome(ip, true, 10, None),
+            }),
+        );
+        selector.start();
+        assert_eq!(selector.phase(), Phase::Verifying);
+        assert_eq!(selector.winner_ip(), Some(ip(CUSTOM_A)));
+        wait_phase(&selector, Phase::Ready).await;
+        wait_idle(&selector).await;
+        assert_eq!(selector.winner_ip(), Some(ip(CUSTOM_B)));
+    }
+
+    #[tokio::test]
+    async fn ip_family_change_reraces_among_custom_nodes() {
+        // 自动模式下选了 IPv6 的自定义节点；改成 IPv4 优先后重启：后台在自定义节点里重挑
+        const CUSTOM_V6: &str = "2606:4700::9";
+        let mut state = state_with_key(1);
+        state.winner = Some(Winner {
+            ip: ip(CUSTOM_V6),
+            latency_ms: 60,
+            verified_at: 1,
+            source: CandidateSource::Custom,
+            ech_source: EchKeySource::Persisted,
+        });
+        state.network_sig = Some("wifi".to_string());
+        state.custom_check = Some(CustomCheck {
+            list: format!("auto|{},{}", CUSTOM_A, CUSTOM_V6),
+            sig: Some("wifi".to_string()),
+            at: now_unix(),
+            ok: true,
+            results: Vec::new(),
+        });
+        let selector = fake_selector_custom(
+            SelectMode::LocalAtlas,
+            FamilyPref::V4,
+            state,
+            by_family(80, 40),
+            Arc::new(EdgePin::new(false)),
+            Vec::new(),
+            &[CUSTOM_A, CUSTOM_V6],
+        );
+        selector.set_local_family(DUAL_STACK);
+        selector.start();
+        assert_eq!(selector.winner_ip(), Some(ip(CUSTOM_V6)));
+        wait_phase(&selector, Phase::Ready).await;
+        wait_idle(&selector).await;
+        assert_eq!(selector.winner_ip(), Some(ip(CUSTOM_A)));
+        assert_eq!(winner_of(&selector).source, CandidateSource::Custom);
+    }
+
+    #[tokio::test]
+    async fn custom_domain_is_resolved_and_preferred() {
+        // 假 DoH 对任何域名都答这两个地址；其中一个在 Cloudflare 自家资产段
+        let doh = fake_public_doh("fake", &["104.18.7.7", "104.16.5.5"]).await;
+        let selector = fake_selector_custom(
+            SelectMode::AtlasOnly,
+            FamilyPref::V4,
+            state_with_key(1),
+            Arc::new(|ip, _| match ip.to_string().as_str() {
+                "104.18.7.7" => outcome(ip, true, 120, None),
+                "104.16.5.5" => outcome(ip, true, 70, None),
+                _ => outcome(ip, true, 10, None),
+            }),
+            Arc::new(EdgePin::new(false)),
+            vec![doh],
+            &["cf.example.com", "nx.example.com:8443"],
+        );
+        selector.set_local_family(V4_ONLY);
+        selector.start();
+        wait_phase(&selector, Phase::Ready).await;
+        // 「只用 atlas 池」模式下自定义节点照样参与；域名解析出的地址里挑最快的
+        let winner = winner_of(&selector);
+        assert_eq!(winner.ip, ip("104.16.5.5"));
+        assert_eq!(winner.source, CandidateSource::Custom);
+        let node = custom_node(&selector, 0);
+        assert_eq!(node["entry"], "cf.example.com");
+        assert_eq!(node["state"], "ok");
+        assert_eq!(node["ip"], "104.16.5.5");
+        assert_eq!(node["active"], true);
+        assert_eq!(custom_node(&selector, 1)["state"], "invalid");
+        // 赢家出自域名这一条：这一条还在，启动时照常校验
+        let state = selector.inner.lock().state.clone();
+        assert_eq!(state.custom_entry.as_deref(), Some("cf.example.com"));
+        let restarted = fake_selector_custom(
+            SelectMode::AtlasOnly,
+            FamilyPref::V4,
+            state,
+            by_family(20, 20),
+            Arc::new(EdgePin::new(false)),
+            Vec::new(),
+            &["cf.example.com", "nx.example.com:8443"],
+        );
+        restarted.set_local_family(V4_ONLY);
+        restarted.start();
+        assert_eq!(restarted.phase(), Phase::Verifying);
+        assert_eq!(restarted.winner_ip(), Some(ip("104.16.5.5")));
+        wait_phase(&restarted, Phase::Ready).await;
+        wait_idle(&restarted).await;
+        // 这个 selector 没有公共 DoH，域名解析不出来（DNS 一时没答上）：重新竞速时
+        // 正用着的节点仍算这个域名的，不因此丢掉
+        assert!(restarted.request_rerace(true));
+        wait_idle(&restarted).await;
+        wait_phase(&restarted, Phase::Ready).await;
+        let winner = winner_of(&restarted);
+        assert_eq!(winner.ip, ip("104.16.5.5"));
+        assert_eq!(winner.source, CandidateSource::Custom);
+        let node = custom_node(&restarted, 0);
+        assert_eq!(node["state"], "ok");
+        assert_eq!(node["active"], true);
+
+        // 换成另一个域名（同样解析不出来）：原来的节点不是它的，不留
+        let state = restarted.inner.lock().state.clone();
+        let probed: Arc<Mutex<Vec<IpAddr>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = probed.clone();
+        let swapped = fake_selector_custom(
+            SelectMode::AtlasOnly,
+            FamilyPref::V4,
+            state,
+            Arc::new(move |ip, _| {
+                log.lock().push(ip);
+                outcome(ip, true, 20, None)
+            }),
+            Arc::new(EdgePin::new(false)),
+            Vec::new(),
+            &["other.example.com"],
+        );
+        swapped.set_local_family(V4_ONLY);
+        swapped.start();
+        // 出处那一条不在清单里了：不校验、直接竞速；这个模式下又没有 atlas，没有候选
+        assert_eq!(swapped.phase(), Phase::Racing);
+        wait_phase(&swapped, Phase::Failed).await;
+        assert!(probed.lock().is_empty());
+        assert!(swapped.inner.lock().state.custom_entry.is_none());
+        assert_eq!(custom_node(&swapped, 0)["state"], "pending");
+    }
+
+    #[tokio::test]
+    async fn removing_the_literal_node_in_use_drops_it_even_with_domains_listed() {
+        // 正用着字面 IP 那一条；把它从清单里拿掉，清单里还剩一个域名
+        let mut state = state_with_key(1);
+        state.winner = Some(Winner {
+            ip: ip(CUSTOM_A),
+            latency_ms: 60,
+            verified_at: 1,
+            source: CandidateSource::Custom,
+            ech_source: EchKeySource::Persisted,
+        });
+        state.network_sig = Some("wifi".to_string());
+        state.custom_entry = Some(CUSTOM_A.to_string());
+        let probed: Arc<Mutex<Vec<IpAddr>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = probed.clone();
+        let selector = custom_selector(
+            state,
+            &["cf.example.com"],
+            Arc::new(move |ip, _| {
+                log.lock().push(ip);
+                outcome(ip, true, 20, None)
+            }),
+        );
+        selector.start();
+        assert_eq!(selector.phase(), Phase::Racing);
+        wait_phase(&selector, Phase::Ready).await;
+        // 域名这一轮没解析出来，也不把拿掉的节点算到它头上
+        assert!(!probed.lock().contains(&ip(CUSTOM_A)));
+        assert_ne!(winner_of(&selector).source, CandidateSource::Custom);
+        assert!(selector.inner.lock().state.custom_entry.is_none());
+        assert_eq!(custom_node(&selector, 0)["state"], "unresolved");
+    }
+
+    #[tokio::test]
+    async fn unresolved_custom_domain_is_reported() {
+        // 没有公共 DoH 可用：域名解析不出来，按平常的规则优选
+        let selector = custom_selector(
+            state_with_key(1),
+            &["cf.example.com"],
+            by_family(20, 20),
+        );
+        selector.start();
+        wait_phase(&selector, Phase::Ready).await;
+        assert_ne!(winner_of(&selector).source, CandidateSource::Custom);
+        assert_eq!(custom_node(&selector, 0)["state"], "unresolved");
+        assert!(!selector.inner.lock().state.custom_check.as_ref().unwrap().ok);
+    }
+
+    #[tokio::test]
+    async fn custom_nodes_without_an_outcome_are_timeouts_only_when_the_race_ran_out() {
+        let selector = custom_selector(
+            state_with_key(1),
+            &[CUSTOM_A, CUSTOM_B],
+            custom_probe(&[CUSTOM_A], Some(60), 20),
+        );
+        // 收集候选时记下每条对应的地址
+        let _ = selector.gather().await;
+        let only_a = [outcome(ip(CUSTOM_A), true, 60, None)];
+        // 提前收敛：B 只是没等它
+        let early = selector.custom_results(&only_a, false);
+        assert_eq!(early[0].state, CustomState::Ok);
+        assert_eq!(early[1].state, CustomState::Pending);
+        // 跑满总时限：B 到最后都没出结果，按超时算
+        let late = selector.custom_results(&only_a, true);
+        assert_eq!(late[0].state, CustomState::Ok);
+        assert_eq!(late[1].state, CustomState::Failed);
+        assert_eq!(late[1].detail.as_deref(), Some("timeout"));
+        assert_eq!(late[1].ip, Some(ip(CUSTOM_B)));
+    }
+
+    #[test]
+    fn custom_state_survives_the_state_json_roundtrip() {
+        let mut state = state_with_key(1);
+        state.custom_check = Some(CustomCheck {
+            list: format!("v4|{}", CUSTOM_A),
+            sig: Some("wifi".to_string()),
+            at: 123,
+            ok: true,
+            results: vec![CustomResult {
+                entry: CUSTOM_A.to_string(),
+                state: CustomState::Ok,
+                ip: Some(ip(CUSTOM_A)),
+                latency_ms: Some(88),
+                detail: None,
+            }],
+        });
+        state.custom_demoted = vec![CustomDemotion { ip: ip(CUSTOM_B), at: 456 }];
+        let json = serde_json::to_string(&state).unwrap();
+        let back = SelectState::from_json(&json).unwrap();
+        assert_eq!(back.custom_check, state.custom_check);
+        assert_eq!(back.custom_demoted, state.custom_demoted);
+        // 旧版落盘的状态没有这两项：照常读回
+        let old = SelectState::from_json(r#"{"v":1,"ech_keys":[]}"#).unwrap();
+        assert!(old.custom_check.is_none() && old.custom_demoted.is_empty());
     }
 
     #[test]

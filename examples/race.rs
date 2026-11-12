@@ -1,6 +1,6 @@
 //! 在 VPS / 开发机上跑一轮本地优选竞速，看候选、赢家与状态 JSON。
 //!
-//! 用法：`cargo run --example race --features ech -- [--mode local_atlas|atlas_only] [--family auto|v6|v4] [--atlas <url>] [--json]`
+//! 用法：`cargo run --example race --features ech -- [--mode local_atlas|atlas_only] [--family auto|v6|v4] [--atlas <url>] [--custom <ip或域名,...>] [--json]`
 
 use doh_proxy::select::{FamilyPref, Phase, SelectMode, Selector};
 use std::time::{Duration, Instant};
@@ -35,7 +35,13 @@ async fn main() {
         _ => FamilyPref::Auto,
     };
 
-    let selector = Selector::standalone(mode, family, Some(&atlas), None, Some("cli"));
+    // --custom a,b,c：自定义节点（IP 或优选域名），有通过的就优先用它们
+    let custom: Vec<String> = arg("--custom")
+        .map(|list| list.split(',').map(|item| item.trim().to_string()).collect())
+        .unwrap_or_default();
+
+    let selector =
+        Selector::standalone_custom(mode, family, Some(&atlas), None, Some("cli"), &custom);
     // --probe <ip>：只探测这个 IP（钥匙照常从 atlas / HTTPS 记录拿）
     if let Some(ip) = arg("--probe").and_then(|v| v.parse::<std::net::IpAddr>().ok()) {
         // --via-proxy host:port：经 HTTP CONNECT 隧道探测（复现模拟器 / 特定出口的路径）

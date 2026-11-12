@@ -228,6 +228,10 @@ pub struct ProxyConfig {
     /// App 持久化的优选状态 JSON，启动时回灌
     #[serde(default)]
     pub select_state_json: Option<String>,
+    /// 用户自己填的 Cloudflare 节点（IP 或优选域名）：有能用的就优先用它们，
+    /// 都不通再按平常的规则优选（见 select.rs 的 `CustomNodes`）
+    #[serde(default)]
+    pub custom_nodes: Vec<String>,
     /// 是否把握手测量结果分享给 cfhub（默认关）
     #[serde(default)]
     pub share_measurements: bool,
@@ -294,6 +298,7 @@ impl Default for ProxyConfig {
             doh_node_list_json: None,
             select_mode: default_select_mode(),
             select_state_json: None,
+            custom_nodes: Vec::new(),
             share_measurements: false,
             atlas_routes_url: None,
             public_doh: Vec::new(),
