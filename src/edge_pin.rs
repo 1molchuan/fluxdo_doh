@@ -228,7 +228,11 @@ impl EdgePin {
                     if let Some(listener) = self.listener() {
                         listener.pin_missed();
                     }
-                    return None;
+                    // Selector 顺手发了车（断网后的重试，见 Selector::pin_missed）：等它的
+                    // 结果，这个请求就用得上新赢家；没发车照旧立即返回
+                    if self.state.read().pin != Pin::Pending {
+                        return None;
+                    }
                 }
                 Pin::Pending => {}
             }

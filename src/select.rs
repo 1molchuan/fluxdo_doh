@@ -84,6 +84,9 @@ const SELECT_MIN_RACE_INTERVAL_SECS: u64 = 60;
 const SELECT_MAX_AUTO_RACES_PER_HOUR: usize = 4;
 const SELECT_MANUAL_COOLDOWN_SECS: u64 = 10;
 const SELECT_FAILED_RETRY_SECS: u64 = 300;
+/// 上一轮是「这台设备连不出去」（见 [`Inner::outage`]）时的重试间隔：网络一回来，
+/// 下一个要赢家的请求就顺手重赛，不等上面那 5 分钟
+const SELECT_OUTAGE_RETRY_SECS: u64 = 10;
 /// 网络变化防抖
 const SELECT_NETCHANGE_DEBOUNCE_MS: u64 = 1500;
 /// 钥匙池上限
@@ -665,6 +668,11 @@ struct Inner {
     atlas_backoff_until: Option<Instant>,
     last_manual_race: Option<Instant>,
     failed_at: Option<Instant>,
+    /// 上一轮失败是因为所有探测都「TCP 一连就失败」（不是超时，也没到握手）：这台设备
+    /// 此刻连不出去——断网，或 App 在后台被系统拒掉了连接（2026-11-20 用户日志里
+    /// 成片的 Connection refused），不是候选的问题。这样的失败不占自动重赛的预算，
+    /// 重试也不用等 [`SELECT_FAILED_RETRY_SECS`]
+    outage: bool,
     netchange_gen: u64,
     /// 本次竞速结束后待上报的结果
     report_pending: bool,
@@ -993,6 +1001,7 @@ impl Selector {
                 atlas_backoff_until: None,
                 last_manual_race: None,
                 failed_at: None,
+                outage: false,
                 netchange_gen: 0,
                 report_pending: false,
                 race_trigger: RaceTrigger::Auto,
@@ -1728,7 +1737,8 @@ impl Selector {
         {
             let inner = self.inner.lock();
             let now = now_unix();
-            if matches!(trigger, RaceTrigger::Auto | RaceTrigger::Failed) {
+            let after_outage = matches!(trigger, RaceTrigger::Failed) && inner.outage;
+            if matches!(trigger, RaceTrigger::Auto | RaceTrigger::Failed) && !after_outage {
                 let recent = inner
                     .state
                     .races_log
@@ -2772,6 +2782,7 @@ impl Selector {
             inner.state.last_race_at = now;
             inner.state.races_log.push(now);
             inner.state.races_log.retain(|at| now.saturating_sub(*at) < 3600);
+            inner.outage = false;
         }
         self.race_with(candidates, keys, Self::probe_timeouts(), true)
             .await;
@@ -3024,6 +3035,17 @@ impl Selector {
                         .await;
                     return;
                 }
+            }
+            // 全部「TCP 一连就失败」：设备此刻连不出去（断网 / 后台被系统拒掉连接），
+            // 这一轮不占预算，网络回来后很快重试（见 pin_missed）
+            let outage = !all.is_empty()
+                && all
+                    .iter()
+                    .all(|o| matches!(o.failure, Some(ProbeFailure::TcpConnect)));
+            if outage {
+                let mut inner = self.inner.lock();
+                inner.outage = true;
+                inner.state.races_log.pop();
             }
             self.race_failed("no candidate passed");
             return;
@@ -3362,17 +3384,22 @@ impl PinListener for Selector {
         }
     }
 
-    /// 覆盖域名要建连但没有赢家：Failed 过了重试间隔就顺手发车
+    /// 覆盖域名要建连但没有赢家：Failed 过了重试间隔就顺手发车（上一轮是断网的间隔短得多）
     fn pin_missed(self: Arc<Self>) {
         if !self.alive.load(Ordering::Acquire) {
             return;
         }
         let retry = {
             let inner = self.inner.lock();
+            let wait = if inner.outage {
+                SELECT_OUTAGE_RETRY_SECS
+            } else {
+                SELECT_FAILED_RETRY_SECS
+            };
             inner.phase == Phase::Failed
-                && inner.failed_at.is_some_and(|at| {
-                    at.elapsed() >= Duration::from_secs(SELECT_FAILED_RETRY_SECS)
-                })
+                && inner
+                    .failed_at
+                    .is_some_and(|at| at.elapsed() >= Duration::from_secs(wait))
         };
         if retry {
             self.spawn_race(RaceTrigger::Failed);
@@ -4173,6 +4200,78 @@ mod tests {
         }
         // 降级后发车：run_race 走 gather（无公共 DoH、无 atlas）→ 无候选 → Failed
         wait_phase(&selector, Phase::Failed).await;
+    }
+
+    /// 后台被系统断网（或断网的一瞬）时探测全是「TCP 一连就失败」：这一轮不占自动重赛
+    /// 的预算，网络回来后下一个要赢家的请求就顺手重赛，不等 5 分钟
+    #[tokio::test]
+    async fn outage_failure_retries_soon_and_does_not_spend_the_budget() {
+        let blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let blocked_in = blocked.clone();
+        let edge = Arc::new(EdgePin::new(false));
+        let selector = fake_selector_with(
+            SelectMode::LocalAtlas,
+            state_with_key(1),
+            Arc::new(move |ip, _| {
+                if blocked_in.load(Ordering::SeqCst) {
+                    outcome(ip, false, 1, Some(ProbeFailure::TcpConnect))
+                } else {
+                    outcome(ip, true, 20, None)
+                }
+            }),
+            edge.clone(),
+        );
+        let pool = candidates(&["104.21.0.1", "104.21.0.2"]);
+        selector.race_candidates(pool.clone(), selector.key_pool()).await;
+        assert_eq!(selector.phase(), Phase::Ready);
+        let winner = selector.inner.lock().state.winner.clone().unwrap().ip;
+
+        // 断网：这一轮全是连接被拒
+        blocked.store(true, Ordering::SeqCst);
+        selector.race_candidates(pool, selector.key_pool()).await;
+        assert_eq!(selector.phase(), Phase::Failed);
+        {
+            let mut inner = selector.inner.lock();
+            assert!(inner.outage);
+            assert_eq!(inner.state.races_log.len(), 1, "断网的那一轮不占预算");
+            // 上次的赢家还留着，下一轮先探它
+            assert_eq!(inner.state.winner.as_ref().map(|w| w.ip), Some(winner));
+            // 预算用满、上一轮刚跑过：普通的失败重试会被挡住
+            let now = now_unix();
+            inner.state.races_log = vec![now - 10, now - 20, now - 30, now - 40];
+            inner.state.last_race_at = now;
+        }
+        // 刚失败：不重试
+        selector.clone().pin_missed();
+        assert_eq!(selector.phase(), Phase::Failed);
+
+        // 过了断网的重试间隔、网络也回来了：要赢家的请求顺手发车，并等到这一轮的结果
+        blocked.store(false, Ordering::SeqCst);
+        selector.inner.lock().failed_at =
+            Some(Instant::now() - Duration::from_secs(SELECT_OUTAGE_RETRY_SECS + 1));
+        let deadline = Instant::now() + Duration::from_secs(SELECT_LOOKUP_WAIT_SECS);
+        assert_eq!(edge.settled_winner("linux.do", deadline).await, Some(winner));
+        assert_eq!(selector.phase(), Phase::Ready);
+        assert!(!selector.inner.lock().outage);
+    }
+
+    /// 对照：探测是超时（网络慢 / 地址被墙）不算断网，照旧等 5 分钟、受预算约束
+    #[tokio::test]
+    async fn timeout_failure_keeps_the_long_retry() {
+        let selector = fake_selector(
+            SelectMode::LocalAtlas,
+            state_with_key(1),
+            Arc::new(|ip, _| outcome(ip, false, 5, Some(ProbeFailure::TcpTimeout))),
+        );
+        selector
+            .race_candidates(candidates(&["104.21.0.1"]), selector.key_pool())
+            .await;
+        assert_eq!(selector.phase(), Phase::Failed);
+        assert!(!selector.inner.lock().outage);
+        selector.inner.lock().failed_at =
+            Some(Instant::now() - Duration::from_secs(SELECT_OUTAGE_RETRY_SECS + 1));
+        selector.clone().pin_missed();
+        assert_eq!(selector.phase(), Phase::Failed);
     }
 
     #[tokio::test]
