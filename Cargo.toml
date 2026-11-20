@@ -79,6 +79,8 @@ time = "0.3"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+# 只为给上游连接设 TCP_USER_TIMEOUT（tokio 已经带着它，`all` 只是放出这些 setsockopt）
+socket2 = { version = "0.6", features = ["all"] }
 
 # HTTP proxy
 hyper = { version = "1", features = ["full"] }

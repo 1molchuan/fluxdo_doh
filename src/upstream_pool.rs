@@ -54,9 +54,11 @@ const REAP_INTERVAL: Duration = Duration::from_secs(15);
 const SUSPEND_GAP: Duration = Duration::from_secs(45);
 /// 池里最多保留多少个 key
 const MAX_KEYS: usize = 64;
-/// h2 保活
-const H2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
-const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// h2 保活：这么久没收到任何帧就发 PING，再这么久没回就判连接已死。两者之和是「请求
+/// 已经送达、回程却断了」时在途请求最多白等的时间（原来 20 + 10 s，日志里弱网切换后
+/// 一串 20～30 s 才失败的请求）。请求还没送达的情况更早由 TCP_USER_TIMEOUT 断开（见 ech.rs）
+const H2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(12);
+const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(6);
 /// h2 连接级接收窗口（hyper 默认 5 MiB）。所有回环连接共用一条上游连接后，读得慢的流
 /// 各占一个流窗口（默认 2 MiB），连接窗口给大些，免得几个慢流就把同连接的其他流卡住
 const H2_CONN_WINDOW: u32 = 32 * 1024 * 1024;

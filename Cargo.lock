@@ -787,6 +787,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shadowsocks",
+ "socket2 0.6.5",
  "thiserror 1.0.69",
  "time",
  "tokio",

@@ -506,17 +506,20 @@ impl DohTlsConnector {
         };
 
         let mut failed = Vec::new();
+        let mut refused_locally = 0;
         let mut result = Err(DohProxyError::Dns(format!("No reachable IP for {}", host)));
         let mut took_over = false;
         if !primary_plan.is_empty() {
             let outcome = tcp_race(primary_plan, head_start).await;
             failed.extend(outcome.failed);
+            refused_locally += outcome.refused_locally;
             result = outcome.result;
         }
         if result.is_err() && !secondary_plan.is_empty() {
             let primary_tried = !failed.is_empty();
             let outcome = tcp_race(secondary_plan, RACE_STAGGER).await;
             failed.extend(outcome.failed);
+            refused_locally += outcome.refused_locally;
             took_over = route.family_decided && primary_tried;
             if outcome.result.is_ok() || !primary_tried {
                 result = outcome.result;
@@ -524,7 +527,17 @@ impl DohTlsConnector {
         }
         if let Some(first) = first {
             if failed.iter().any(|addr| addr.ip() == first) {
-                edge.report(host, first, Outcome::Failed);
+                if blames_first_choice(result.is_ok(), failed.len(), refused_locally) {
+                    edge.report(host, first, Outcome::Failed);
+                } else {
+                    debug!(
+                        "Tunnel to {}:{}: all {} attempts refused locally, not counted against {}",
+                        host,
+                        port,
+                        failed.len(),
+                        first
+                    );
+                }
             }
         }
         let (stream, addr, _) = result?;
@@ -903,14 +916,17 @@ impl DohTlsConnector {
         };
 
         let mut failed = Vec::new();
+        let mut refused_locally = 0;
         let result = if primary_plan.is_empty() {
             // 某一族没有地址（如只有 AAAA 的域名）：直接连另一族，这不算亲和族失败
             let outcome = tls_race(secondary_plan, RACE_STAGGER).await;
             failed.extend(outcome.failed);
+            refused_locally += outcome.refused_locally;
             outcome.result.map(|won| (won, false))
         } else if secondary_plan.is_empty() || route.family_decided {
             let outcome = tls_race(primary_plan, head_start).await;
             failed.extend(outcome.failed);
+            refused_locally += outcome.refused_locally;
             match outcome.result {
                 Ok(won) => Ok((won, false)),
                 Err(e @ DohProxyError::EchRetry { .. }) => Err(e),
@@ -925,6 +941,7 @@ impl DohTlsConnector {
                     );
                     let outcome = tls_race(secondary_plan, RACE_STAGGER).await;
                     failed.extend(outcome.failed);
+                    refused_locally += outcome.refused_locally;
                     match outcome.result {
                         // 亲和族整族连不上、由另一族接管：亲和跟着切换
                         Ok(won) => Ok((won, true)),
@@ -957,6 +974,7 @@ impl DohTlsConnector {
                 tokio::select! {
                     outcome = &mut primary_race, if primary_done.is_none() => {
                         failed.extend(outcome.failed);
+                        refused_locally += outcome.refused_locally;
                         match outcome.result {
                             Ok(won) => break Ok((won, false)),
                             Err(e @ DohProxyError::EchRetry { .. }) => break Err(e),
@@ -965,6 +983,7 @@ impl DohTlsConnector {
                     }
                     outcome = &mut secondary_race, if secondary_done.is_none() => {
                         failed.extend(outcome.failed);
+                        refused_locally += outcome.refused_locally;
                         match outcome.result {
                             Ok(won) => break Ok((won, false)),
                             Err(e @ DohProxyError::EchRetry { .. }) => break Err(e),
@@ -980,11 +999,22 @@ impl DohTlsConnector {
             }
         };
 
-        // 首选地址（赢家 / 粘性 IP）这次确实失败了才记它一次；被别的候选赢下而中止的不算
+        // 首选地址（赢家 / 粘性 IP）这次确实失败了才记它一次；被别的候选赢下而中止的不算，
+        // 整趟都被本机挡下的也不算（见 blames_first_choice）
         if let Some(first) = first {
             if failed.iter().any(|addr| addr.ip() == first) {
-                warn!("First choice {} failed for {}:{}", first, host, port);
-                edge.report(host, first, Outcome::Failed);
+                if blames_first_choice(result.is_ok(), failed.len(), refused_locally) {
+                    warn!("First choice {} failed for {}:{}", first, host, port);
+                    edge.report(host, first, Outcome::Failed);
+                } else {
+                    debug!(
+                        "All {} attempts to {}:{} refused locally, not counted against {}",
+                        failed.len(),
+                        host,
+                        port,
+                        first
+                    );
+                }
             }
         }
         result.map(|((stream, addr, rtt), took_over)| Won {
@@ -1130,6 +1160,12 @@ const CHALLENGE_LOOKUP_WAIT: Duration = Duration::from_millis(1500);
 /// 单个地址的 TCP / TLS 超时
 const ATTEMPT_TCP_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTEMPT_TLS_TIMEOUT: Duration = Duration::from_secs(10);
+/// 发出去的数据这么久没被对端确认，内核就断开这条连接（TCP_USER_TIMEOUT）。路径悄悄
+/// 断掉（Wi-Fi 切流量、VPN 换出口、NAT 映射过期）时复用的连接不会报错，请求发上去
+/// 只能等 h2 保活发现，日志里是一串等了 20～30 s 的 `http2 error`；有了它 8 s 就断，
+/// 幂等请求随即换新连接重发（见 upstream_pool）。按 RTO 退避算这时已重传三四次都没回音
+#[cfg(any(target_os = "android", target_os = "linux"))]
+const UPSTREAM_USER_TIMEOUT: Duration = Duration::from_secs(8);
 /// 首选地址的领先时间：它历史握手耗时的两倍，限制在 300 ms～1.5 s；没有记录时 600 ms
 const HEAD_START_MIN: Duration = Duration::from_millis(300);
 const HEAD_START_MAX: Duration = Duration::from_millis(1500);
@@ -1170,6 +1206,37 @@ struct Won {
 pub(crate) struct RaceOutcome<T> {
     pub result: Result<(T, SocketAddr, Duration)>,
     pub failed: Vec<SocketAddr>,
+    /// `failed` 里被本机挡下的个数（见 [`is_local_refusal`]）
+    pub refused_locally: usize,
+}
+
+/// 建连被本机挡下：连接被拒、没有路由、网络不可用、不许联网。App 退到后台后系统（省电、
+/// 后台流量限制）就是这样拒掉它的连接的——2026-11-20 日志里成片的
+/// `Connection refused (os error 111)`；断网的一瞬、VPN 还没接管时也是。
+/// 墙的重置发生在握手里（ConnectionReset）、丢包是超时，都不在这里
+pub(crate) fn is_local_refusal(error: &DohProxyError) -> bool {
+    use std::io::ErrorKind;
+    let DohProxyError::Io(error) = error else {
+        return false;
+    };
+    matches!(
+        error.kind(),
+        ErrorKind::ConnectionRefused
+            | ErrorKind::NetworkUnreachable
+            | ErrorKind::HostUnreachable
+            | ErrorKind::NetworkDown
+            | ErrorKind::PermissionDenied
+            | ErrorKind::AddrNotAvailable
+    )
+}
+
+/// 一趟建连里首选地址（赢家 / 粘性 IP）的失败要不要记到它头上。整趟一个都没连上、
+/// 试过的不止它一个、失败的又全是被本机挡下的：是这台设备此刻出不去，换谁都一样，
+/// 不记——否则后台被系统断网的十几分钟里长轮询每次失败都算赢家一次，两次就把它
+/// 踢掉、重赛也必败，回到前台没有赢家可用，首批请求要等重新竞速。
+/// 只试了它一个时照旧记：没有别的地址作对照，分不出是不是它自己的问题
+pub(crate) fn blames_first_choice(connected: bool, failed: usize, refused_locally: usize) -> bool {
+    connected || failed < 2 || refused_locally < failed
 }
 
 /// 交错赛跑（Happy Eyeballs 的结构）：`addrs[0]` 立即起跑，领先 `head_start` 后其余按
@@ -1188,6 +1255,7 @@ where
 {
     let mut pending: std::collections::VecDeque<SocketAddr> = addrs.into();
     let mut failed = Vec::new();
+    let mut refused_locally = 0;
     let mut last_error: Option<DohProxyError> = None;
     let mut set = tokio::task::JoinSet::new();
     let spawn = |set: &mut tokio::task::JoinSet<_>, addr: SocketAddr| {
@@ -1203,6 +1271,7 @@ where
         return RaceOutcome {
             result: Err(DohProxyError::Proxy("No addresses to connect".to_string())),
             failed,
+            refused_locally,
         };
     };
     spawn(&mut set, addr);
@@ -1221,15 +1290,20 @@ where
                         return RaceOutcome {
                             result: Ok((value, addr, elapsed)),
                             failed,
+                            refused_locally,
                         };
                     }
                     Ok((addr, Err(error), _)) => {
                         failed.push(addr);
+                        if is_local_refusal(&error) {
+                            refused_locally += 1;
+                        }
                         if matches!(error, DohProxyError::EchRetry { .. }) {
                             set.abort_all();
                             return RaceOutcome {
                                 result: Err(error),
                                 failed,
+                                refused_locally,
                             };
                         }
                         last_error = Some(error);
@@ -1260,6 +1334,7 @@ where
         result: Err(last_error
             .unwrap_or_else(|| DohProxyError::Proxy("All connection attempts failed".to_string()))),
         failed,
+        refused_locally,
     }
 }
 
@@ -1291,6 +1366,8 @@ async fn timed_tcp_connect(addr: SocketAddr, timeout: Duration) -> Result<TcpStr
             STATS.tcp_connect.record(start.elapsed());
             // 握手与小请求都是小包往返，关掉 Nagle
             let _ = stream.set_nodelay(true);
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            let _ = socket2::SockRef::from(stream).set_tcp_user_timeout(Some(UPSTREAM_USER_TIMEOUT));
         }
         Err(_) => STATS.tcp_fail.inc(),
     }
@@ -1530,5 +1607,117 @@ mod tests {
             .await
             .is_err());
         assert_eq!(edge.winner_fail_streak(), 1);
+    }
+
+    /// 没人监听的本机端口
+    async fn closed_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    #[test]
+    fn local_refusals_are_told_apart_from_blocked_paths() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::HostUnreachable,
+            ErrorKind::NetworkDown,
+            ErrorKind::PermissionDenied,
+        ] {
+            assert!(is_local_refusal(&DohProxyError::Io(Error::from(kind))), "{:?}", kind);
+        }
+        // 墙的重置在握手里、丢包是超时：这些是路径（或这个地址）的问题
+        assert!(!is_local_refusal(&DohProxyError::Io(Error::from(ErrorKind::ConnectionReset))));
+        assert!(!is_local_refusal(&DohProxyError::Io(Error::from(ErrorKind::UnexpectedEof))));
+        assert!(!is_local_refusal(&DohProxyError::Timeout));
+        assert!(!is_local_refusal(&DohProxyError::Proxy("x".to_string())));
+    }
+
+    #[test]
+    fn first_choice_is_blamed_unless_the_whole_route_was_refused_locally() {
+        // 整趟被本机挡下（后台被系统断网 / 断网的一瞬）：不记
+        assert!(!blames_first_choice(false, 3, 3));
+        assert!(!blames_first_choice(false, 2, 2));
+        // 有别的地址连上了：是它自己的问题
+        assert!(blames_first_choice(true, 1, 1));
+        assert!(blames_first_choice(true, 3, 3));
+        // 失败里有超时 / 重置：照旧记
+        assert!(blames_first_choice(false, 3, 2));
+        assert!(blames_first_choice(false, 2, 0));
+        // 只试了它一个，没有对照：照旧记
+        assert!(blames_first_choice(false, 1, 1));
+    }
+
+    #[tokio::test]
+    async fn race_counts_attempts_refused_locally() {
+        let port = closed_port().await;
+        let plan = vec![
+            SocketAddr::new("127.0.0.1".parse().unwrap(), port),
+            SocketAddr::new("127.0.0.2".parse().unwrap(), port),
+        ];
+        let outcome = race_staggered(plan, RACE_STAGGER, RACE_STAGGER, |addr| async move {
+            timed_tcp_connect(addr, ATTEMPT_TCP_TIMEOUT).await
+        })
+        .await;
+        assert!(outcome.result.is_err());
+        assert_eq!(outcome.failed.len(), 2);
+        assert_eq!(outcome.refused_locally, 2);
+
+        let outcome = race_staggered(
+            vec![race_addr(1), race_addr(2)],
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            |_addr| async move { Err::<(), _>(DohProxyError::Timeout) },
+        )
+        .await;
+        assert_eq!(outcome.failed.len(), 2);
+        assert_eq!(outcome.refused_locally, 0);
+    }
+
+    /// 后台被系统断网时所有地址都是「连接被拒」：长轮询一次次失败，不能把赢家踢掉——
+    /// 回到前台它还在，首个请求直接连，不用等重新竞速
+    #[tokio::test]
+    async fn winner_survives_when_every_address_is_refused_locally() {
+        let winner: IpAddr = "127.0.0.1".parse().unwrap();
+        let other: IpAddr = "127.0.0.2".parse().unwrap();
+        let port = closed_port().await;
+        let (connector, edge) = connector().await;
+        edge.set_pin(Pin::Winner(winner));
+
+        for _ in 0..crate::edge_pin::WINNER_FAIL_THRESHOLD + 2 {
+            let route = edge.route("linux.do", vec![other]);
+            assert!(connector
+                .connect_tcp_route("linux.do", port, &edge, &route)
+                .await
+                .is_err());
+        }
+        assert_eq!(edge.winner_fail_streak(), 0);
+        assert_eq!(edge.pin(), Pin::Winner(winner));
+
+        // 对照：别的地址连得上、只有赢家被拒，照旧记它的连败
+        let listener = TcpListener::bind((other, 0)).await.unwrap();
+        let open_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+        let route = edge.route("linux.do", vec![other]);
+        connector
+            .connect_tcp_route("linux.do", open_port, &edge, &route)
+            .await
+            .unwrap();
+        assert_eq!(edge.winner_fail_streak(), 1);
+    }
+
+    /// 上游连接带 TCP_USER_TIMEOUT：发出的数据一直没人确认，内核自己断开
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[tokio::test]
+    async fn upstream_sockets_carry_a_user_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+        let stream = timed_tcp_connect(addr, ATTEMPT_TCP_TIMEOUT).await.unwrap();
+        assert_eq!(
+            socket2::SockRef::from(&stream).tcp_user_timeout().unwrap(),
+            Some(UPSTREAM_USER_TIMEOUT)
+        );
     }
 }
